@@ -639,6 +639,7 @@ fn maybe_exchange_agent_token(headers: &HeaderMap, cfg: &PandaConfig) -> Result<
 
 enum ProxyError {
     PolicyReject(String),
+    RateLimited(String),
     Upstream(anyhow::Error),
 }
 
@@ -740,9 +741,18 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
     ctx.correlation_id = correlation_id;
 
     let est = estimate_prompt_tokens_hint(&headers);
+    let bucket = tpm_bucket_key(&ctx);
+    if state.config.tpm.enforce_budget
+        && state
+            .tpm
+            .would_exceed_prompt_budget(&bucket, est, state.config.tpm.budget_tokens_per_minute)
+            .await
+    {
+        return Err(ProxyError::RateLimited("tpm budget exceeded".to_string()));
+    }
     state
         .tpm
-        .add_prompt_tokens(&tpm_bucket_key(&ctx), est)
+        .add_prompt_tokens(&bucket, est)
         .await;
 
     log_request_context(&ctx);
@@ -892,6 +902,10 @@ fn proxy_error_response(e: ProxyError) -> Response<BoxBody> {
         ProxyError::PolicyReject(msg) => {
             eprintln!("policy reject: {msg}");
             text_response(StatusCode::FORBIDDEN, "forbidden: request rejected by policy")
+        }
+        ProxyError::RateLimited(msg) => {
+            eprintln!("rate limited: {msg}");
+            text_response(StatusCode::TOO_MANY_REQUESTS, "too many requests: token budget exceeded")
         }
         ProxyError::Upstream(err) => {
             eprintln!("upstream error: {err:#}");
@@ -1093,6 +1107,12 @@ mod tests {
         }));
         let resp = proxy_error_response(err);
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn rate_limited_maps_to_429() {
+        let resp = proxy_error_response(ProxyError::RateLimited("budget".to_string()));
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@ use redis::AsyncCommands;
 
 pub struct TpmCounters {
     mem: Mutex<HashMap<String, (u64, u64)>>,
+    mem_prompt_window: Mutex<HashMap<String, (std::time::Instant, u64)>>,
     redis: Option<redis::aio::ConnectionManager>,
 }
 
@@ -20,6 +21,7 @@ impl TpmCounters {
         };
         Ok(Self {
             mem: Mutex::new(HashMap::new()),
+            mem_prompt_window: Mutex::new(HashMap::new()),
             redis,
         })
     }
@@ -31,6 +33,15 @@ impl TpmCounters {
         {
             let mut g = self.mem.lock().expect("tpm mutex poisoned");
             g.entry(bucket.to_string()).or_default().0 += n;
+        }
+        {
+            let now = std::time::Instant::now();
+            let mut g = self.mem_prompt_window.lock().expect("tpm mutex poisoned");
+            let e = g.entry(bucket.to_string()).or_insert((now, 0));
+            if now.duration_since(e.0) >= std::time::Duration::from_secs(60) {
+                *e = (now, 0);
+            }
+            e.1 = e.1.saturating_add(n);
         }
         if let Some(ref mgr) = self.redis {
             let mut conn = mgr.clone();
@@ -52,5 +63,30 @@ impl TpmCounters {
             let key = format!("panda:tpm:v1:completion:{bucket}");
             let _: Result<i64, _> = conn.incr(&key, n as i64).await;
         }
+    }
+
+    /// Returns true when adding `n` would exceed `limit_per_minute`.
+    pub async fn would_exceed_prompt_budget(&self, bucket: &str, n: u64, limit_per_minute: u64) -> bool {
+        let now = std::time::Instant::now();
+        let mut g = self.mem_prompt_window.lock().expect("tpm mutex poisoned");
+        let e = g.entry(bucket.to_string()).or_insert((now, 0));
+        if now.duration_since(e.0) >= std::time::Duration::from_secs(60) {
+            *e = (now, 0);
+        }
+        e.1.saturating_add(n) > limit_per_minute
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TpmCounters;
+
+    #[tokio::test]
+    async fn in_memory_prompt_budget_enforced() {
+        let counters = TpmCounters::connect(None).await.unwrap();
+        assert!(!counters.would_exceed_prompt_budget("u1", 50, 100).await);
+        counters.add_prompt_tokens("u1", 50).await;
+        assert!(counters.would_exceed_prompt_budget("u1", 51, 100).await);
+        assert!(!counters.would_exceed_prompt_budget("u1", 50, 100).await);
     }
 }

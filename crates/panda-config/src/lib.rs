@@ -65,10 +65,30 @@ impl Default for ObservabilityConfig {
 }
 
 /// TPM backends: optional Redis for multi-instance totals (`PANDA_REDIS_URL` overrides `redis_url`).
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TpmConfig {
     #[serde(default)]
     pub redis_url: Option<String>,
+    /// If true, enforce token budgets per identity bucket.
+    #[serde(default)]
+    pub enforce_budget: bool,
+    /// Max prompt-token estimate per rolling minute per bucket.
+    #[serde(default = "default_tpm_budget_tokens_per_minute")]
+    pub budget_tokens_per_minute: u64,
+}
+
+fn default_tpm_budget_tokens_per_minute() -> u64 {
+    60_000
+}
+
+impl Default for TpmConfig {
+    fn default() -> Self {
+        Self {
+            redis_url: None,
+            enforce_budget: false,
+            budget_tokens_per_minute: default_tpm_budget_tokens_per_minute(),
+        }
+    }
 }
 
 /// Wasm plugins: load `*.wasm` from `directory` (Phase 2).
@@ -348,6 +368,9 @@ impl PandaConfig {
         if self.plugins.max_reloads_per_minute == 0 {
             anyhow::bail!("plugins.max_reloads_per_minute must be > 0");
         }
+        if self.tpm.enforce_budget && self.tpm.budget_tokens_per_minute == 0 {
+            anyhow::bail!("tpm.budget_tokens_per_minute must be > 0 when enforce_budget=true");
+        }
         if self.identity.require_jwt && self.identity.jwt_hs256_secret_env.trim().is_empty() {
             anyhow::bail!("identity.jwt_hs256_secret_env must be non-empty when require_jwt=true");
         }
@@ -491,6 +514,8 @@ mod tests {
         assert!(cfg.plugins.reload_interval_ms > 0);
         assert!(cfg.plugins.reload_debounce_ms > 0);
         assert!(cfg.plugins.max_reloads_per_minute > 0);
+        assert!(!cfg.tpm.enforce_budget);
+        assert!(cfg.tpm.budget_tokens_per_minute > 0);
         assert!(!cfg.identity.require_jwt);
         assert!(cfg.identity.accepted_issuers.is_empty());
         assert!(cfg.identity.accepted_audiences.is_empty());

@@ -19,6 +19,9 @@ upstream: "http://127.0.0.1:11434"
 # Env PANDA_REDIS_URL overrides this field.
 # tpm:
 #   redis_url: "redis://127.0.0.1:6379"
+#   # Starter per-instance budget guard (429 when estimated prompt budget is exceeded).
+#   enforce_budget: false
+#   budget_tokens_per_minute: 60000
 
 # Optional: terminate TLS on `listen` (HTTP plaintext disabled). PEM paths must exist at validate time.
 # If client_ca_pem is set, mTLS is required.

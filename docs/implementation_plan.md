@@ -59,9 +59,9 @@ This plan matches the **Kong-style lesson** you care about: a **thin, native dat
 - **`trusted_gateway` in YAML** (optional): `attestation_header`, `subject_header`, `tenant_header`, `scopes_header`.
 - **Env `PANDA_TRUSTED_GATEWAY_SECRET`**: attestation header value is compared with **HMAC-SHA256(secret, ·) digests** + **`constant_time_eq`** (same-length digest compare; avoids naive string timing leaks). Identity headers stripped when not trusted; attestation never forwarded upstream.
 - **`observability.correlation_header`** (default `x-request-id`): reuse incoming id, else **W3C `traceparent`**, else UUID; echoed on the **response**; included in stderr logs.
-- **TPM**: in-memory prompt (`Content-Length / 4`) and **completion** (SSE: **tiktoken** `cl100k_base` on `delta.content`, or `usage.completion_tokens` when present); optional **Redis** via `tpm.redis_url` or **`PANDA_REDIS_URL`** (`INCRBY` on `panda:tpm:v1:prompt:*` / `completion:*`).
+- **TPM**: in-memory prompt (`Content-Length / 4`) and **completion** (SSE: **tiktoken** `cl100k_base` on `delta.content`, or `usage.completion_tokens` when present); optional **Redis** via `tpm.redis_url` or **`PANDA_REDIS_URL`** (`INCRBY` on `panda:tpm:v1:prompt:*` / `completion:*`). Starter per-minute prompt budget enforcement is available via `tpm.enforce_budget` + `tpm.budget_tokens_per_minute` (returns HTTP 429).
 - **TLS / mTLS**: optional **`tls`** block (`cert_pem`, `key_pem`, optional **`client_ca_pem`**) — Panda listens with **HTTPS** on the same `listen` address; plaintext HTTP path disabled when TLS is configured.
-- **Still to do later:** scope-based enforcement, richer audit export, sliding-window TPM policies.
+- **Still to do later:** richer audit export, distributed/global budget enforcement, adaptive/sliding-window TPM policies.
 - Kong pattern: terminate OIDC at Kong, set attestation + identity headers, forward to Panda (see [integration & evolution](./integration_and_evolution.md)).
 
 ### Review
