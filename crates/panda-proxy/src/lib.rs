@@ -28,7 +28,7 @@ use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use panda_config::PandaConfig;
 use panda_wasm::{HookFailure, PluginRuntime, RuntimeReason};
 use serde::Deserialize;
@@ -39,6 +39,7 @@ use tpm::TpmCounters;
 
 type BoxBody = UnsyncBoxBody<bytes::Bytes, hyper::Error>;
 type HttpClient = Client<HttpsConnector<HttpConnector>, BoxBody>;
+const AGENT_TOKEN_HEADER: &str = "x-panda-agent-token";
 
 /// Shared state for each connection handler.
 pub struct ProxyState {
@@ -300,6 +301,15 @@ struct JwtClaims {
     exp: usize,
 }
 
+#[derive(Debug, serde::Serialize)]
+struct AgentClaims {
+    sub: String,
+    iss: String,
+    aud: String,
+    scope: String,
+    exp: usize,
+}
+
 /// Run until SIGINT (Ctrl+C). Binds per `config.listen` (HTTPS if `config.tls` is set).
 pub async fn run(config: Arc<PandaConfig>) -> anyhow::Result<()> {
     let client = build_http_client()?;
@@ -509,6 +519,11 @@ fn enforce_jwt_if_required(req: &Request<Incoming>, cfg: &PandaConfig) -> Result
 }
 
 fn validate_bearer_jwt(headers: &HeaderMap, cfg: &PandaConfig) -> Result<(), &'static str> {
+    let _ = validate_and_decode_bearer_jwt(headers, cfg)?;
+    Ok(())
+}
+
+fn validate_and_decode_bearer_jwt(headers: &HeaderMap, cfg: &PandaConfig) -> Result<JwtClaims, &'static str> {
     let auth = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -543,7 +558,7 @@ fn validate_bearer_jwt(headers: &HeaderMap, cfg: &PandaConfig) -> Result<(), &'s
     if data.claims.sub.as_deref().unwrap_or_default().trim().is_empty() {
         return Err("unauthorized: invalid bearer token");
     }
-    Ok(())
+    Ok(data.claims)
 }
 
 fn extract_scopes(claims: &JwtClaims) -> std::collections::HashSet<String> {
@@ -577,6 +592,38 @@ fn extract_scopes(claims: &JwtClaims) -> std::collections::HashSet<String> {
         }
     }
     out
+}
+
+fn maybe_exchange_agent_token(headers: &HeaderMap, cfg: &PandaConfig) -> Result<Option<String>, &'static str> {
+    if !cfg.identity.enable_token_exchange {
+        return Ok(None);
+    }
+    let claims = validate_and_decode_bearer_jwt(headers, cfg)?;
+    let sub = claims
+        .sub
+        .filter(|s| !s.trim().is_empty())
+        .ok_or("unauthorized: invalid bearer token")?;
+    let secret = std::env::var(&cfg.identity.agent_token_secret_env)
+        .map_err(|_| "unauthorized: agent token secret not configured")?;
+    let exp = (std::time::SystemTime::now()
+        + std::time::Duration::from_secs(cfg.identity.agent_token_ttl_seconds))
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "unauthorized: invalid system time")?
+        .as_secs() as usize;
+    let payload = AgentClaims {
+        sub,
+        iss: "panda-gateway".to_string(),
+        aud: "panda-agent".to_string(),
+        scope: cfg.identity.agent_token_scopes.join(" "),
+        exp,
+    };
+    let token = encode(
+        &Header::default(),
+        &payload,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .map_err(|_| "unauthorized: failed to mint agent token")?;
+    Ok(Some(token))
 }
 
 enum ProxyError {
@@ -622,6 +669,14 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
     parts.uri = uri;
     let mut headers = HeaderMap::new();
     upstream::filter_request_headers(&parts.headers, &mut headers);
+    if let Some(tok) = maybe_exchange_agent_token(&parts.headers, &state.config)
+        .map_err(|m| ProxyError::Upstream(anyhow::anyhow!("{m}")))?
+    {
+        headers.insert(
+            HeaderName::from_static(AGENT_TOKEN_HEADER),
+            HeaderValue::from_str(&tok).map_err(|_| ProxyError::Upstream(anyhow::anyhow!("agent token header value")))?,
+        );
+    }
     if let Some(ref plugins) = state.plugins {
         let runtime = plugins.runtime_snapshot().await;
         match apply_wasm_headers_with_timeout(
@@ -1075,6 +1130,10 @@ mod tests {
                 accepted_issuers: vec![],
                 accepted_audiences: vec![],
                 required_scopes: vec![],
+                enable_token_exchange: false,
+                agent_token_secret_env: "PANDA_AGENT_TOKEN_HS256_SECRET".to_string(),
+                agent_token_ttl_seconds: 300,
+                agent_token_scopes: vec![],
             },
         };
         let headers = HeaderMap::new();
@@ -1133,6 +1192,10 @@ mod tests {
                 accepted_issuers: vec!["https://issuer.example".to_string()],
                 accepted_audiences: vec!["panda-gateway".to_string()],
                 required_scopes: vec!["gateway:invoke".to_string()],
+                enable_token_exchange: false,
+                agent_token_secret_env: "PANDA_AGENT_TOKEN_HS256_SECRET".to_string(),
+                agent_token_ttl_seconds: 300,
+                agent_token_scopes: vec![],
             },
         };
 
@@ -1189,9 +1252,88 @@ mod tests {
                 accepted_issuers: vec!["https://issuer.example".to_string()],
                 accepted_audiences: vec!["panda-gateway".to_string()],
                 required_scopes: vec!["gateway:invoke".to_string()],
+                enable_token_exchange: false,
+                agent_token_secret_env: "PANDA_AGENT_TOKEN_HS256_SECRET".to_string(),
+                agent_token_ttl_seconds: 300,
+                agent_token_scopes: vec![],
             },
         };
         let err = validate_bearer_jwt(&headers, &cfg).unwrap_err();
         assert_eq!(err, "forbidden: missing required scope");
+    }
+
+    #[test]
+    fn token_exchange_mints_agent_token() {
+        #[derive(serde::Serialize)]
+        struct Claims {
+            sub: &'static str,
+            iss: &'static str,
+            aud: &'static str,
+            scope: &'static str,
+            exp: usize,
+        }
+        let user_secret_env = "PANDA_TEST_USER_SECRET_EXCHANGE";
+        let agent_secret_env = "PANDA_TEST_AGENT_SECRET_EXCHANGE";
+        // SAFETY: test-only process env setup.
+        unsafe {
+            std::env::set_var(user_secret_env, "user-secret");
+            std::env::set_var(agent_secret_env, "agent-secret");
+        }
+        let exp = (StdSystemTime::now() + StdDuration::from_secs(300))
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as usize;
+        let token = encode(
+            &Header::default(),
+            &Claims {
+                sub: "alice",
+                iss: "https://issuer.example",
+                aud: "panda-gateway",
+                scope: "gateway:invoke",
+                exp,
+            },
+            &EncodingKey::from_secret("user-secret".as_bytes()),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        let cfg = PandaConfig {
+            listen: "127.0.0.1:0".to_string(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            trusted_gateway: Default::default(),
+            observability: Default::default(),
+            tpm: Default::default(),
+            tls: None,
+            plugins: Default::default(),
+            identity: panda_config::IdentityConfig {
+                require_jwt: true,
+                jwt_hs256_secret_env: user_secret_env.to_string(),
+                accepted_issuers: vec!["https://issuer.example".to_string()],
+                accepted_audiences: vec!["panda-gateway".to_string()],
+                required_scopes: vec!["gateway:invoke".to_string()],
+                enable_token_exchange: true,
+                agent_token_secret_env: agent_secret_env.to_string(),
+                agent_token_ttl_seconds: 300,
+                agent_token_scopes: vec!["agent:invoke".to_string()],
+            },
+        };
+        let exchanged = maybe_exchange_agent_token(&headers, &cfg).unwrap().unwrap();
+        let mut v = Validation::new(Algorithm::HS256);
+        v.set_audience(&["panda-agent"]);
+        v.set_issuer(&["panda-gateway"]);
+        let decoded = decode::<serde_json::Value>(
+            &exchanged,
+            &DecodingKey::from_secret("agent-secret".as_bytes()),
+            &v,
+        )
+        .unwrap();
+        assert_eq!(decoded.claims.get("sub").and_then(|v| v.as_str()), Some("alice"));
+        assert_eq!(
+            decoded.claims.get("scope").and_then(|v| v.as_str()),
+            Some("agent:invoke")
+        );
     }
 }

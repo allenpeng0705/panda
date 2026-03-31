@@ -136,7 +136,7 @@ impl Default for PluginsConfig {
 }
 
 /// Optional identity controls for Phase 3 entry.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct IdentityConfig {
     /// If true, require a bearer JWT on proxied requests.
     #[serde(default)]
@@ -153,10 +153,46 @@ pub struct IdentityConfig {
     /// Required scopes (all must be present). Empty means no scope check.
     #[serde(default)]
     pub required_scopes: Vec<String>,
+    /// If true, mint a scoped agent token and forward in `x-panda-agent-token`.
+    #[serde(default)]
+    pub enable_token_exchange: bool,
+    /// Env var name containing HS256 secret for minted agent tokens.
+    #[serde(default = "default_agent_token_secret_env")]
+    pub agent_token_secret_env: String,
+    /// Lifetime for minted agent tokens.
+    #[serde(default = "default_agent_token_ttl_seconds")]
+    pub agent_token_ttl_seconds: u64,
+    /// Scopes to embed in minted agent tokens (space-delimited in `scope` claim).
+    #[serde(default)]
+    pub agent_token_scopes: Vec<String>,
+}
+
+impl Default for IdentityConfig {
+    fn default() -> Self {
+        Self {
+            require_jwt: false,
+            jwt_hs256_secret_env: default_jwt_hs256_secret_env(),
+            accepted_issuers: vec![],
+            accepted_audiences: vec![],
+            required_scopes: vec![],
+            enable_token_exchange: false,
+            agent_token_secret_env: default_agent_token_secret_env(),
+            agent_token_ttl_seconds: default_agent_token_ttl_seconds(),
+            agent_token_scopes: vec![],
+        }
+    }
 }
 
 fn default_jwt_hs256_secret_env() -> String {
     "PANDA_JWT_HS256_SECRET".to_string()
+}
+
+fn default_agent_token_secret_env() -> String {
+    "PANDA_AGENT_TOKEN_HS256_SECRET".to_string()
+}
+
+fn default_agent_token_ttl_seconds() -> u64 {
+    300
 }
 
 /// Terminate TLS on the **same** `listen` socket (HTTP disabled for that process).
@@ -285,6 +321,28 @@ impl PandaConfig {
         {
             anyhow::bail!("identity.required_scopes entries must be non-empty");
         }
+        if self.identity.enable_token_exchange {
+            if !self.identity.require_jwt {
+                anyhow::bail!("identity.enable_token_exchange requires identity.require_jwt=true");
+            }
+            if self.identity.agent_token_secret_env.trim().is_empty() {
+                anyhow::bail!("identity.agent_token_secret_env must be non-empty");
+            }
+            if self.identity.agent_token_ttl_seconds == 0 {
+                anyhow::bail!("identity.agent_token_ttl_seconds must be > 0");
+            }
+            if self.identity.agent_token_scopes.is_empty() {
+                anyhow::bail!("identity.agent_token_scopes must not be empty when token exchange is enabled");
+            }
+            if self
+                .identity
+                .agent_token_scopes
+                .iter()
+                .any(|v| v.trim().is_empty())
+            {
+                anyhow::bail!("identity.agent_token_scopes entries must be non-empty");
+            }
+        }
         Ok(())
     }
 
@@ -349,5 +407,9 @@ mod tests {
         assert!(cfg.identity.accepted_issuers.is_empty());
         assert!(cfg.identity.accepted_audiences.is_empty());
         assert!(cfg.identity.required_scopes.is_empty());
+        assert!(!cfg.identity.enable_token_exchange);
+        assert_eq!(cfg.identity.agent_token_secret_env, "PANDA_AGENT_TOKEN_HS256_SECRET");
+        assert_eq!(cfg.identity.agent_token_ttl_seconds, 300);
+        assert!(cfg.identity.agent_token_scopes.is_empty());
     }
 }

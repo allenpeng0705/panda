@@ -58,3 +58,7 @@ upstream: "http://127.0.0.1:11434"
 #   accepted_issuers: ["https://issuer.example"]
 #   accepted_audiences: ["panda-gateway"]
 #   required_scopes: ["gateway:invoke"]
+#   enable_token_exchange: true
+#   agent_token_secret_env: "PANDA_AGENT_TOKEN_HS256_SECRET"
+#   agent_token_ttl_seconds: 300
+#   agent_token_scopes: ["agent:invoke"]

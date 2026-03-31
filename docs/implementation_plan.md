@@ -123,6 +123,7 @@ This plan matches the **Kong-style lesson** you care about: a **thin, native dat
 ### Implement
 
 - **JWT middleware (Phase 3 entry):** optional bearer auth with HS256 secret env and claim checks (`iss`/`aud`/required `scope`) from config.
+- **Token exchange (starter):** mint scoped agent token (`x-panda-agent-token`) from validated user JWT using dedicated signing secret and TTL.
 - **PII scrubber:** regex-based first; evolve toward NER or hybrid detection when Phase 4+ depth lands.
 - **Token-based rate limiting** (TPM / token budgets): start with **in-memory** per-instance counters; design boundaries so **Redis** (or similar) can back **global** counts later.
 
