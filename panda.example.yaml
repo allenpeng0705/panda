@@ -21,6 +21,8 @@ upstream: "http://127.0.0.1:11434"
 #   #   panda_ops_auth_allowed_total{endpoint="..."}
 #   #   panda_ops_auth_denied_total{endpoint="..."}
 #   #   panda_ops_auth_deny_ratio{endpoint="..."}
+#   # Example alert ideas (PromQL):
+#   #   sum by (endpoint) (increase(panda_ops_auth_denied_total[5m])) > 20
 
 # Optional: Redis for cross-replica TPM counters (INCRBY panda:tpm:v1:prompt:* and completion:*).
 # Env PANDA_REDIS_URL overrides this field.
