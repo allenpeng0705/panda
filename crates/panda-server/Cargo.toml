@@ -22,3 +22,10 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 mimalloc = { version = "0.1", optional = true }
+opentelemetry = "0.31.0"
+opentelemetry_sdk = "0.31.0"
+opentelemetry-otlp = "0.31.1"
+tracing-opentelemetry = "0.32.1"
+
+[dev-dependencies]
+tempfile = "3"

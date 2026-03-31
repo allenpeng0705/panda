@@ -57,6 +57,10 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 Optional structured logs:
 
 - `RUST_LOG=info cargo run -p panda-server -- panda.yaml`
+- Optional OTLP export:
+  - `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318/v1/traces`
+  - `PANDA_OTEL_SERVICE_NAME=panda-gateway`
+  - When set, the gateway also exports OpenTelemetry **trace spans** to that endpoint (HTTP/protobuf); structured JSON logs still go to stdout.
 
 ### 2) Docker
 
@@ -111,9 +115,18 @@ kubectl rollout status deployment/panda
 - Load profile:
   - `PANDA_BASE_URL=http://127.0.0.1:8080 LOAD_PAYLOAD=./payload.json LOAD_REQUESTS=500 LOAD_CONCURRENCY=50 ./scripts/load_profile_chat.sh`
 - SSE soak guard:
-  - `PANDA_BASE_URL=http://127.0.0.1:8080 SOAK_PAYLOAD=./payload_stream.json SOAK_DURATION_SECONDS=3600 SOAK_CONCURRENCY=10 SOAK_PID=<panda_pid> ./scripts/soak_guard_sse.sh`
+  - `PANDA_BASE_URL=http://127.0.0.1:8080 SOAK_PAYLOAD=./payload_stream.json SOAK_DURATION_SECONDS=3600 SOAK_CONCURRENCY=10 SOAK_PID=<panda_pid> SOAK_MAX_FAILURES=0 ./scripts/soak_guard_sse.sh`
+- OTLP smoke test (self-contained local upstream + local OTLP receiver):
+  - `./scripts/otlp_smoke.sh`
 
 All script outputs are written to `artifacts/` (git-ignored).
+
+## Release Packaging (Reproducible Path)
+
+- Reproducible release build (locked dependencies + `SOURCE_DATE_EPOCH`):
+  - `./scripts/release_repro_build.sh`
+- Optional target override:
+  - `PANDA_RELEASE_TARGET=x86_64-unknown-linux-gnu ./scripts/release_repro_build.sh`
 
 ## Optional Allocator Tuning
 

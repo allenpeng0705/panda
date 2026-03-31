@@ -689,18 +689,11 @@ async fn accept_loop(
             }
         }
     }
-    let deadline = std::time::Instant::now() + shutdown_drain_duration();
-    loop {
+    if wait_for_active_connections(&state.active_connections, shutdown_drain_duration()).await {
+        eprintln!("shutdown drain complete: all connections closed");
+    } else {
         let active = state.active_connections.load(Ordering::SeqCst);
-        if active == 0 {
-            eprintln!("shutdown drain complete: all connections closed");
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            eprintln!("shutdown drain timeout reached with {active} active connection(s)");
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        eprintln!("shutdown drain timeout reached with {active} active connection(s)");
     }
     Ok(())
 }
@@ -747,16 +740,15 @@ fn build_http_client() -> anyhow::Result<HttpClient> {
     Ok(Client::builder(TokioExecutor::new()).build(https))
 }
 
-async fn dispatch(req: Request<Incoming>, state: Arc<ProxyState>) -> Result<Response<BoxBody>, Infallible> {
+async fn dispatch(mut req: Request<Incoming>, state: Arc<ProxyState>) -> Result<Response<BoxBody>, Infallible> {
     let started = std::time::Instant::now();
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    let corr = req
-        .headers()
-        .get(state.config.observability.correlation_header.as_str())
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-")
-        .to_string();
+    let corr = gateway::ensure_correlation_id(
+        req.headers_mut(),
+        &state.config.observability.correlation_header,
+    )
+    .unwrap_or_else(|_| "-".to_string());
     let is_ops_endpoint = method == hyper::Method::GET
         && (path == "/metrics"
             || path == "/plugins/status"
@@ -836,6 +828,14 @@ async fn dispatch(req: Request<Incoming>, state: Arc<ProxyState>) -> Result<Resp
 }
 
 fn trace_request(path: &str, method: &hyper::Method, correlation_id: &str, status: StatusCode, elapsed_ms: u128) {
+    let request_span = tracing::info_span!(
+        "http_request",
+        method = %method,
+        path = path,
+        correlation_id = correlation_id,
+        status = status.as_u16()
+    );
+    let _entered = request_span.enter();
     info!(
         method = %method,
         path = path,
@@ -1754,6 +1754,19 @@ fn shutdown_drain_duration() -> Duration {
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_SHUTDOWN_DRAIN_SECONDS);
     Duration::from_secs(seconds)
+}
+
+async fn wait_for_active_connections(active: &AtomicUsize, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if active.load(Ordering::SeqCst) == 0 {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn tpm_status_json(state: &ProxyState, path: &str, req_headers: &HeaderMap) -> serde_json::Value {
@@ -3404,6 +3417,25 @@ mod tests {
                 .and_then(|v| v.as_bool()),
             Some(true)
         );
+    }
+
+    #[tokio::test]
+    async fn wait_for_active_connections_returns_true_after_release() {
+        let active = StdArc::new(AtomicUsize::new(1));
+        let active_release = StdArc::clone(&active);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            active_release.store(0, Ordering::SeqCst);
+        });
+        let drained = wait_for_active_connections(active.as_ref(), Duration::from_secs(2)).await;
+        assert!(drained);
+    }
+
+    #[tokio::test]
+    async fn wait_for_active_connections_times_out_when_busy() {
+        let active = AtomicUsize::new(1);
+        let drained = wait_for_active_connections(&active, Duration::from_millis(150)).await;
+        assert!(!drained);
     }
 
     #[tokio::test]

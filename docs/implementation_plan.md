@@ -186,14 +186,15 @@ This plan matches the **Kong-style lesson** you care about: a **thin, native dat
 
 ### Plan
 
-- **OpenTelemetry** for traces and metrics (HTTP, upstream latency, TTFT, stream duration, plugin time, TPM).
+- **OpenTelemetry:** OTLP HTTP trace export when `OTEL_EXPORTER_OTLP_ENDPOINT` is set; optional `PANDA_OTEL_SERVICE_NAME` for resource `service.name`. Emitting the same dimensions as rich OTel **metrics** (TTFT, stream duration, TPM, etc.) remains follow-on work.
 - **Packaging:** Docker image wrapping the **single static binary**; reproducible builds.
-- **Status:** JSON structured tracing baseline is in place (`RUST_LOG` controlled) with per-request completion events (`method`, `path`, `status`, `correlation_id`, `elapsed_ms`).
+- **Status:** JSON structured logging baseline is in place (`RUST_LOG`) with per-request completion events (`method`, `path`, `status`, `correlation_id`, `elapsed_ms`), independent of OTLP.
 
 ### Implement
 
 - Kubernetes **Deployment** + **ConfigMap** (and Secrets) templates; document upgrade and rollback; **PodDisruptionBudget** / **HPA** hooks as needed for **many replicas** at egress.
 - Starter manifests are in `k8s/` (`deployment.yaml`, `configmap.yaml`, `service.yaml`, `pdb.yaml`, `hpa.yaml`, `secret.example.yaml`) with probes wired to `/health` and `/ready`.
+- Reproducible release packaging helper is available via `scripts/release_repro_build.sh` (`--locked`, stable `SOURCE_DATE_EPOCH`, SHA256 artifact output in `artifacts/release/`).
 - **Health endpoints:** `/health` (process up) and `/ready` with explicit checks:
   - upstream config URI is valid,
   - MCP runtime is connected when `mcp.enabled=true` and `mcp.fail_open=false`,
