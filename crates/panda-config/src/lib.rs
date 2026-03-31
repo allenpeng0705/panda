@@ -150,6 +150,9 @@ pub struct IdentityConfig {
     /// Expected audience (`aud`) values. Empty means audience is not checked.
     #[serde(default)]
     pub accepted_audiences: Vec<String>,
+    /// Required scopes (all must be present). Empty means no scope check.
+    #[serde(default)]
+    pub required_scopes: Vec<String>,
 }
 
 fn default_jwt_hs256_secret_env() -> String {
@@ -274,6 +277,14 @@ impl PandaConfig {
         {
             anyhow::bail!("identity.accepted_audiences entries must be non-empty");
         }
+        if self
+            .identity
+            .required_scopes
+            .iter()
+            .any(|v| v.trim().is_empty())
+        {
+            anyhow::bail!("identity.required_scopes entries must be non-empty");
+        }
         Ok(())
     }
 
@@ -337,5 +348,6 @@ mod tests {
         assert!(!cfg.identity.require_jwt);
         assert!(cfg.identity.accepted_issuers.is_empty());
         assert!(cfg.identity.accepted_audiences.is_empty());
+        assert!(cfg.identity.required_scopes.is_empty());
     }
 }

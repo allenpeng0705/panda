@@ -293,6 +293,10 @@ struct JwtClaims {
     #[allow(dead_code)]
     aud: Option<serde_json::Value>,
     #[allow(dead_code)]
+    scope: Option<String>,
+    #[allow(dead_code)]
+    scp: Option<serde_json::Value>,
+    #[allow(dead_code)]
     exp: usize,
 }
 
@@ -494,7 +498,12 @@ fn enforce_jwt_if_required(req: &Request<Incoming>, cfg: &PandaConfig) -> Result
         return Ok(());
     }
     if let Err(msg) = validate_bearer_jwt(req.headers(), cfg) {
-        return Err(text_response(StatusCode::UNAUTHORIZED, msg));
+        let status = if msg.starts_with("forbidden:") {
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::UNAUTHORIZED
+        };
+        return Err(text_response(status, msg));
     }
     Ok(())
 }
@@ -518,10 +527,56 @@ fn validate_bearer_jwt(headers: &HeaderMap, cfg: &PandaConfig) -> Result<(), &'s
     if !cfg.identity.accepted_audiences.is_empty() {
         validation.set_audience(&cfg.identity.accepted_audiences);
     }
-    if decode::<JwtClaims>(token, &DecodingKey::from_secret(secret.as_bytes()), &validation).is_err() {
+    let data = decode::<JwtClaims>(token, &DecodingKey::from_secret(secret.as_bytes()), &validation)
+        .map_err(|_| "unauthorized: invalid bearer token")?;
+    if !cfg.identity.required_scopes.is_empty() {
+        let available = extract_scopes(&data.claims);
+        let has_all = cfg
+            .identity
+            .required_scopes
+            .iter()
+            .all(|s| available.contains(s));
+        if !has_all {
+            return Err("forbidden: missing required scope");
+        }
+    }
+    if data.claims.sub.as_deref().unwrap_or_default().trim().is_empty() {
         return Err("unauthorized: invalid bearer token");
     }
     Ok(())
+}
+
+fn extract_scopes(claims: &JwtClaims) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    if let Some(ref s) = claims.scope {
+        for p in s.split_whitespace() {
+            if !p.trim().is_empty() {
+                out.insert(p.to_string());
+            }
+        }
+    }
+    if let Some(ref scp) = claims.scp {
+        match scp {
+            serde_json::Value::String(s) => {
+                for p in s.split_whitespace() {
+                    if !p.trim().is_empty() {
+                        out.insert(p.to_string());
+                    }
+                }
+            }
+            serde_json::Value::Array(a) => {
+                for v in a {
+                    if let Some(s) = v.as_str() {
+                        if !s.trim().is_empty() {
+                            out.insert(s.to_string());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 enum ProxyError {
@@ -1019,6 +1074,7 @@ mod tests {
                 jwt_hs256_secret_env: "PANDA_TEST_JWT_SECRET".to_string(),
                 accepted_issuers: vec![],
                 accepted_audiences: vec![],
+                required_scopes: vec![],
             },
         };
         let headers = HeaderMap::new();
@@ -1033,6 +1089,7 @@ mod tests {
             sub: &'static str,
             iss: &'static str,
             aud: &'static str,
+            scope: &'static str,
             exp: usize,
         }
         let secret_env = "PANDA_TEST_JWT_SECRET_VALID";
@@ -1050,6 +1107,7 @@ mod tests {
                 sub: "u1",
                 iss: "https://issuer.example",
                 aud: "panda-gateway",
+                scope: "gateway:invoke gateway:read",
                 exp,
             },
             &EncodingKey::from_secret("test-secret".as_bytes()),
@@ -1074,9 +1132,66 @@ mod tests {
                 jwt_hs256_secret_env: secret_env.to_string(),
                 accepted_issuers: vec!["https://issuer.example".to_string()],
                 accepted_audiences: vec!["panda-gateway".to_string()],
+                required_scopes: vec!["gateway:invoke".to_string()],
             },
         };
 
         assert!(validate_bearer_jwt(&headers, &cfg).is_ok());
+    }
+
+    #[test]
+    fn jwt_validation_rejects_missing_scope() {
+        #[derive(serde::Serialize)]
+        struct Claims {
+            sub: &'static str,
+            iss: &'static str,
+            aud: &'static str,
+            scope: &'static str,
+            exp: usize,
+        }
+        let secret_env = "PANDA_TEST_JWT_SECRET_SCOPE";
+        // SAFETY: test-only process env setup.
+        unsafe {
+            std::env::set_var(secret_env, "test-secret");
+        }
+        let exp = (StdSystemTime::now() + StdDuration::from_secs(300))
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as usize;
+        let token = encode(
+            &Header::default(),
+            &Claims {
+                sub: "u1",
+                iss: "https://issuer.example",
+                aud: "panda-gateway",
+                scope: "gateway:read",
+                exp,
+            },
+            &EncodingKey::from_secret("test-secret".as_bytes()),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        let cfg = PandaConfig {
+            listen: "127.0.0.1:0".to_string(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            trusted_gateway: Default::default(),
+            observability: Default::default(),
+            tpm: Default::default(),
+            tls: None,
+            plugins: Default::default(),
+            identity: panda_config::IdentityConfig {
+                require_jwt: true,
+                jwt_hs256_secret_env: secret_env.to_string(),
+                accepted_issuers: vec!["https://issuer.example".to_string()],
+                accepted_audiences: vec!["panda-gateway".to_string()],
+                required_scopes: vec!["gateway:invoke".to_string()],
+            },
+        };
+        let err = validate_bearer_jwt(&headers, &cfg).unwrap_err();
+        assert_eq!(err, "forbidden: missing required scope");
     }
 }
