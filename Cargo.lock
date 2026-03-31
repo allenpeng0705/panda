@@ -1233,6 +1233,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "http",
+ "regex",
  "serde",
  "serde_yaml",
 ]
@@ -1255,6 +1256,7 @@ dependencies = [
  "panda-config",
  "panda-wasm",
  "redis",
+ "regex",
  "rustls",
  "rustls-pemfile",
  "serde",

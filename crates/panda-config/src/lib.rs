@@ -217,6 +217,34 @@ pub struct PromptSafetyConfig {
     pub deny_patterns: Vec<String>,
 }
 
+/// Starter PII scrubbing controls (Phase 3).
+#[derive(Debug, Clone, Deserialize)]
+pub struct PiiConfig {
+    /// If true, redact request body using regex patterns.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Regex patterns to redact from buffered request body.
+    #[serde(default)]
+    pub redact_patterns: Vec<String>,
+    /// Replacement text used for each matched PII region.
+    #[serde(default = "default_pii_replacement")]
+    pub replacement: String,
+}
+
+fn default_pii_replacement() -> String {
+    "[REDACTED]".to_string()
+}
+
+impl Default for PiiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            redact_patterns: vec![],
+            replacement: default_pii_replacement(),
+        }
+    }
+}
+
 /// Terminate TLS on the **same** `listen` socket (HTTP disabled for that process).
 #[derive(Debug, Clone, Deserialize)]
 pub struct TlsListenConfig {
@@ -246,6 +274,8 @@ pub struct PandaConfig {
     pub identity: IdentityConfig,
     #[serde(default)]
     pub prompt_safety: PromptSafetyConfig,
+    #[serde(default)]
+    pub pii: PiiConfig,
 }
 
 impl PandaConfig {
@@ -386,6 +416,21 @@ impl PandaConfig {
         {
             anyhow::bail!("prompt_safety.deny_patterns entries must be non-empty");
         }
+        if self.pii.enabled {
+            if self.pii.replacement.trim().is_empty() {
+                anyhow::bail!("pii.replacement must be non-empty when pii.enabled=true");
+            }
+            if self.pii.redact_patterns.is_empty() {
+                anyhow::bail!("pii.redact_patterns must not be empty when pii.enabled=true");
+            }
+            for p in &self.pii.redact_patterns {
+                if p.trim().is_empty() {
+                    anyhow::bail!("pii.redact_patterns entries must be non-empty");
+                }
+                regex::Regex::new(p)
+                    .map_err(|e| anyhow::anyhow!("invalid pii.redact_patterns regex {p:?}: {e}"))?;
+            }
+        }
         Ok(())
     }
 
@@ -457,5 +502,8 @@ mod tests {
         assert!(cfg.identity.agent_token_scopes.is_empty());
         assert!(!cfg.prompt_safety.enabled);
         assert!(cfg.prompt_safety.deny_patterns.is_empty());
+        assert!(!cfg.pii.enabled);
+        assert!(cfg.pii.redact_patterns.is_empty());
+        assert_eq!(cfg.pii.replacement, "[REDACTED]");
     }
 }

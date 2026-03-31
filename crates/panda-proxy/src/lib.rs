@@ -32,6 +32,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use panda_config::PandaConfig;
 use panda_wasm::{HookFailure, PluginRuntime, RuntimeReason};
+use regex::Regex;
 use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
@@ -748,33 +749,51 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
 
     parts.headers = headers;
 
-    let boxed_req_body: BoxBody = if let Some(ref plugins) = state.plugins {
-        let runtime = plugins.runtime_snapshot().await;
-        let content_len_ok = parts
-            .headers
-            .get(header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<usize>().ok())
-            .is_some_and(|n| n <= state.config.plugins.max_request_body_bytes);
-        if content_len_ok {
-            let collected = body
-                .collect()
-                .await
-                .map_err(|e| ProxyError::Upstream(anyhow::anyhow!("collect body: {e}")))?;
-            let original = collected.to_bytes();
-            if state.config.prompt_safety.enabled {
-                let body_text = String::from_utf8_lossy(&original);
-                if let Some(pat) = matches_deny_pattern(
-                    &body_text,
-                    state.prompt_safety_matcher.as_deref(),
-                    &state.config.prompt_safety.deny_patterns,
-                ) {
-                    return Err(ProxyError::PolicyReject(format!("prompt_safety body pattern={pat}")));
-                }
+    let content_len_ok = parts
+        .headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+        .is_some_and(|n| n <= state.config.plugins.max_request_body_bytes);
+    let should_buffer_body = content_len_ok && (state.plugins.is_some() || state.config.pii.enabled || state.config.prompt_safety.enabled);
+    let boxed_req_body: BoxBody = if should_buffer_body {
+        let collected = body
+            .collect()
+            .await
+            .map_err(|e| ProxyError::Upstream(anyhow::anyhow!("collect body: {e}")))?;
+        let original = collected.to_bytes();
+        if state.config.prompt_safety.enabled {
+            let body_text = String::from_utf8_lossy(&original);
+            if let Some(pat) = matches_deny_pattern(
+                &body_text,
+                state.prompt_safety_matcher.as_deref(),
+                &state.config.prompt_safety.deny_patterns,
+            ) {
+                return Err(ProxyError::PolicyReject(format!("prompt_safety body pattern={pat}")));
             }
-            let next = match apply_wasm_body_with_timeout(
+        }
+
+        let mut next_bytes = original.to_vec();
+        if state.config.pii.enabled {
+            next_bytes = scrub_pii_bytes(
+                &next_bytes,
+                &state.config.pii.redact_patterns,
+                &state.config.pii.replacement,
+            )
+            .map_err(ProxyError::Upstream)?;
+            if next_bytes != original.as_ref() {
+                parts.headers.insert(
+                    HeaderName::from_static("x-panda-pii-redacted"),
+                    HeaderValue::from_static("true"),
+                );
+            }
+        }
+
+        if let Some(ref plugins) = state.plugins {
+            let runtime = plugins.runtime_snapshot().await;
+            next_bytes = match apply_wasm_body_with_timeout(
                 Arc::clone(&runtime),
-                original.to_vec(),
+                next_bytes,
                 state.config.plugins.max_request_body_bytes,
                 state.config.plugins.execution_timeout_ms,
             )
@@ -793,12 +812,11 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
                     original.to_vec()
                 }
             };
-            Full::new(bytes::Bytes::from(next))
-                .map_err(|never: std::convert::Infallible| match never {})
-                .boxed_unsync()
-        } else {
-            body.map_err(|e| e).boxed_unsync()
         }
+
+        Full::new(bytes::Bytes::from(next_bytes))
+            .map_err(|never: std::convert::Infallible| match never {})
+            .boxed_unsync()
     } else {
         body.map_err(|e| e).boxed_unsync()
     };
@@ -903,6 +921,15 @@ fn matches_deny_pattern<'a>(
 ) -> Option<&'a str> {
     let m = matcher?;
     m.find(text).and_then(|mat| patterns.get(mat.pattern().as_usize()).map(|s| s.as_str()))
+}
+
+fn scrub_pii_bytes(input: &[u8], patterns: &[String], replacement: &str) -> anyhow::Result<Vec<u8>> {
+    let mut s = String::from_utf8_lossy(input).to_string();
+    for p in patterns {
+        let re = Regex::new(p).map_err(|e| anyhow::anyhow!("invalid pii regex {p:?}: {e}"))?;
+        s = re.replace_all(&s, replacement).to_string();
+    }
+    Ok(s.into_bytes())
 }
 
 async fn apply_wasm_headers_with_timeout(
@@ -1117,6 +1144,7 @@ mod tests {
             },
             identity: Default::default(),
             prompt_safety: Default::default(),
+            pii: Default::default(),
         });
 
         let runtime = PluginRuntime::load_optional(
@@ -1197,6 +1225,7 @@ mod tests {
                 agent_token_scopes: vec![],
             },
             prompt_safety: Default::default(),
+            pii: Default::default(),
         };
         let headers = HeaderMap::new();
         let err = validate_bearer_jwt(&headers, "/v1/chat", &cfg).unwrap_err();
@@ -1261,6 +1290,7 @@ mod tests {
                 agent_token_scopes: vec![],
             },
             prompt_safety: Default::default(),
+            pii: Default::default(),
         };
 
         assert!(validate_bearer_jwt(&headers, "/v1/chat", &cfg).is_ok());
@@ -1323,6 +1353,7 @@ mod tests {
                 agent_token_scopes: vec![],
             },
             prompt_safety: Default::default(),
+            pii: Default::default(),
         };
         let err = validate_bearer_jwt(&headers, "/v1/chat", &cfg).unwrap_err();
         assert_eq!(err, "forbidden: missing required scope");
@@ -1387,6 +1418,7 @@ mod tests {
                 agent_token_scopes: vec!["agent:invoke".to_string()],
             },
             prompt_safety: Default::default(),
+            pii: Default::default(),
         };
         let exchanged = maybe_exchange_agent_token(&headers, &cfg).unwrap().unwrap();
         let mut v = Validation::new(Algorithm::HS256);
@@ -1418,6 +1450,24 @@ mod tests {
             &patterns,
         );
         assert_eq!(hit, Some("ignore previous instructions"));
+    }
+
+    #[test]
+    fn pii_scrubber_redacts_matches() {
+        let input = br#"email=alice@example.com ssn=123-45-6789"#;
+        let out = scrub_pii_bytes(
+            input,
+            &[
+                r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}".to_string(),
+                r"\b\d{3}-\d{2}-\d{4}\b".to_string(),
+            ],
+            "[REDACTED]",
+        )
+        .unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("alice@example.com"));
+        assert!(!s.contains("123-45-6789"));
+        assert!(s.contains("[REDACTED]"));
     }
 
     #[test]
@@ -1480,6 +1530,7 @@ mod tests {
                 agent_token_scopes: vec![],
             },
             prompt_safety: Default::default(),
+            pii: Default::default(),
         };
         let err = validate_bearer_jwt(&headers, "/v1/admin/users", &cfg).unwrap_err();
         assert_eq!(err, "forbidden: missing required route scope");

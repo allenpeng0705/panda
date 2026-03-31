@@ -20,6 +20,7 @@ hyper-util = { version = "0.1", features = ["tokio", "client", "client-legacy", 
 jsonwebtoken = "9"
 panda-config = { path = "../panda-config" }
 panda-wasm = { path = "../panda-wasm" }
+regex = "1"
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"

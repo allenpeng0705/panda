@@ -69,3 +69,11 @@ upstream: "http://127.0.0.1:11434"
 #   deny_patterns:
 #     - "ignore previous instructions"
 #     - "reveal system prompt"
+
+# Optional: starter PII scrubber (regex-based body redaction on buffered request bodies).
+# pii:
+#   enabled: true
+#   replacement: "[REDACTED]"
+#   redact_patterns:
+#     - "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}"
+#     - "\\b\\d{3}-\\d{2}-\\d{4}\\b"
