@@ -67,6 +67,10 @@ This plan matches the **Kong-style lesson** you care about: a **thin, native dat
   - Denied spike per endpoint (5m): `sum by (endpoint) (increase(panda_ops_auth_denied_total[5m])) > 20`
   - High deny ratio with minimum traffic guard (10m): `(sum by (endpoint) (increase(panda_ops_auth_denied_total[10m])) / clamp_min(sum by (endpoint) (increase(panda_ops_auth_allowed_total[10m]) + increase(panda_ops_auth_denied_total[10m])), 1)) > 0.30 and sum by (endpoint) (increase(panda_ops_auth_allowed_total[10m]) + increase(panda_ops_auth_denied_total[10m])) > 50`
   - Endpoint fully blocked/misconfigured (15m): `sum by (endpoint) (increase(panda_ops_auth_allowed_total[15m])) == 0 and sum by (endpoint) (increase(panda_ops_auth_denied_total[15m])) > 0`
+- **TPM alerting examples (starter):**
+  - Budget rejection spike by bucket class (5m): `sum by (bucket_class) (increase(panda_tpm_budget_rejected_total[5m])) > 100`
+  - Sustained throttling pressure (15m): `sum(increase(panda_tpm_budget_rejected_total[15m])) > 500`
+  - Anonymous-heavy rejection share (10m): `sum(increase(panda_tpm_budget_rejected_total{bucket_class="anonymous"}[10m])) / clamp_min(sum(increase(panda_tpm_budget_rejected_total[10m])), 1) > 0.70`
 - **TPM**: in-memory prompt (`Content-Length / 4`) and **completion** (SSE: **tiktoken** `cl100k_base` on `delta.content`, or `usage.completion_tokens` when present); optional **Redis** via `tpm.redis_url` or **`PANDA_REDIS_URL`** (`INCRBY` on `panda:tpm:v1:prompt:*` / `completion:*`). Starter per-minute prompt budget enforcement is available via `tpm.enforce_budget` + `tpm.budget_tokens_per_minute` (returns HTTP 429), with response visibility headers (`x-panda-budget-*`), configurable/derived `Retry-After`, and a `/tpm/status` JSON endpoint for current bucket budget inspection.
 - **TLS / mTLS**: optional **`tls`** block (`cert_pem`, `key_pem`, optional **`client_ca_pem`**) — Panda listens with **HTTPS** on the same `listen` address; plaintext HTTP path disabled when TLS is configured.
 - **Still to do later:** richer audit export, distributed/global budget enforcement, adaptive/sliding-window TPM policies.

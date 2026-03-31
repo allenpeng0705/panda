@@ -25,6 +25,7 @@ upstream: "http://127.0.0.1:11434"
 #   #   panda_tpm_budget_rejected_total{bucket_class="anonymous|subject|tenant|subject_tenant"}
 #   # Example alert ideas (PromQL):
 #   #   sum by (endpoint) (increase(panda_ops_auth_denied_total[5m])) > 20
+#   #   sum by (bucket_class) (increase(panda_tpm_budget_rejected_total[5m])) > 100
 
 # Optional: Redis for cross-replica TPM counters (INCRBY panda:tpm:v1:prompt:* and completion:*).
 # Env PANDA_REDIS_URL overrides this field.
