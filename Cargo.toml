@@ -4,6 +4,8 @@ members = [
     "crates/panda-config",
     "crates/panda-proxy",
     "crates/panda-server",
+    "crates/panda-wasm",
+    "crates/wasm-plugin-sample",
 ]
 
 [workspace.package]

@@ -1,3 +1,47 @@
 # Example Panda config (copy to panda.yaml for local runs).
 listen: "127.0.0.1:8080"
 upstream: "http://127.0.0.1:11434"
+
+# Optional: Kong / edge injects identity after OIDC. Attestation uses HMAC-then-constant-time
+# compare (see gateway.rs). Set PANDA_TRUSTED_GATEWAY_SECRET to the same value as the edge sends.
+# trusted_gateway:
+#   attestation_header: "X-Panda-Internal"
+#   subject_header: "X-User-Id"
+#   tenant_header: "X-Tenant-Id"
+#   scopes_header: "X-User-Scopes"
+
+# Optional: correlation id for logs and client response echo (default header: x-request-id).
+# Falls back to W3C traceparent trace id, then UUID.
+# observability:
+#   correlation_header: "x-request-id"
+
+# Optional: Redis for cross-replica TPM counters (INCRBY panda:tpm:v1:prompt:* and completion:*).
+# Env PANDA_REDIS_URL overrides this field.
+# tpm:
+#   redis_url: "redis://127.0.0.1:6379"
+
+# Optional: terminate TLS on `listen` (HTTP plaintext disabled). PEM paths must exist at validate time.
+# If client_ca_pem is set, mTLS is required.
+# tls:
+#   cert_pem: "/path/to/fullchain.pem"
+#   key_pem: "/path/to/privkey.pem"
+#   client_ca_pem: "/path/to/client-ca.pem"
+
+# Optional: load guest Wasm modules (*.wasm) from this directory at startup (Wasmtime).
+# Build the sample with: cargo build -p wasm-plugin-sample --target wasm32-unknown-unknown --release
+#   then copy target/wasm32-unknown-unknown/release/wasm_plugin_sample.wasm here.
+# plugins:
+#   directory: "./plugins"
+#   # Buffer/request-body hooks only apply when Content-Length <= max_request_body_bytes.
+#   max_request_body_bytes: 262144
+#   # Best-effort timeout per Wasm hook call; fail behavior controlled by fail_closed.
+#   execution_timeout_ms: 25
+#   # false => fail open (log + continue), true => fail closed (return bad gateway).
+#   fail_closed: false
+#
+# Wasm plugin return-code semantics (from `panda_on_request*` exports):
+#   0 => allow
+#   1 => reject (policy denied)     -> HTTP 403 when fail_closed=true
+#   2 => reject (malformed request) -> HTTP 403 when fail_closed=true
+#   n => reject (plugin-specific)   -> HTTP 403 when fail_closed=true
+# Runtime/trap/timeout/join failures map to HTTP 502 when fail_closed=true.

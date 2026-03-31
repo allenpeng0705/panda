@@ -54,13 +54,15 @@ This plan matches the **Kong-style lesson** you care about: a **thin, native dat
 - Hop-by-hop header filtering; strip upstream **`content-length`** on the way back so Hyper can re-frame chunked streams safely.
 - **Still to do for full Phase 1 review:** explicit **max body / stream** limits, **retry / circuit breaker** groups from config, and measured TTFT benchmarks.
 
-### Kong handshake (milestone 1.3)
+### Kong handshake (milestone 1.3) *(complete for Phase 1)*
 
-- Middleware applied **early** in the request path:
-  - If the request arrives on a **trusted** listener (or carries a configurable **gateway auth** secret / mTLS identity), read **configurable header names** for end-user identity (e.g. subject / user id, tenant, scope list)—Kong (or a Kong plugin) is responsible for **setting** these after OIDC termination.
-  - Populate an internal **`RequestContext`** (subject, scopes, correlation id from `traceparent` or `X-Request-Id`) used for **TPM bucket keys** and structured logs.
-  - **Strip or sanitize** incoming client spoof attempts: drop untrusted `X-*` identity headers from **untrusted** hops; only accept trust headers from **verified** edge (network + optional HMAC or mTLS).
-- Document the recommended Kong pattern: terminate OIDC at Kong, inject headers, forward to Panda upstream (see [integration & evolution](./integration_and_evolution.md)).
+- **`trusted_gateway` in YAML** (optional): `attestation_header`, `subject_header`, `tenant_header`, `scopes_header`.
+- **Env `PANDA_TRUSTED_GATEWAY_SECRET`**: attestation header value is compared with **HMAC-SHA256(secret, ·) digests** + **`constant_time_eq`** (same-length digest compare; avoids naive string timing leaks). Identity headers stripped when not trusted; attestation never forwarded upstream.
+- **`observability.correlation_header`** (default `x-request-id`): reuse incoming id, else **W3C `traceparent`**, else UUID; echoed on the **response**; included in stderr logs.
+- **TPM**: in-memory prompt (`Content-Length / 4`) and **completion** (SSE: **tiktoken** `cl100k_base` on `delta.content`, or `usage.completion_tokens` when present); optional **Redis** via `tpm.redis_url` or **`PANDA_REDIS_URL`** (`INCRBY` on `panda:tpm:v1:prompt:*` / `completion:*`).
+- **TLS / mTLS**: optional **`tls`** block (`cert_pem`, `key_pem`, optional **`client_ca_pem`**) — Panda listens with **HTTPS** on the same `listen` address; plaintext HTTP path disabled when TLS is configured.
+- **Still to do later:** scope-based enforcement, richer audit export, sliding-window TPM policies.
+- Kong pattern: terminate OIDC at Kong, set attestation + identity headers, forward to Panda (see [integration & evolution](./integration_and_evolution.md)).
 
 ### Review
 
@@ -85,13 +87,19 @@ This plan matches the **Kong-style lesson** you care about: a **thin, native dat
 
 ### Implement
 
-- **Plugin manager:** load `.wasm` modules from a configured directory; versioned metadata (name, ABI version).
-- **Sample TinyGo plugin:** adds a custom header (proves non-Rust toolchain path).
-- **Sample Rust plugin:** redacts the literal substring `password` in the prompt (simple policy hook).
+- **Workspace crate `panda-wasm`:** `PANDA_WASM_ABI_VERSION`, **Wasmtime** loader, `plugins.directory` in config; loads `*.wasm` at startup and runs an optional `add` smoke export per module.
+- **`panda-proxy`:** loads plugins when `plugins.directory` is set; keeps `Arc<PluginRuntime>` for upcoming per-request hooks.
+- **Sample Rust guest (`wasm-plugin-sample`):** minimal `panda_abi_version` + `add` for smoke tests; build with `wasm32-unknown-unknown`.
+- **Next:** host ↔ guest ABI (headers/body/context), TinyGo sample, trap isolation per request, optional hot reload.
 
 ### Review
 
 - Misbehaving or trapping plugins **must not** crash the gateway process; isolate failures per invocation and surface structured errors.
+- **Status semantics (implemented):**
+  - plugin policy reject (`panda_on_request*` non-zero return code) -> **HTTP 403** when `plugins.fail_closed=true`
+  - runtime/trap/timeout/join failures -> **HTTP 502** when `plugins.fail_closed=true`
+  - fail-open mode (`plugins.fail_closed=false`) logs and continues
+- **Return-code contract (v0):** `0=allow`, `1=policy denied`, `2=malformed request`, other non-zero values are plugin-specific rejects.
 
 ### Refine
 

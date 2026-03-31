@@ -35,8 +35,9 @@ The implementation is a **Cargo workspace** so configuration parsing and the HTT
 | Crate | Responsibility |
 |-------|------------------|
 | **`panda-config`** | Types, validation, and YAML load for listener address, upstream base URL, and future routes/plugins—**no** socket I/O. |
-| **`panda-proxy`** | Async HTTP server (**Tokio** + **Hyper**); **streaming reverse proxy** to the configured `upstream` (HTTP + HTTPS via **rustls/ring**); `/health` & `/ready` stay local; Kong-handshake middleware next. |
+| **`panda-proxy`** | Async HTTP server (**Tokio** + **Hyper**); **streaming reverse proxy**; **Kong handshake** (optional attestation header + env secret, strip spoofed identity); in-memory **TPM hint** (`Content-Length`/4 per subject bucket). |
 | **`panda-server`** | Thin binary crate; wires config path (CLI) → `panda-config` → `panda-proxy::run`. The built artifact is named **`panda`** (`cargo run -p panda-server` / `target/debug/panda`). |
+| **`panda-wasm`** | Phase 2: Wasmtime-based plugin host and guest ABI (workspace placeholder until integrated). |
 
 A sample file lives at `panda.example.yaml` in the repo root (copy to `panda.yaml` for local runs).
 
