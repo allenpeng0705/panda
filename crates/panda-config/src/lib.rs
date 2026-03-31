@@ -195,6 +195,17 @@ fn default_agent_token_ttl_seconds() -> u64 {
     300
 }
 
+/// Starter prompt-safety controls (Phase 3).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PromptSafetyConfig {
+    /// If true, run deny-pattern scan on request path/query/body.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Case-insensitive literal patterns that trigger 403 when found.
+    #[serde(default)]
+    pub deny_patterns: Vec<String>,
+}
+
 /// Terminate TLS on the **same** `listen` socket (HTTP disabled for that process).
 #[derive(Debug, Clone, Deserialize)]
 pub struct TlsListenConfig {
@@ -222,6 +233,8 @@ pub struct PandaConfig {
     pub plugins: PluginsConfig,
     #[serde(default)]
     pub identity: IdentityConfig,
+    #[serde(default)]
+    pub prompt_safety: PromptSafetyConfig,
 }
 
 impl PandaConfig {
@@ -343,6 +356,14 @@ impl PandaConfig {
                 anyhow::bail!("identity.agent_token_scopes entries must be non-empty");
             }
         }
+        if self
+            .prompt_safety
+            .deny_patterns
+            .iter()
+            .any(|v| v.trim().is_empty())
+        {
+            anyhow::bail!("prompt_safety.deny_patterns entries must be non-empty");
+        }
         Ok(())
     }
 
@@ -411,5 +432,7 @@ mod tests {
         assert_eq!(cfg.identity.agent_token_secret_env, "PANDA_AGENT_TOKEN_HS256_SECRET");
         assert_eq!(cfg.identity.agent_token_ttl_seconds, 300);
         assert!(cfg.identity.agent_token_scopes.is_empty());
+        assert!(!cfg.prompt_safety.enabled);
+        assert!(cfg.prompt_safety.deny_patterns.is_empty());
     }
 }

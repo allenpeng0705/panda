@@ -62,3 +62,10 @@ upstream: "http://127.0.0.1:11434"
 #   agent_token_secret_env: "PANDA_AGENT_TOKEN_HS256_SECRET"
 #   agent_token_ttl_seconds: 300
 #   agent_token_scopes: ["agent:invoke"]
+
+# Optional: prompt safety deny patterns (starter jailbreak/injection heuristics).
+# prompt_safety:
+#   enabled: true
+#   deny_patterns:
+#     - "ignore previous instructions"
+#     - "reveal system prompt"
