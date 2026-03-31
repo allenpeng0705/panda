@@ -60,10 +60,12 @@ Optional structured logs:
 - Optional OTLP export:
   - `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318/v1/traces`
   - `PANDA_OTEL_SERVICE_NAME=panda-gateway`
+  - `PANDA_OTEL_TRACE_SAMPLING_RATIO=0.2` (0.0 to 1.0, parent-based ratio sampler)
   - When set, the gateway also exports OpenTelemetry **trace spans** to that endpoint (HTTP/protobuf); structured JSON logs still go to stdout.
 - Semantic cache backend override (when `semantic_cache.enabled=true`):
   - `PANDA_SEMANTIC_CACHE_REDIS_URL=redis://127.0.0.1:6379`
   - `semantic_cache.backend: "redis"` in `panda.yaml` (Redis-compatible; Dragonfly works too)
+  - `PANDA_SEMANTIC_CACHE_TIMEOUT_MS=50` (cache bypass timeout budget)
 
 ### 2) Docker
 
@@ -123,6 +125,8 @@ kubectl rollout status deployment/panda
   - `PANDA_BASE_URL=http://127.0.0.1:8080 SOAK_PAYLOAD=./payload_stream.json SOAK_DURATION_SECONDS=3600 SOAK_CONCURRENCY=10 SOAK_PID=<panda_pid> SOAK_MAX_FAILURES=0 ./scripts/soak_guard_sse.sh`
 - OTLP smoke test (self-contained local upstream + local OTLP receiver):
   - `./scripts/otlp_smoke.sh`
+- TPM Redis failover soak:
+  - `./scripts/tpm_redis_failover_soak.sh`
 
 All script outputs are written to `artifacts/` (git-ignored).
 

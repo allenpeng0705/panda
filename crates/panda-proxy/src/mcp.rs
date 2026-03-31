@@ -411,4 +411,65 @@ mcp:
             .expect("call");
         assert!(res.content.to_string().contains("pong"));
     }
+
+    #[tokio::test]
+    async fn stdio_mcp_zombie_process_returns_error_without_hanging() {
+        let py = if std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            "python3"
+        } else if std::process::Command::new("python")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            "python"
+        } else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("zombie_mcp.py");
+        std::fs::write(
+            &script,
+            r#"#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"z","version":"1"}}}), flush=True)
+    elif method == "notifications/initialized":
+        continue
+    elif method == "tools/list":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"boom","description":"x","inputSchema":{"type":"object"}}]}}), flush=True)
+    elif method == "tools/call":
+        sys.exit(0)
+"#,
+        )
+        .unwrap();
+        let client = StdioMcpClient::spawn("zombie", py, &[script.to_string_lossy().into_owned()])
+            .await
+            .expect("spawn zombie MCP");
+        let tools = client.list_tools().await.expect("list");
+        assert_eq!(tools.len(), 1);
+        let err = client
+            .call_tool(McpToolCallRequest {
+                server: "zombie".into(),
+                tool: "boom".into(),
+                arguments: serde_json::json!({}),
+                correlation_id: "c".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("closed stdout"));
+    }
 }

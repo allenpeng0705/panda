@@ -31,7 +31,12 @@ fn init_observability() -> Option<SdkTracerProvider> {
             .ok()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "panda-gateway".to_string());
-        match build_otel_provider(&endpoint, &service_name) {
+        let trace_sampling_ratio = std::env::var("PANDA_OTEL_TRACE_SAMPLING_RATIO")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|r| r.clamp(0.0, 1.0))
+            .unwrap_or(1.0);
+        match build_otel_provider(&endpoint, &service_name, trace_sampling_ratio) {
             Ok(provider) => {
                 let shutdown_handle = provider.clone();
                 let tracer = provider.tracer("panda");
@@ -63,6 +68,7 @@ fn init_observability() -> Option<SdkTracerProvider> {
 fn build_otel_provider(
     endpoint: &str,
     service_name: &str,
+    trace_sampling_ratio: f64,
 ) -> anyhow::Result<SdkTracerProvider> {
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
@@ -74,6 +80,9 @@ fn build_otel_provider(
                 .with_attributes([KeyValue::new("service.name", service_name.to_string())])
                 .build(),
         )
+        .with_sampler(opentelemetry_sdk::trace::Sampler::ParentBased(Box::new(
+            opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(trace_sampling_ratio),
+        )))
         .with_batch_exporter(exporter)
         .build())
 }

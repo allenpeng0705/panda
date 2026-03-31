@@ -59,6 +59,7 @@ type HttpClient = Client<HttpsConnector<HttpConnector>, BoxBody>;
 const AGENT_TOKEN_HEADER: &str = "x-panda-agent-token";
 const DEFAULT_SHUTDOWN_DRAIN_SECONDS: u64 = 30;
 const DEFAULT_UPSTREAM_REQUEST_TIMEOUT_SECONDS: u64 = 120;
+const DEFAULT_SEMANTIC_CACHE_TIMEOUT_MS: u64 = 50;
 
 /// Shared state for each connection handler.
 pub struct ProxyState {
@@ -1663,10 +1664,19 @@ fn semantic_cache_key_for_chat_request(raw: &[u8]) -> Option<String> {
         .to_string();
     let messages = obj.get("messages")?.clone();
     let tools = obj.get("tools").cloned().unwrap_or(serde_json::Value::Null);
+    let tool_choice = obj.get("tool_choice").cloned().unwrap_or(serde_json::Value::Null);
+    let metadata = obj.get("metadata").cloned().unwrap_or(serde_json::Value::Null);
+    let response_format = obj
+        .get("response_format")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let canonical = serde_json::json!({
         "model": model,
         "messages": messages,
-        "tools": tools
+        "tools": tools,
+        "tool_choice": tool_choice,
+        "metadata": metadata,
+        "response_format": response_format
     });
     serde_json::to_string(&canonical).ok()
 }
@@ -2125,7 +2135,7 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
             None
         };
         if let (Some(ref cache), Some(ref key)) = (state.semantic_cache.as_ref(), semantic_cache_key.as_ref()) {
-            if let Some(hit) = cache.get(key).await {
+            if let Some(hit) = semantic_cache_get_with_timeout(cache, key, semantic_cache_timeout_duration()).await {
                 let mut out = Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", "application/json; charset=utf-8")
@@ -2674,7 +2684,7 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
         if let (Some(ref cache), Some(key), Some(value)) =
             (state.semantic_cache.as_ref(), semantic_cache_key, semantic_cache_store_value)
         {
-            cache.put(key, value).await;
+            semantic_cache_put_with_timeout(cache, key, value, semantic_cache_timeout_duration()).await;
             out_headers.insert(
                 HeaderName::from_static("x-panda-semantic-cache"),
                 HeaderValue::from_static("miss"),
@@ -2687,6 +2697,44 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
         .map_err(|e| ProxyError::Upstream(anyhow::anyhow!("response build: {e}")))?;
     *out.headers_mut() = out_headers;
     Ok(out)
+}
+
+fn semantic_cache_timeout_duration() -> Duration {
+    Duration::from_millis(
+        std::env::var("PANDA_SEMANTIC_CACHE_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_SEMANTIC_CACHE_TIMEOUT_MS),
+    )
+}
+
+async fn semantic_cache_get_with_timeout(
+    cache: &SemanticCache,
+    key: &str,
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    match tokio::time::timeout(timeout, cache.get(key)).await {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("panda semantic-cache: get timed out after {}ms; bypassing cache", timeout.as_millis());
+            None
+        }
+    }
+}
+
+async fn semantic_cache_put_with_timeout(
+    cache: &SemanticCache,
+    key: String,
+    value: Vec<u8>,
+    timeout: Duration,
+) {
+    if tokio::time::timeout(timeout, cache.put(key, value)).await.is_err() {
+        eprintln!(
+            "panda semantic-cache: put timed out after {}ms; skipping cache write",
+            timeout.as_millis()
+        );
+    }
 }
 
 async fn request_upstream_with_timeout(
@@ -4491,6 +4539,27 @@ mcp:
         assert!(s.contains("\"role\":\"assistant\""));
         assert!(s.contains("\"content\":\"hello\""));
         assert!(s.contains("data: [DONE]"));
+    }
+
+    #[test]
+    fn semantic_cache_key_includes_tool_choice_and_metadata() {
+        let a = br#"{
+          "model":"gpt-4o-mini",
+          "messages":[{"role":"user","content":"hi"}],
+          "tools":[{"type":"function","function":{"name":"t","parameters":{"type":"object"}}}],
+          "tool_choice":"auto",
+          "metadata":{"team":"a"}
+        }"#;
+        let b = br#"{
+          "model":"gpt-4o-mini",
+          "messages":[{"role":"user","content":"hi"}],
+          "tools":[{"type":"function","function":{"name":"t","parameters":{"type":"object"}}}],
+          "tool_choice":"required",
+          "metadata":{"team":"b"}
+        }"#;
+        let ka = semantic_cache_key_for_chat_request(a).expect("key a");
+        let kb = semantic_cache_key_for_chat_request(b).expect("key b");
+        assert_ne!(ka, kb);
     }
 
     #[test]

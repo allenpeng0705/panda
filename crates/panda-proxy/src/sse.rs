@@ -288,4 +288,24 @@ mod tests {
         body.process_buffer();
         assert!(body.delta_tokens > 0, "must parse once full line arrives");
     }
+
+    #[tokio::test]
+    async fn sse_counting_handles_utf8_multibyte_split_across_chunks() {
+        let tpm = Arc::new(TpmCounters::connect(None).await.unwrap());
+        let bpe = Arc::new(tiktoken_rs::cl100k_base().unwrap());
+        let mut body = SseCountingBody::new(NoopBody, tpm, "b2".to_string(), bpe);
+
+        let mut part1 = br#"data: {"choices":[{"delta":{"content":""#.to_vec();
+        part1.extend_from_slice(&[0xF0]); // first byte of 😀
+        body.buf.put_slice(&part1);
+        body.process_buffer();
+        assert_eq!(body.delta_tokens, 0, "must not parse incomplete utf8/json line");
+
+        let mut part2 = vec![0x9F, 0x98, 0x80]; // remaining bytes of 😀
+        part2.extend_from_slice(br#""}}]}
+"#);
+        body.buf.put_slice(&part2);
+        body.process_buffer();
+        assert!(body.delta_tokens > 0, "must parse once utf8 sequence is complete");
+    }
 }
