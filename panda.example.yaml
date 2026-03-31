@@ -14,7 +14,7 @@ upstream: "http://127.0.0.1:11434"
 # Falls back to W3C traceparent trace id, then UUID.
 # observability:
 #   correlation_header: "x-request-id"
-#   # Optional ops endpoint auth for /metrics, /plugins/status, /tpm/status
+#   # Optional ops endpoint auth for /metrics, /plugins/status, /tpm/status, /mcp/status
 #   admin_auth_header: "x-panda-admin-secret"
 #   admin_secret_env: "PANDA_ADMIN_STATUS_SECRET"
 #   # Ops auth telemetry on /metrics:
@@ -99,3 +99,49 @@ upstream: "http://127.0.0.1:11434"
 #   redact_patterns:
 #     - "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}"
 #     - "\\b\\d{3}-\\d{2}-\\d{4}\\b"
+
+# Phase 4: semantic cache (MVP in-memory backend, exact canonical-key match).
+# semantic_cache:
+#   enabled: false
+#   similarity_threshold: 0.92
+#   max_entries: 10000
+#   ttl_seconds: 300
+
+# Phase 4: universal adapter (OpenAI ingress -> backend protocol).
+# adapter:
+#   provider: "openai"   # "openai" or "anthropic"
+#   anthropic_version: "2023-06-01"
+# Notes:
+# - Anthropic non-streaming chat is mapped to OpenAI chat completion format.
+# - If OpenAI sets stream=true with provider=anthropic, Panda forwards stream to Anthropic and
+#   translates Anthropic SSE to OpenAI chat.completion.chunk SSE (including data: [DONE]).
+
+# Phase 4: MCP tool servers (stub transports; wire stdio/SSE clients incrementally).
+# When enabled, at least one server entry with enabled=true is required.
+# Optional context enrichment (Phase 4 MVP): set env PANDA_CONTEXT_ENRICHMENT_FILE to a text file
+# with lines like `keyword => snippet` to inject top-matching snippets as a system message.
+# mcp:
+#   enabled: false
+#   fail_open: true
+#   tool_timeout_ms: 30000
+#   max_tool_payload_bytes: 1048576
+#   max_tool_rounds: 4
+#   stream_probe_bytes: 16384
+#   probe_window_seconds: 60
+#   advertise_tools: false
+#   # Proof-of-intent mode: off | audit | enforce
+#   proof_of_intent_mode: "off"
+#   # OpenAI stream=true + MCP tools: first upstream round is buffered (JSON or SSE) to detect
+#   # tool calls; follow-ups keep stream=true; final JSON may be wrapped as SSE for the client.
+#   # Optional intent policy examples (names can be `server.tool` or `mcp_server_tool`):
+#   # intent_tool_policies:
+#   #   - intent: "data_read"
+#   #     allowed_tools: ["demo.list_docs"]
+#   #   - intent: "data_write"
+#   #     allowed_tools: ["demo.update_doc"]
+#   servers:
+#     - name: demo
+#       enabled: true
+#       # Optional: real MCP over stdio (JSON-RPC, one JSON object per line). When omitted, server is a stub.
+#       # command: "npx"
+#       # args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]

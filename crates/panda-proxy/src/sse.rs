@@ -11,8 +11,25 @@ use tiktoken_rs::CoreBPE;
 
 use crate::tpm::TpmCounters;
 
-pub struct SseCountingBody {
-    inner: Incoming,
+pub struct PrefixedBody<B = Incoming> {
+    prefix: Option<Bytes>,
+    inner: B,
+}
+
+impl<B> PrefixedBody<B>
+where
+    B: Body<Data = Bytes, Error = hyper::Error> + Unpin,
+{
+    pub fn new(prefix: Bytes, inner: B) -> Self {
+        Self {
+            prefix: if prefix.is_empty() { None } else { Some(prefix) },
+            inner,
+        }
+    }
+}
+
+pub struct SseCountingBody<B = Incoming> {
+    inner: B,
     buf: BytesMut,
     bucket: String,
     tpm: Arc<TpmCounters>,
@@ -22,8 +39,11 @@ pub struct SseCountingBody {
     finished: bool,
 }
 
-impl SseCountingBody {
-    pub fn new(inner: Incoming, tpm: Arc<TpmCounters>, bucket: String, bpe: Arc<CoreBPE>) -> Self {
+impl<B> SseCountingBody<B>
+where
+    B: Body<Data = Bytes, Error = hyper::Error> + Unpin,
+{
+    pub fn new(inner: B, tpm: Arc<TpmCounters>, bucket: String, bpe: Arc<CoreBPE>) -> Self {
         Self {
             inner,
             buf: BytesMut::new(),
@@ -112,7 +132,10 @@ fn trim_bytes(b: &[u8]) -> &[u8] {
     s
 }
 
-impl Body for SseCountingBody {
+impl<B> Body for SseCountingBody<B>
+where
+    B: Body<Data = Bytes, Error = hyper::Error> + Unpin,
+{
     type Data = Bytes;
     type Error = hyper::Error;
 
@@ -152,5 +175,24 @@ impl Body for SseCountingBody {
                 Err(frame) => Poll::Ready(Some(Ok(frame))),
             },
         }
+    }
+}
+
+impl<B> Body for PrefixedBody<B>
+where
+    B: Body<Data = Bytes, Error = hyper::Error> + Unpin,
+{
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.as_mut().get_mut();
+        if let Some(p) = this.prefix.take() {
+            return Poll::Ready(Some(Ok(Frame::data(p))));
+        }
+        Pin::new(&mut this.inner).poll_frame(cx)
     }
 }

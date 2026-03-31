@@ -7,6 +7,7 @@ license.workspace = true
 description = "HTTP proxy engine: listener, forwarding, future SSE and middleware"
 
 [dependencies]
+async-trait = "0.1"
 aho-corasick = "1"
 anyhow = "1"
 bytes = "1"
@@ -28,8 +29,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tiktoken-rs = "0.5"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "signal"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]

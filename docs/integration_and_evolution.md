@@ -101,6 +101,8 @@ Panda should support a **shadow / observe** mode when placed behind Kong:
 
 Panda emits **OTel** metrics and traces compatible with existing backends (Datadog, Grafana, etc.) so teams are **not** asked to rebuild dashboards for the AI tier.
 
+For streaming MCP operations, use the [operator playbook in the high-level design](./high_level_design.md#operator-playbook-streaming-mcp-probe-tuning) to tune `mcp.stream_probe_bytes` and `mcp.probe_window_seconds` from real traffic signals, and use `/mcp/status` enrichment fields (`enrichment_enabled`, `enrichment_rules_count`, `enrichment_last_mtime_ms`) to validate context-enrichment cache behavior in production.
+
 ---
 
 ## 5. Summary: value proposition

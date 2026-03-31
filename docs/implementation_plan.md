@@ -175,6 +175,8 @@ This plan matches the **Kong-style lesson** you care about: a **thin, native dat
 ### Refine
 
 - **Tool discovery:** send only **intent-relevant** tools to the model to save context window and reduce misuse surface.
+- **Streaming MCP tuning:** tune `mcp.stream_probe_bytes` (how many first-round bytes Panda inspects before passthrough) together with `mcp.probe_window_seconds` (rolling status window) using `/mcp/status` (`probe_window_*`) and `/metrics` (`panda_mcp_stream_probe_*`) to balance TTFT vs early tool-call detection.
+- **Context enrichment runtime health:** verify `/mcp/status` enrichment fields (`enrichment_enabled`, `enrichment_rules_count`, `enrichment_last_mtime_ms`) during rollouts to ensure rules are resident in memory and reloaded on file updates.
 
 ---
 
@@ -186,21 +188,30 @@ This plan matches the **Kong-style lesson** you care about: a **thin, native dat
 
 - **OpenTelemetry** for traces and metrics (HTTP, upstream latency, TTFT, stream duration, plugin time, TPM).
 - **Packaging:** Docker image wrapping the **single static binary**; reproducible builds.
+- **Status:** JSON structured tracing baseline is in place (`RUST_LOG` controlled) with per-request completion events (`method`, `path`, `status`, `correlation_id`, `elapsed_ms`).
 
 ### Implement
 
 - Kubernetes **Deployment** + **ConfigMap** (and Secrets) templates; document upgrade and rollback; **PodDisruptionBudget** / **HPA** hooks as needed for **many replicas** at egress.
-- **Health endpoints:** `/health` (process up) and `/ready` (config loaded, critical deps reachable—define criteria explicitly).
+- Starter manifests are in `k8s/` (`deployment.yaml`, `configmap.yaml`, `service.yaml`, `pdb.yaml`, `hpa.yaml`, `secret.example.yaml`) with probes wired to `/health` and `/ready`.
+- **Health endpoints:** `/health` (process up) and `/ready` with explicit checks:
+  - upstream config URI is valid,
+  - MCP runtime is connected when `mcp.enabled=true` and `mcp.fail_open=false`,
+  - context enrichment source exists when `PANDA_CONTEXT_ENRICHMENT_FILE` is configured.
 
 ### Review
 
 - Load test at scale (e.g. **~5,000** concurrent streams **aggregate** or per shard, per environment—state the topology); watch CPU, RSS, and tail latency; validate no systematic memory growth on long-lived SSE.
 - **Soak test:** run **≥ 24 hours** of steady **SSE** traffic (mix of short and long streams) and confirm **no creep** in RSS, open sockets, or in-flight task counts; catch slow leaks that burst tests miss.
 - Revisit **Phase 1** SLOs under load: TTFT overhead, p99 stream stall time, upstream failover correctness.
+- Use `scripts/staging_readiness_gate.sh` as a repeatable pre-Phase-5 gate for core tests, readiness/status checks, and optional short load probing.
+- Use `scripts/load_profile_chat.sh` for repeatable load snapshots and `scripts/soak_guard_sse.sh` for SSE soak/resource drift checks.
 
 ### Refine
 
 - Allocator tuning (**mimalloc** / **jemalloc**) if fragmentation shows up under long-lived AI streams; validate with benchmarks before committing.
+- Graceful shutdown for rollouts: on SIGTERM, fail `/ready` immediately, stop accepting new connections, and drain active streams up to `PANDA_SHUTDOWN_DRAIN_SECONDS`.
+- Optional allocator feature is wired in `panda-server` (`--features mimalloc`) for A/B comparisons under load.
 
 ---
 

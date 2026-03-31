@@ -147,6 +147,26 @@ This is complementary to API keys: valid keys are insufficient if intent and sco
 
 Operational requirements should favor **clear observability** (structured logs, metrics, traces) aligned with intent and tool events, not only HTTP access lines.
 
+Readiness should be stricter than process liveness: use `/health` for process up, and `/ready` for dependency/config checks (upstream URI validity, MCP runtime availability when fail-closed, and context-enrichment source availability when configured).
+
+### Operator playbook: streaming MCP probe tuning
+
+For `stream=true` chat traffic with MCP enabled, tune probe settings in small steps:
+
+1. **Baseline**
+   - Keep defaults: `mcp.stream_probe_bytes=16384`, `mcp.probe_window_seconds=60`.
+   - Capture baseline TTFT and tool-call success rates for representative workloads.
+2. **Observe**
+   - Check `/mcp/status` windowed fields (`probe_window_seconds`, `probe_window_decisions`, `probe_window_bytes_total`).
+   - Check enrichment cache fields in `/mcp/status` (`enrichment_enabled`, `enrichment_rules_count`, `enrichment_last_mtime_ms`) to confirm context rules are loaded and refresh when the source file changes.
+   - Check `/metrics` counters (`panda_mcp_stream_probe_decision_total`, `panda_mcp_stream_probe_bytes_total`, `panda_mcp_stream_probe_bytes_bucket_total`).
+3. **Tune**
+   - If `passthrough` dominates and TTFT is high, reduce `stream_probe_bytes`.
+   - If missed/late tool detection appears in streaming flows, increase `stream_probe_bytes`.
+   - Use `probe_window_seconds` to match your analysis cadence (short windows for incident response, longer for steady-state tuning).
+4. **Validate**
+   - Re-run load/soak slices and compare TTFT, tool-call completion, and error-rate deltas before adopting new defaults.
+
 ---
 
 ## 6. Extensibility: Wasm plugins

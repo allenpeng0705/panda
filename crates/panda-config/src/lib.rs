@@ -281,6 +281,182 @@ impl Default for PiiConfig {
     }
 }
 
+/// Phase 4: semantic cache controls (MVP in-memory backend).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SemanticCacheConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Similarity threshold placeholder for future embedding/vector backend.
+    #[serde(default = "default_semantic_cache_similarity_threshold")]
+    pub similarity_threshold: f32,
+    /// Max number of cached responses kept in-memory.
+    #[serde(default = "default_semantic_cache_max_entries")]
+    pub max_entries: usize,
+    /// Time-to-live for cache entries in seconds.
+    #[serde(default = "default_semantic_cache_ttl_seconds")]
+    pub ttl_seconds: u64,
+}
+
+fn default_semantic_cache_similarity_threshold() -> f32 {
+    0.92
+}
+
+fn default_semantic_cache_max_entries() -> usize {
+    10_000
+}
+
+fn default_semantic_cache_ttl_seconds() -> u64 {
+    300
+}
+
+impl Default for SemanticCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            similarity_threshold: default_semantic_cache_similarity_threshold(),
+            max_entries: default_semantic_cache_max_entries(),
+            ttl_seconds: default_semantic_cache_ttl_seconds(),
+        }
+    }
+}
+
+/// Phase 4: universal adapter target provider.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdapterConfig {
+    /// Backend provider protocol to target from OpenAI-compatible ingress.
+    /// Supported: `openai` (passthrough), `anthropic` (request/response mapping for non-streaming chat).
+    #[serde(default = "default_adapter_provider")]
+    pub provider: String,
+    /// Anthropic API version header when provider is `anthropic`.
+    #[serde(default = "default_adapter_anthropic_version")]
+    pub anthropic_version: String,
+}
+
+fn default_adapter_provider() -> String {
+    "openai".to_string()
+}
+
+fn default_adapter_anthropic_version() -> String {
+    "2023-06-01".to_string()
+}
+
+impl Default for AdapterConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_adapter_provider(),
+            anthropic_version: default_adapter_anthropic_version(),
+        }
+    }
+}
+
+/// Phase 4: MCP tool servers (stub wiring; real transports added incrementally).
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpConfig {
+    /// When true, load MCP server entries; the proxy runtime is built in the `panda-proxy` crate.
+    #[serde(default)]
+    pub enabled: bool,
+    /// If true, MCP client errors do not fail the overall request path (until chat/tool loop is wired).
+    #[serde(default = "default_mcp_fail_open")]
+    pub fail_open: bool,
+    #[serde(default = "default_mcp_tool_timeout_ms")]
+    pub tool_timeout_ms: u64,
+    #[serde(default = "default_mcp_max_tool_payload_bytes")]
+    pub max_tool_payload_bytes: usize,
+    /// Maximum number of non-streaming tool-call follow-up rounds per request.
+    #[serde(default = "default_mcp_max_tool_rounds")]
+    pub max_tool_rounds: usize,
+    /// Streaming MCP first-round probe budget in bytes before passthrough fallback.
+    #[serde(default = "default_mcp_stream_probe_bytes")]
+    pub stream_probe_bytes: usize,
+    /// Rolling window size in seconds for MCP probe status snapshots.
+    #[serde(default = "default_mcp_probe_window_seconds")]
+    pub probe_window_seconds: u64,
+    /// When true, discovered tools may be advertised to the model (OpenAI-style `tools` field).
+    #[serde(default)]
+    pub advertise_tools: bool,
+    /// Proof-of-intent mode for tool calls: `off`, `audit`, or `enforce`.
+    #[serde(default = "default_mcp_proof_of_intent_mode")]
+    pub proof_of_intent_mode: String,
+    /// Optional allowlist rules: which tool names are allowed for each intent label.
+    #[serde(default)]
+    pub intent_tool_policies: Vec<McpIntentToolPolicy>,
+    #[serde(default)]
+    pub servers: Vec<McpServerConfig>,
+}
+
+fn default_mcp_fail_open() -> bool {
+    true
+}
+
+fn default_mcp_tool_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_mcp_max_tool_payload_bytes() -> usize {
+    1_048_576
+}
+
+fn default_mcp_max_tool_rounds() -> usize {
+    4
+}
+
+fn default_mcp_stream_probe_bytes() -> usize {
+    16 * 1024
+}
+
+fn default_mcp_probe_window_seconds() -> u64 {
+    60
+}
+
+fn default_mcp_proof_of_intent_mode() -> String {
+    "off".to_string()
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            fail_open: default_mcp_fail_open(),
+            tool_timeout_ms: default_mcp_tool_timeout_ms(),
+            max_tool_payload_bytes: default_mcp_max_tool_payload_bytes(),
+            max_tool_rounds: default_mcp_max_tool_rounds(),
+            stream_probe_bytes: default_mcp_stream_probe_bytes(),
+            probe_window_seconds: default_mcp_probe_window_seconds(),
+            advertise_tools: false,
+            proof_of_intent_mode: default_mcp_proof_of_intent_mode(),
+            intent_tool_policies: vec![],
+            servers: vec![],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpServerConfig {
+    /// Stable id for routing (e.g. `filesystem`, `corp-sql`).
+    pub name: String,
+    #[serde(default = "default_mcp_server_enabled")]
+    pub enabled: bool,
+    /// When set, spawn this process and speak MCP over stdin/stdout (JSON-RPC, one object per line).
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+fn default_mcp_server_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpIntentToolPolicy {
+    /// Intent label (example: `general`, `data_read`, `filesystem`).
+    pub intent: String,
+    /// Tool names allowed for this intent.
+    /// Entries may be full OpenAI function names (`mcp_server_tool`) or canonical `server.tool`.
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+}
+
 /// Terminate TLS on the **same** `listen` socket (HTTP disabled for that process).
 #[derive(Debug, Clone, Deserialize)]
 pub struct TlsListenConfig {
@@ -312,6 +488,12 @@ pub struct PandaConfig {
     pub prompt_safety: PromptSafetyConfig,
     #[serde(default)]
     pub pii: PiiConfig,
+    #[serde(default)]
+    pub mcp: McpConfig,
+    #[serde(default)]
+    pub semantic_cache: SemanticCacheConfig,
+    #[serde(default)]
+    pub adapter: AdapterConfig,
 }
 
 impl PandaConfig {
@@ -487,6 +669,76 @@ impl PandaConfig {
                     .map_err(|e| anyhow::anyhow!("invalid pii.redact_patterns regex {p:?}: {e}"))?;
             }
         }
+        if self.mcp.enabled {
+            if self.mcp.tool_timeout_ms == 0 {
+                anyhow::bail!("mcp.tool_timeout_ms must be > 0 when mcp.enabled=true");
+            }
+            if self.mcp.max_tool_payload_bytes == 0 {
+                anyhow::bail!("mcp.max_tool_payload_bytes must be > 0 when mcp.enabled=true");
+            }
+            if self.mcp.max_tool_rounds == 0 {
+                anyhow::bail!("mcp.max_tool_rounds must be > 0 when mcp.enabled=true");
+            }
+            if self.mcp.stream_probe_bytes == 0 {
+                anyhow::bail!("mcp.stream_probe_bytes must be > 0 when mcp.enabled=true");
+            }
+            if self.mcp.probe_window_seconds == 0 {
+                anyhow::bail!("mcp.probe_window_seconds must be > 0 when mcp.enabled=true");
+            }
+            if self.mcp.servers.is_empty() {
+                anyhow::bail!("mcp.servers must not be empty when mcp.enabled=true");
+            }
+            let mut seen = std::collections::HashSet::<String>::new();
+            for s in &self.mcp.servers {
+                if s.name.trim().is_empty() {
+                    anyhow::bail!("mcp.servers entries must have non-empty name");
+                }
+                if let Some(ref c) = s.command {
+                    if c.trim().is_empty() {
+                        anyhow::bail!("mcp.servers command must be non-empty when set");
+                    }
+                }
+                if !seen.insert(s.name.clone()) {
+                    anyhow::bail!("mcp.servers names must be unique: duplicate {:?}", s.name);
+                }
+            }
+            if !self.mcp.servers.iter().any(|s| s.enabled) {
+                anyhow::bail!("mcp.enabled requires at least one mcp.servers entry with enabled=true");
+            }
+            match self.mcp.proof_of_intent_mode.as_str() {
+                "off" | "audit" | "enforce" => {}
+                _ => anyhow::bail!("mcp.proof_of_intent_mode must be one of: off, audit, enforce"),
+            }
+            for p in &self.mcp.intent_tool_policies {
+                if p.intent.trim().is_empty() {
+                    anyhow::bail!("mcp.intent_tool_policies.intent must be non-empty");
+                }
+                if p.allowed_tools.is_empty() {
+                    anyhow::bail!("mcp.intent_tool_policies.allowed_tools must not be empty");
+                }
+                if p.allowed_tools.iter().any(|t| t.trim().is_empty()) {
+                    anyhow::bail!("mcp.intent_tool_policies.allowed_tools entries must be non-empty");
+                }
+            }
+        }
+        if self.semantic_cache.enabled {
+            if !(0.0..=1.0).contains(&self.semantic_cache.similarity_threshold) {
+                anyhow::bail!("semantic_cache.similarity_threshold must be within [0.0, 1.0]");
+            }
+            if self.semantic_cache.max_entries == 0 {
+                anyhow::bail!("semantic_cache.max_entries must be > 0 when semantic_cache.enabled=true");
+            }
+            if self.semantic_cache.ttl_seconds == 0 {
+                anyhow::bail!("semantic_cache.ttl_seconds must be > 0 when semantic_cache.enabled=true");
+            }
+        }
+        match self.adapter.provider.as_str() {
+            "openai" | "anthropic" => {}
+            _ => anyhow::bail!("adapter.provider must be one of: openai, anthropic"),
+        }
+        if self.adapter.anthropic_version.trim().is_empty() {
+            anyhow::bail!("adapter.anthropic_version must be non-empty");
+        }
         Ok(())
     }
 
@@ -566,5 +818,114 @@ mod tests {
         assert!(!cfg.pii.enabled);
         assert!(cfg.pii.redact_patterns.is_empty());
         assert_eq!(cfg.pii.replacement, "[REDACTED]");
+        assert!(!cfg.mcp.enabled);
+        assert!(cfg.mcp.fail_open);
+        assert_eq!(cfg.mcp.tool_timeout_ms, 30_000);
+        assert_eq!(cfg.mcp.max_tool_payload_bytes, 1_048_576);
+        assert_eq!(cfg.mcp.max_tool_rounds, 4);
+        assert_eq!(cfg.mcp.stream_probe_bytes, 16 * 1024);
+        assert_eq!(cfg.mcp.probe_window_seconds, 60);
+        assert!(!cfg.mcp.advertise_tools);
+        assert_eq!(cfg.mcp.proof_of_intent_mode, "off");
+        assert!(cfg.mcp.intent_tool_policies.is_empty());
+        assert!(cfg.mcp.servers.is_empty());
+        assert!(!cfg.semantic_cache.enabled);
+        assert_eq!(cfg.semantic_cache.similarity_threshold, 0.92);
+        assert_eq!(cfg.semantic_cache.max_entries, 10_000);
+        assert_eq!(cfg.semantic_cache.ttl_seconds, 300);
+        assert_eq!(cfg.adapter.provider, "openai");
+        assert_eq!(cfg.adapter.anthropic_version, "2023-06-01");
+    }
+
+    #[test]
+    fn rejects_mcp_enabled_without_servers() {
+        let err = PandaConfig::from_yaml_str(
+            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+             mcp:\n  enabled: true\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("mcp.servers"));
+    }
+
+    #[test]
+    fn accepts_mcp_enabled_with_one_server() {
+        let cfg = PandaConfig::from_yaml_str(
+            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+             mcp:\n  enabled: true\n  servers:\n    - name: demo\n",
+        )
+        .unwrap();
+        assert!(cfg.mcp.enabled);
+        assert_eq!(cfg.mcp.servers.len(), 1);
+        assert_eq!(cfg.mcp.servers[0].name, "demo");
+    }
+
+    #[test]
+    fn rejects_invalid_mcp_proof_of_intent_mode() {
+        let err = PandaConfig::from_yaml_str(
+            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+             mcp:\n  enabled: true\n  proof_of_intent_mode: strict\n  servers:\n    - name: demo\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("proof_of_intent_mode"));
+    }
+
+    #[test]
+    fn rejects_empty_mcp_command_when_set() {
+        let err = PandaConfig::from_yaml_str(
+            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+             mcp:\n  enabled: true\n  servers:\n    - name: demo\n      command: ''\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("command"));
+    }
+
+    #[test]
+    fn rejects_invalid_mcp_max_tool_rounds() {
+        let err = PandaConfig::from_yaml_str(
+            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+             mcp:\n  enabled: true\n  max_tool_rounds: 0\n  servers:\n    - name: demo\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("mcp.max_tool_rounds"));
+    }
+
+    #[test]
+    fn rejects_invalid_mcp_stream_probe_bytes() {
+        let err = PandaConfig::from_yaml_str(
+            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+             mcp:\n  enabled: true\n  stream_probe_bytes: 0\n  servers:\n    - name: demo\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("mcp.stream_probe_bytes"));
+    }
+
+    #[test]
+    fn rejects_invalid_mcp_probe_window_seconds() {
+        let err = PandaConfig::from_yaml_str(
+            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+             mcp:\n  enabled: true\n  probe_window_seconds: 0\n  servers:\n    - name: demo\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("mcp.probe_window_seconds"));
+    }
+
+    #[test]
+    fn rejects_invalid_semantic_cache_threshold() {
+        let err = PandaConfig::from_yaml_str(
+            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+             semantic_cache:\n  enabled: true\n  similarity_threshold: 1.2\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("semantic_cache.similarity_threshold"));
+    }
+
+    #[test]
+    fn rejects_invalid_adapter_provider() {
+        let err = PandaConfig::from_yaml_str(
+            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+             adapter:\n  provider: gemini\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("adapter.provider"));
     }
 }

@@ -4,8 +4,23 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
+use tracing_subscriber::EnvFilter;
+
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+fn init_observability() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .json()
+        .try_init();
+}
 
 fn main() -> anyhow::Result<()> {
+    init_observability();
+
     let config_path = std::env::args()
         .nth(1)
         .map(PathBuf::from)

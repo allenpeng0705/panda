@@ -1,2 +1,132 @@
 # Panda
-Panda is a next-generation AI Gateway built in Rust designed to manage the transition from the API era to the AI Agent era.
+
+Panda is a Rust AI gateway for agent-era traffic. It sits between your client and model providers, and adds policy, security, observability, MCP tool orchestration, and production-ready operations.
+
+## What Panda Gives You
+
+- OpenAI-compatible ingress for chat/streaming traffic.
+- MCP host support with tool-call interception and multi-hop follow-up.
+- Policy and safety controls (JWT, prompt safety, PII scrubbing, proof-of-intent).
+- Semantic cache and optional context enrichment.
+- Operational endpoints (`/health`, `/ready`, `/metrics`, `/mcp/status`, `/tpm/status`).
+- Kubernetes-friendly behavior (readiness gates, graceful drain on shutdown).
+
+## Architecture (High Level)
+
+```mermaid
+flowchart LR
+  C[Client / Agent SDK] --> P[Panda Gateway]
+  P --> U[LLM Upstream]
+  P --> M[MCP Tool Servers]
+  P --> O[Ops: Metrics/Status/Logs]
+
+  subgraph Panda
+    I[Ingress + Auth]
+    S[Safety + Policy]
+    A[Adapter + Streaming]
+    T[TPM + Cache + Context]
+  end
+
+  P --> I --> S --> A --> T
+```
+
+## QuickStart
+
+### 1) Local (Cargo)
+
+1. Copy example config:
+   - `cp panda.example.yaml panda.yaml`
+2. Set your upstream in `panda.yaml`:
+   - `upstream: "http://127.0.0.1:11434"` (or your provider endpoint)
+3. Start Panda:
+   - `cargo run -p panda-server -- panda.yaml`
+4. Health check:
+   - `curl -s http://127.0.0.1:8080/health`
+
+Minimal chat test:
+
+```bash
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model":"gpt-4o-mini",
+    "messages":[{"role":"user","content":"hello from panda"}]
+  }'
+```
+
+Optional structured logs:
+
+- `RUST_LOG=info cargo run -p panda-server -- panda.yaml`
+
+### 2) Docker
+
+Build and run:
+
+```bash
+docker build -t panda:latest .
+docker run --rm -p 8080:8080 \
+  -v "$(pwd)/panda.yaml:/app/panda.yaml:ro" \
+  panda:latest /app/panda.yaml
+```
+
+### 3) Kubernetes
+
+Starter manifests are in `k8s/`:
+
+- `configmap.yaml`
+- `deployment.yaml`
+- `service.yaml`
+- `pdb.yaml`
+- `hpa.yaml`
+- `secret.example.yaml`
+
+Deploy:
+
+```bash
+kubectl apply -f k8s/configmap.yaml
+kubectl apply -f k8s/secret.example.yaml
+kubectl apply -f k8s/deployment.yaml
+kubectl apply -f k8s/service.yaml
+kubectl apply -f k8s/pdb.yaml
+kubectl apply -f k8s/hpa.yaml
+```
+
+Rollback:
+
+```bash
+kubectl rollout undo deployment/panda
+kubectl rollout status deployment/panda
+```
+
+## Runtime Behavior (Production)
+
+- `/health` reports process liveness.
+- `/ready` reports real readiness (config/runtime checks) and turns not-ready during shutdown drain.
+- On `SIGTERM`/`SIGINT`, Panda stops accepting new work and drains active connections up to `PANDA_SHUTDOWN_DRAIN_SECONDS` (default `30`).
+
+## Validation and Performance Scripts
+
+- Pre-rollout gate:
+  - `PANDA_BASE_URL=http://127.0.0.1:8080 ./scripts/staging_readiness_gate.sh`
+- Load profile:
+  - `PANDA_BASE_URL=http://127.0.0.1:8080 LOAD_PAYLOAD=./payload.json LOAD_REQUESTS=500 LOAD_CONCURRENCY=50 ./scripts/load_profile_chat.sh`
+- SSE soak guard:
+  - `PANDA_BASE_URL=http://127.0.0.1:8080 SOAK_PAYLOAD=./payload_stream.json SOAK_DURATION_SECONDS=3600 SOAK_CONCURRENCY=10 SOAK_PID=<panda_pid> ./scripts/soak_guard_sse.sh`
+
+All script outputs are written to `artifacts/` (git-ignored).
+
+## Optional Allocator Tuning
+
+For long-lived streaming workloads, compare allocator behavior with:
+
+```bash
+cargo build -p panda-server --release --features mimalloc
+```
+
+Enable only after load/soak evidence in your environment.
+
+## Documentation Map
+
+- Implementation roadmap: `docs/implementation_plan.md`
+- High-level architecture: `docs/high_level_design.md`
+- Integration strategy: `docs/integration_and_evolution.md`
