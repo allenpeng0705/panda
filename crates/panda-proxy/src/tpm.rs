@@ -6,6 +6,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use redis::AsyncCommands;
 
+const PROMPT_BUDGET_LUA: &str = r#"
+local cur = tonumber(redis.call('GET', KEYS[1]) or 0)
+local n = tonumber(ARGV[1])
+local limit = tonumber(ARGV[2])
+if cur + n > limit then
+  return 0
+end
+redis.call('INCRBY', KEYS[1], n)
+redis.call('EXPIRE', KEYS[1], 120)
+redis.call('INCRBY', KEYS[2], n)
+return 1
+"#;
+
 pub struct TpmCounters {
     mem: Mutex<HashMap<String, (u64, u64)>>,
     mem_prompt_window: Mutex<HashMap<String, (std::time::Instant, u64)>>,
@@ -25,6 +38,62 @@ impl TpmCounters {
             mem_prompt_window: Mutex::new(HashMap::new()),
             redis,
         })
+    }
+
+    /// Atomically reserve `n` prompt tokens for the current minute window when under `limit`.
+    /// Returns false when the request would exceed the budget (nothing is applied).
+    pub async fn try_reserve_prompt_budget(&self, bucket: &str, n: u64, limit_per_minute: u64) -> bool {
+        if n == 0 {
+            return true;
+        }
+        if limit_per_minute == 0 {
+            return false;
+        }
+        if let Some(ref mgr) = self.redis {
+            let mut conn = mgr.clone();
+            let minute = unix_minute();
+            let window_key = format!("panda:tpm:v1:prompt_window:{bucket}:{minute}");
+            let total_key = format!("panda:tpm:v1:prompt:{bucket}");
+            match redis::cmd("EVAL")
+                .arg(PROMPT_BUDGET_LUA)
+                .arg(2usize)
+                .arg(&window_key)
+                .arg(&total_key)
+                .arg(n as i64)
+                .arg(limit_per_minute as i64)
+                .query_async::<i64>(&mut conn)
+                .await
+            {
+                Ok(1) => return true,
+                Ok(0) => return false,
+                Ok(_) => {
+                    eprintln!("panda tpm: unexpected lua return from prompt budget script");
+                    return self.try_reserve_prompt_budget_memory(bucket, n, limit_per_minute);
+                }
+                Err(e) => {
+                    eprintln!("panda tpm: redis prompt budget script failed: {e}; falling back to in-memory window");
+                    return self.try_reserve_prompt_budget_memory(bucket, n, limit_per_minute);
+                }
+            }
+        }
+        self.try_reserve_prompt_budget_memory(bucket, n, limit_per_minute)
+    }
+
+    fn try_reserve_prompt_budget_memory(&self, bucket: &str, n: u64, limit_per_minute: u64) -> bool {
+        let now = std::time::Instant::now();
+        let mut g = self.mem_prompt_window.lock().expect("tpm mutex poisoned");
+        let e = g.entry(bucket.to_string()).or_insert((now, 0));
+        if now.duration_since(e.0) >= std::time::Duration::from_secs(60) {
+            *e = (now, 0);
+        }
+        if e.1.saturating_add(n) > limit_per_minute {
+            return false;
+        }
+        e.1 = e.1.saturating_add(n);
+        drop(g);
+        let mut g = self.mem.lock().expect("tpm mutex poisoned");
+        g.entry(bucket.to_string()).or_default().0 += n;
+        true
     }
 
     pub async fn add_prompt_tokens(&self, bucket: &str, n: u64) {
@@ -68,26 +137,6 @@ impl TpmCounters {
             let key = format!("panda:tpm:v1:completion:{bucket}");
             let _: Result<i64, _> = conn.incr(&key, n as i64).await;
         }
-    }
-
-    /// Returns true when adding `n` would exceed `limit_per_minute`.
-    pub async fn would_exceed_prompt_budget(&self, bucket: &str, n: u64, limit_per_minute: u64) -> bool {
-        if let Some(ref mgr) = self.redis {
-            let mut conn = mgr.clone();
-            let minute = unix_minute();
-            let window_key = format!("panda:tpm:v1:prompt_window:{bucket}:{minute}");
-            let cur: Result<Option<u64>, _> = conn.get(&window_key).await;
-            if let Ok(current) = cur {
-                return current.unwrap_or(0).saturating_add(n) > limit_per_minute;
-            }
-        }
-        let now = std::time::Instant::now();
-        let mut g = self.mem_prompt_window.lock().expect("tpm mutex poisoned");
-        let e = g.entry(bucket.to_string()).or_insert((now, 0));
-        if now.duration_since(e.0) >= std::time::Duration::from_secs(60) {
-            *e = (now, 0);
-        }
-        e.1.saturating_add(n) > limit_per_minute
     }
 
     /// Returns `(used, remaining)` for the active prompt budget window.
@@ -156,10 +205,9 @@ mod tests {
     #[tokio::test]
     async fn in_memory_prompt_budget_enforced() {
         let counters = TpmCounters::connect(None).await.unwrap();
-        assert!(!counters.would_exceed_prompt_budget("u1", 50, 100).await);
-        counters.add_prompt_tokens("u1", 50).await;
-        assert!(counters.would_exceed_prompt_budget("u1", 51, 100).await);
-        assert!(!counters.would_exceed_prompt_budget("u1", 50, 100).await);
+        assert!(counters.try_reserve_prompt_budget("u1", 50, 100).await);
+        assert!(!counters.try_reserve_prompt_budget("u1", 51, 100).await);
+        assert!(counters.try_reserve_prompt_budget("u1", 50, 100).await);
     }
 
     #[tokio::test]

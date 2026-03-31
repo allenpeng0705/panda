@@ -20,6 +20,7 @@ use aho_corasick::AhoCorasick;
 use constant_time_eq::constant_time_eq;
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http_body_util::BodyExt;
+use http_body_util::Limited;
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::Full;
 use hyper::body::Incoming;
@@ -604,7 +605,7 @@ async fn dispatch(req: Request<Incoming>, state: Arc<ProxyState>) -> Result<Resp
         return Ok(json_response(StatusCode::OK, json));
     }
     if method == hyper::Method::GET && path == "/tpm/status" {
-        let json = tpm_status_json(state.as_ref(), req.headers()).await;
+        let json = tpm_status_json(state.as_ref(), path, req.headers()).await;
         return Ok(json_response(StatusCode::OK, json));
     }
 
@@ -774,6 +775,7 @@ fn maybe_exchange_agent_token(headers: &HeaderMap, cfg: &PandaConfig) -> Result<
 
 enum ProxyError {
     PolicyReject(String),
+    PayloadTooLarge(&'static str),
     RateLimited {
         limit: u64,
         estimate: u64,
@@ -790,13 +792,48 @@ impl From<anyhow::Error> for ProxyError {
     }
 }
 
-fn estimate_prompt_tokens_hint(headers: &HeaderMap) -> u64 {
+fn parse_content_length(headers: &HeaderMap) -> Option<usize> {
     headers
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(|n| n.saturating_div(4))
-        .unwrap_or(0)
+        .and_then(|s| s.parse().ok())
+}
+
+/// Token estimate: max of `Content-Length/4` and actual buffered body length/4 when present.
+fn tpm_token_estimate(content_length: Option<usize>, body_len: Option<usize>) -> u64 {
+    let mut e = 0u64;
+    if let Some(n) = content_length {
+        e = e.max((n as u64).saturating_div(4));
+    }
+    if let Some(len) = body_len {
+        e = e.max((len as u64).saturating_div(4));
+    }
+    e
+}
+
+fn merge_jwt_identity_into_context(ctx: &mut RequestContext, headers: &HeaderMap, path: &str, cfg: &PandaConfig) {
+    if !cfg.identity.require_jwt || ctx.subject.is_some() {
+        return;
+    }
+    if let Ok(claims) = validate_and_decode_bearer_jwt(headers, path, cfg) {
+        if let Some(s) = claims.sub {
+            let t = s.trim();
+            if !t.is_empty() {
+                ctx.subject = Some(t.to_string());
+            }
+        }
+    }
+}
+
+async fn collect_body_bounded(body: Incoming, max: usize) -> Result<bytes::Bytes, ProxyError> {
+    let limited = Limited::new(body, max);
+    match limited.collect().await {
+        Ok(collected) => Ok(collected.to_bytes()),
+        Err(e) => {
+            eprintln!("panda: bounded body collect failed: {e}");
+            Err(ProxyError::PayloadTooLarge("request body exceeds configured limit"))
+        }
+    }
 }
 
 fn tpm_bucket_key(ctx: &RequestContext) -> String {
@@ -817,10 +854,11 @@ fn tpm_bucket_class(ctx: &RequestContext) -> &'static str {
     }
 }
 
-async fn tpm_status_json(state: &ProxyState, req_headers: &HeaderMap) -> serde_json::Value {
+async fn tpm_status_json(state: &ProxyState, path: &str, req_headers: &HeaderMap) -> serde_json::Value {
     let mut headers = req_headers.clone();
     let secret = gateway::trusted_gateway_secret_from_env();
-    let ctx = gateway::apply_trusted_gateway(&mut headers, &state.config.trusted_gateway, secret.as_deref());
+    let mut ctx = gateway::apply_trusted_gateway(&mut headers, &state.config.trusted_gateway, secret.as_deref());
+    merge_jwt_identity_into_context(&mut ctx, &headers, path, &state.config);
     let bucket = tpm_bucket_key(&ctx);
     if !state.config.tpm.enforce_budget {
         return serde_json::json!({
@@ -851,7 +889,8 @@ fn ops_bucket_for_path(path: &str, req_headers: &HeaderMap, state: &ProxyState) 
     }
     let mut headers = req_headers.clone();
     let secret = gateway::trusted_gateway_secret_from_env();
-    let ctx = gateway::apply_trusted_gateway(&mut headers, &state.config.trusted_gateway, secret.as_deref());
+    let mut ctx = gateway::apply_trusted_gateway(&mut headers, &state.config.trusted_gateway, secret.as_deref());
+    merge_jwt_identity_into_context(&mut ctx, &headers, path, &state.config);
     Some(tpm_bucket_key(&ctx))
 }
 
@@ -959,54 +998,55 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
     let secret = gateway::trusted_gateway_secret_from_env();
     let mut ctx = gateway::apply_trusted_gateway(&mut headers, &state.config.trusted_gateway, secret.as_deref());
     ctx.correlation_id = correlation_id;
-
-    let est = estimate_prompt_tokens_hint(&headers);
+    let path = parts.uri.path();
+    merge_jwt_identity_into_context(&mut ctx, &headers, path, &state.config);
     let bucket = tpm_bucket_key(&ctx);
-    if state.config.tpm.enforce_budget {
-        let limit = state.config.tpm.budget_tokens_per_minute;
-        if state.tpm.would_exceed_prompt_budget(&bucket, est, limit).await {
-            state
-                .ops_metrics
-                .inc_tpm_budget_rejected(tpm_bucket_class(&ctx));
-            let (used, remaining) = state.tpm.prompt_budget_snapshot(&bucket, limit).await;
-            let retry_after_seconds = if let Some(s) = state.config.tpm.retry_after_seconds {
-                s
-            } else {
-                state.tpm.prompt_budget_retry_after_seconds(&bucket).await
-            };
-            return Err(ProxyError::RateLimited {
-                limit,
-                estimate: est,
-                used,
-                remaining,
-                retry_after_seconds,
-            });
+
+    let max_body = state.config.plugins.max_request_body_bytes;
+    let cl = parse_content_length(&parts.headers);
+    if let Some(n) = cl {
+        if n > max_body {
+            return Err(ProxyError::PayloadTooLarge("Content-Length exceeds configured limit"));
         }
     }
-    state
-        .tpm
-        .add_prompt_tokens(&bucket, est)
-        .await;
 
-    log_request_context(&ctx);
+    let needs_body_hooks = state.plugins.is_some() || state.config.pii.enabled || state.config.prompt_safety.enabled;
+    let tpm_on = state.config.tpm.enforce_budget;
+    let need_early_buffer = needs_body_hooks || (tpm_on && cl.is_none());
 
-    parts.headers = headers;
+    let (est, boxed_req_body): (u64, BoxBody) = if need_early_buffer {
+        let buf = collect_body_bounded(body, max_body).await?.to_vec();
+        let est = tpm_token_estimate(cl, Some(buf.len()));
+        if tpm_on {
+            let limit = state.config.tpm.budget_tokens_per_minute;
+            if !state.tpm.try_reserve_prompt_budget(&bucket, est, limit).await {
+                state
+                    .ops_metrics
+                    .inc_tpm_budget_rejected(tpm_bucket_class(&ctx));
+                let (used, remaining) = state.tpm.prompt_budget_snapshot(&bucket, limit).await;
+                let retry_after_seconds = if let Some(s) = state.config.tpm.retry_after_seconds {
+                    s
+                } else {
+                    state.tpm.prompt_budget_retry_after_seconds(&bucket).await
+                };
+                return Err(ProxyError::RateLimited {
+                    limit,
+                    estimate: est,
+                    used,
+                    remaining,
+                    retry_after_seconds,
+                });
+            }
+        } else {
+            state.tpm.add_prompt_tokens(&bucket, est).await;
+        }
+        log_request_context(&ctx);
+        parts.headers = headers;
 
-    let content_len_ok = parts
-        .headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<usize>().ok())
-        .is_some_and(|n| n <= state.config.plugins.max_request_body_bytes);
-    let should_buffer_body = content_len_ok && (state.plugins.is_some() || state.config.pii.enabled || state.config.prompt_safety.enabled);
-    let boxed_req_body: BoxBody = if should_buffer_body {
-        let collected = body
-            .collect()
-            .await
-            .map_err(|e| ProxyError::Upstream(anyhow::anyhow!("collect body: {e}")))?;
-        let original = collected.to_bytes();
+        let original = buf.clone();
+        let mut next_bytes = buf;
         if state.config.prompt_safety.enabled {
-            let body_text = String::from_utf8_lossy(&original);
+            let body_text = String::from_utf8_lossy(&next_bytes);
             if let Some(pat) = matches_deny_pattern(
                 &body_text,
                 state.prompt_safety_matcher.as_deref(),
@@ -1016,7 +1056,6 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
             }
         }
 
-        let mut next_bytes = original.to_vec();
         if state.config.pii.enabled {
             next_bytes = scrub_pii_bytes(
                 &next_bytes,
@@ -1024,7 +1063,7 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
                 &state.config.pii.replacement,
             )
             .map_err(ProxyError::Upstream)?;
-            if next_bytes != original.as_ref() {
+            if next_bytes != original {
                 parts.headers.insert(
                     HeaderName::from_static("x-panda-pii-redacted"),
                     HeaderValue::from_static("true"),
@@ -1052,16 +1091,45 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
                         return Err(proxy_error_from_wasm(e));
                     }
                     eprintln!("panda: wasm body hook fail-open: {e:?}");
-                    original.to_vec()
+                    original
                 }
             };
         }
 
-        Full::new(bytes::Bytes::from(next_bytes))
-            .map_err(|never: std::convert::Infallible| match never {})
-            .boxed_unsync()
+        (
+            est,
+            Full::new(bytes::Bytes::from(next_bytes))
+                .map_err(|never: std::convert::Infallible| match never {})
+                .boxed_unsync(),
+        )
     } else {
-        body.map_err(|e| e).boxed_unsync()
+        let est = tpm_token_estimate(cl, None);
+        if tpm_on {
+            let limit = state.config.tpm.budget_tokens_per_minute;
+            if !state.tpm.try_reserve_prompt_budget(&bucket, est, limit).await {
+                state
+                    .ops_metrics
+                    .inc_tpm_budget_rejected(tpm_bucket_class(&ctx));
+                let (used, remaining) = state.tpm.prompt_budget_snapshot(&bucket, limit).await;
+                let retry_after_seconds = if let Some(s) = state.config.tpm.retry_after_seconds {
+                    s
+                } else {
+                    state.tpm.prompt_budget_retry_after_seconds(&bucket).await
+                };
+                return Err(ProxyError::RateLimited {
+                    limit,
+                    estimate: est,
+                    used,
+                    remaining,
+                    retry_after_seconds,
+                });
+            }
+        } else {
+            state.tpm.add_prompt_tokens(&bucket, est).await;
+        }
+        log_request_context(&ctx);
+        parts.headers = headers;
+        (est, body.map_err(|e| e).boxed_unsync())
     };
     let req_up = Request::from_parts(parts, boxed_req_body);
 
@@ -1160,6 +1228,10 @@ fn proxy_error_response(e: ProxyError) -> Response<BoxBody> {
         ProxyError::PolicyReject(msg) => {
             eprintln!("policy reject: {msg}");
             text_response(StatusCode::FORBIDDEN, "forbidden: request rejected by policy")
+        }
+        ProxyError::PayloadTooLarge(msg) => {
+            eprintln!("payload too large: {msg}");
+            text_response(StatusCode::PAYLOAD_TOO_LARGE, "payload too large")
         }
         ProxyError::RateLimited {
             limit,
@@ -1382,6 +1454,149 @@ mod tests {
     }
 
     #[test]
+    fn tpm_token_estimate_prefers_larger_of_hints() {
+        assert_eq!(super::tpm_token_estimate(None, None), 0);
+        assert_eq!(super::tpm_token_estimate(Some(100), None), 25);
+        assert_eq!(super::tpm_token_estimate(None, Some(200)), 50);
+        assert_eq!(super::tpm_token_estimate(Some(100), Some(200)), 50);
+    }
+
+    #[test]
+    fn merge_jwt_identity_sets_subject_when_require_jwt_and_no_gateway_subject() {
+        #[derive(serde::Serialize)]
+        struct Claims {
+            sub: &'static str,
+            iss: &'static str,
+            aud: &'static str,
+            scope: &'static str,
+            exp: usize,
+        }
+        let secret_env = "PANDA_TEST_MERGE_JWT_SECRET";
+        unsafe {
+            std::env::set_var(secret_env, "merge-secret");
+        }
+        let exp = (StdSystemTime::now() + StdDuration::from_secs(300))
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as usize;
+        let token = encode(
+            &Header::default(),
+            &Claims {
+                sub: "jwt-user",
+                iss: "https://issuer.example",
+                aud: "panda-gateway",
+                scope: "gateway:invoke",
+                exp,
+            },
+            &EncodingKey::from_secret("merge-secret".as_bytes()),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        let cfg = PandaConfig {
+            listen: "127.0.0.1:0".to_string(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            trusted_gateway: Default::default(),
+            observability: Default::default(),
+            tpm: Default::default(),
+            tls: None,
+            plugins: Default::default(),
+            identity: panda_config::IdentityConfig {
+                require_jwt: true,
+                jwt_hs256_secret_env: secret_env.to_string(),
+                accepted_issuers: vec!["https://issuer.example".to_string()],
+                accepted_audiences: vec!["panda-gateway".to_string()],
+                required_scopes: vec!["gateway:invoke".to_string()],
+                route_scope_rules: vec![],
+                enable_token_exchange: false,
+                agent_token_secret_env: "PANDA_AGENT_TOKEN_HS256_SECRET".to_string(),
+                agent_token_ttl_seconds: 300,
+                agent_token_scopes: vec![],
+            },
+            prompt_safety: Default::default(),
+            pii: Default::default(),
+        };
+        let mut ctx = RequestContext::default();
+        super::merge_jwt_identity_into_context(&mut ctx, &headers, "/v1/chat", &cfg);
+        assert_eq!(ctx.subject.as_deref(), Some("jwt-user"));
+        unsafe {
+            std::env::remove_var(secret_env);
+        }
+    }
+
+    #[test]
+    fn merge_jwt_identity_preserves_gateway_subject() {
+        #[derive(serde::Serialize)]
+        struct Claims {
+            sub: &'static str,
+            iss: &'static str,
+            aud: &'static str,
+            scope: &'static str,
+            exp: usize,
+        }
+        let secret_env = "PANDA_TEST_MERGE_JWT_SECRET2";
+        unsafe {
+            std::env::set_var(secret_env, "merge-secret-2");
+        }
+        let exp = (StdSystemTime::now() + StdDuration::from_secs(300))
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as usize;
+        let token = encode(
+            &Header::default(),
+            &Claims {
+                sub: "jwt-user",
+                iss: "https://issuer.example",
+                aud: "panda-gateway",
+                scope: "gateway:invoke",
+                exp,
+            },
+            &EncodingKey::from_secret("merge-secret-2".as_bytes()),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        let cfg = PandaConfig {
+            listen: "127.0.0.1:0".to_string(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            trusted_gateway: Default::default(),
+            observability: Default::default(),
+            tpm: Default::default(),
+            tls: None,
+            plugins: Default::default(),
+            identity: panda_config::IdentityConfig {
+                require_jwt: true,
+                jwt_hs256_secret_env: secret_env.to_string(),
+                accepted_issuers: vec!["https://issuer.example".to_string()],
+                accepted_audiences: vec!["panda-gateway".to_string()],
+                required_scopes: vec!["gateway:invoke".to_string()],
+                route_scope_rules: vec![],
+                enable_token_exchange: false,
+                agent_token_secret_env: "PANDA_AGENT_TOKEN_HS256_SECRET".to_string(),
+                agent_token_ttl_seconds: 300,
+                agent_token_scopes: vec![],
+            },
+            prompt_safety: Default::default(),
+            pii: Default::default(),
+        };
+        let mut ctx = RequestContext {
+            subject: Some("gateway-subject".into()),
+            ..Default::default()
+        };
+        super::merge_jwt_identity_into_context(&mut ctx, &headers, "/v1/chat", &cfg);
+        assert_eq!(ctx.subject.as_deref(), Some("gateway-subject"));
+        unsafe {
+            std::env::remove_var(secret_env);
+        }
+    }
+
+    #[test]
     fn policy_reject_maps_to_403() {
         let err = proxy_error_from_wasm(WasmCallError::Hook(HookFailure::PolicyReject {
             plugin: "demo".to_string(),
@@ -1414,6 +1629,12 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(resp.headers().get("retry-after").and_then(|v| v.to_str().ok()), Some("17"));
         assert_eq!(resp.headers().get("x-panda-budget-limit").and_then(|v| v.to_str().ok()), Some("100"));
+    }
+
+    #[test]
+    fn payload_too_large_maps_to_413() {
+        let resp = proxy_error_response(ProxyError::PayloadTooLarge("over limit"));
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]
@@ -1494,13 +1715,88 @@ mod tests {
             ops_metrics: OpsMetrics::default(),
             plugins: None,
         };
-        let json = tpm_status_json(&state, &HeaderMap::new()).await;
+        let json = tpm_status_json(&state, "/tpm/status", &HeaderMap::new()).await;
         assert_eq!(json.get("enforce_budget").and_then(|v| v.as_bool()), Some(true));
         assert_eq!(json.get("bucket").and_then(|v| v.as_str()), Some("anonymous"));
         assert_eq!(json.get("limit").and_then(|v| v.as_u64()), Some(100));
         assert_eq!(json.get("used").and_then(|v| v.as_u64()), Some(30));
         assert_eq!(json.get("remaining").and_then(|v| v.as_u64()), Some(70));
         assert_eq!(json.get("retry_after_seconds").and_then(|v| v.as_u64()), Some(9));
+    }
+
+    #[tokio::test]
+    async fn tpm_status_json_bucket_reflects_jwt_sub() {
+        #[derive(serde::Serialize)]
+        struct Claims {
+            sub: &'static str,
+            iss: &'static str,
+            aud: &'static str,
+            scope: &'static str,
+            exp: usize,
+        }
+        let secret_env = "PANDA_TEST_TPM_STATUS_JWT_SECRET";
+        unsafe {
+            std::env::set_var(secret_env, "status-jwt-secret");
+        }
+        let exp = (StdSystemTime::now() + StdDuration::from_secs(300))
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as usize;
+        let token = encode(
+            &Header::default(),
+            &Claims {
+                sub: "status-user",
+                iss: "https://issuer.example",
+                aud: "panda-gateway",
+                scope: "gateway:invoke",
+                exp,
+            },
+            &EncodingKey::from_secret("status-jwt-secret".as_bytes()),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        let cfg = Arc::new(PandaConfig {
+            listen: "127.0.0.1:0".to_string(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            trusted_gateway: Default::default(),
+            observability: Default::default(),
+            tpm: Default::default(),
+            tls: None,
+            plugins: Default::default(),
+            identity: panda_config::IdentityConfig {
+                require_jwt: true,
+                jwt_hs256_secret_env: secret_env.to_string(),
+                accepted_issuers: vec!["https://issuer.example".to_string()],
+                accepted_audiences: vec!["panda-gateway".to_string()],
+                required_scopes: vec!["gateway:invoke".to_string()],
+                route_scope_rules: vec![],
+                enable_token_exchange: false,
+                agent_token_secret_env: "PANDA_AGENT_TOKEN_HS256_SECRET".to_string(),
+                agent_token_ttl_seconds: 300,
+                agent_token_scopes: vec![],
+            },
+            prompt_safety: Default::default(),
+            pii: Default::default(),
+        });
+        let state = ProxyState {
+            config: cfg,
+            client: build_http_client().unwrap(),
+            tpm: Arc::new(TpmCounters::connect(None).await.unwrap()),
+            bpe: None,
+            prompt_safety_matcher: None,
+            ops_metrics: OpsMetrics::default(),
+            plugins: None,
+        };
+        let json = tpm_status_json(&state, "/tpm/status", &headers).await;
+        assert_eq!(json.get("bucket").and_then(|v| v.as_str()), Some("status-user"));
+        assert_eq!(json.get("enforce_budget").and_then(|v| v.as_bool()), Some(false));
+        unsafe {
+            std::env::remove_var(secret_env);
+        }
     }
 
     #[tokio::test]
