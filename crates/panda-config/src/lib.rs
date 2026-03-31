@@ -50,16 +50,28 @@ impl TrustedGatewayConfig {
 pub struct ObservabilityConfig {
     #[serde(default = "default_correlation_header")]
     pub correlation_header: String,
+    /// Header name used for optional ops endpoint authentication.
+    #[serde(default = "default_admin_auth_header")]
+    pub admin_auth_header: String,
+    /// Optional env var name for shared secret protecting ops endpoints.
+    #[serde(default)]
+    pub admin_secret_env: Option<String>,
 }
 
 fn default_correlation_header() -> String {
     "x-request-id".to_string()
 }
 
+fn default_admin_auth_header() -> String {
+    "x-panda-admin-secret".to_string()
+}
+
 impl Default for ObservabilityConfig {
     fn default() -> Self {
         Self {
             correlation_header: default_correlation_header(),
+            admin_auth_header: default_admin_auth_header(),
+            admin_secret_env: None,
         }
     }
 }
@@ -336,6 +348,20 @@ impl PandaConfig {
         HeaderName::from_bytes(self.observability.correlation_header.as_bytes()).map_err(|_| {
             anyhow::anyhow!("invalid observability.correlation_header token")
         })?;
+        if self.observability.admin_auth_header.trim().is_empty() {
+            anyhow::bail!("`observability.admin_auth_header` must not be empty");
+        }
+        HeaderName::from_bytes(self.observability.admin_auth_header.as_bytes()).map_err(|_| {
+            anyhow::anyhow!("invalid observability.admin_auth_header token")
+        })?;
+        if self
+            .observability
+            .admin_secret_env
+            .as_ref()
+            .is_some_and(|v| v.trim().is_empty())
+        {
+            anyhow::bail!("observability.admin_secret_env must be non-empty when set");
+        }
         if let Some(ref t) = self.tls {
             if !Path::new(&t.cert_pem).is_file() {
                 anyhow::bail!("tls.cert_pem not a file: {}", t.cert_pem);
@@ -524,6 +550,8 @@ mod tests {
         assert!(!cfg.tpm.enforce_budget);
         assert!(cfg.tpm.budget_tokens_per_minute > 0);
         assert!(cfg.tpm.retry_after_seconds.is_none());
+        assert_eq!(cfg.observability.admin_auth_header, "x-panda-admin-secret");
+        assert!(cfg.observability.admin_secret_env.is_none());
         assert!(!cfg.identity.require_jwt);
         assert!(cfg.identity.accepted_issuers.is_empty());
         assert!(cfg.identity.accepted_audiences.is_empty());

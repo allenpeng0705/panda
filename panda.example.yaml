@@ -14,6 +14,9 @@ upstream: "http://127.0.0.1:11434"
 # Falls back to W3C traceparent trace id, then UUID.
 # observability:
 #   correlation_header: "x-request-id"
+#   # Optional ops endpoint auth for /metrics, /plugins/status, /tpm/status
+#   admin_auth_header: "x-panda-admin-secret"
+#   admin_secret_env: "PANDA_ADMIN_STATUS_SECRET"
 
 # Optional: Redis for cross-replica TPM counters (INCRBY panda:tpm:v1:prompt:* and completion:*).
 # Env PANDA_REDIS_URL overrides this field.

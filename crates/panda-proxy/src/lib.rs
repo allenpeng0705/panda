@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use aho_corasick::AhoCorasick;
+use constant_time_eq::constant_time_eq;
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http_body_util::BodyExt;
 use http_body_util::combinators::UnsyncBoxBody;
@@ -469,12 +470,19 @@ fn build_http_client() -> anyhow::Result<HttpClient> {
 async fn dispatch(req: Request<Incoming>, state: Arc<ProxyState>) -> Result<Response<BoxBody>, Infallible> {
     let method = req.method().clone();
     let path = req.uri().path();
+    let is_ops_endpoint = method == hyper::Method::GET
+        && (path == "/metrics" || path == "/plugins/status" || path == "/tpm/status");
 
     if method == hyper::Method::GET && path == "/health" {
         return Ok(text_response(StatusCode::OK, "ok"));
     }
     if method == hyper::Method::GET && path == "/ready" {
         return Ok(text_response(StatusCode::OK, "ready"));
+    }
+    if is_ops_endpoint {
+        if let Err(resp) = enforce_ops_auth_if_configured(req.headers(), &state.config) {
+            return Ok(resp);
+        }
     }
     if method == hyper::Method::GET && path == "/metrics" {
         let body = state
@@ -524,6 +532,30 @@ fn enforce_jwt_if_required(req: &Request<Incoming>, cfg: &PandaConfig) -> Result
         return Err(text_response(status, msg));
     }
     Ok(())
+}
+
+fn enforce_ops_auth_if_configured(headers: &HeaderMap, cfg: &PandaConfig) -> Result<(), Response<BoxBody>> {
+    let Some(secret_env) = cfg
+        .observability
+        .admin_secret_env
+        .as_ref()
+        .filter(|v| !v.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    let expected = match std::env::var(secret_env) {
+        Ok(v) if !v.is_empty() => v,
+        _ => return Err(text_response(StatusCode::UNAUTHORIZED, "unauthorized: ops secret not configured")),
+    };
+    let got = headers
+        .get(cfg.observability.admin_auth_header.as_str())
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    if got.len() == expected.len() && constant_time_eq(got.as_bytes(), expected.as_bytes()) {
+        Ok(())
+    } else {
+        Err(text_response(StatusCode::UNAUTHORIZED, "unauthorized: invalid ops secret"))
+    }
 }
 
 fn validate_bearer_jwt(headers: &HeaderMap, path: &str, cfg: &PandaConfig) -> Result<(), &'static str> {
@@ -1217,6 +1249,36 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(resp.headers().get("retry-after").and_then(|v| v.to_str().ok()), Some("17"));
         assert_eq!(resp.headers().get("x-panda-budget-limit").and_then(|v| v.to_str().ok()), Some("100"));
+    }
+
+    #[test]
+    fn ops_auth_guard_enforces_shared_secret() {
+        let cfg = PandaConfig {
+            listen: "127.0.0.1:0".to_string(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            trusted_gateway: Default::default(),
+            observability: panda_config::ObservabilityConfig {
+                correlation_header: "x-request-id".to_string(),
+                admin_auth_header: "x-panda-admin-secret".to_string(),
+                admin_secret_env: Some("PANDA_TEST_OPS_SECRET".to_string()),
+            },
+            tpm: Default::default(),
+            tls: None,
+            plugins: Default::default(),
+            identity: Default::default(),
+            prompt_safety: Default::default(),
+            pii: Default::default(),
+        };
+        let mut headers = HeaderMap::new();
+        std::env::set_var("PANDA_TEST_OPS_SECRET", "s3cr3t");
+        let err = enforce_ops_auth_if_configured(&headers, &cfg).unwrap_err();
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+        headers.insert("x-panda-admin-secret", HeaderValue::from_static("wrong"));
+        let err = enforce_ops_auth_if_configured(&headers, &cfg).unwrap_err();
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+        headers.insert("x-panda-admin-secret", HeaderValue::from_static("s3cr3t"));
+        assert!(enforce_ops_auth_if_configured(&headers, &cfg).is_ok());
+        std::env::remove_var("PANDA_TEST_OPS_SECRET");
     }
 
     #[tokio::test]
