@@ -51,8 +51,40 @@ pub struct ProxyState {
     pub tpm: Arc<TpmCounters>,
     pub bpe: Option<Arc<tiktoken_rs::CoreBPE>>,
     pub prompt_safety_matcher: Option<Arc<AhoCorasick>>,
+    ops_metrics: OpsMetrics,
     /// Hot-swappable plugin runtime and metrics.
     plugins: Option<Arc<PluginManager>>,
+}
+
+#[derive(Default)]
+struct OpsMetrics {
+    ops_auth_denied_counts: std::sync::Mutex<HashMap<String, u64>>,
+}
+
+impl OpsMetrics {
+    fn inc_ops_auth_denied(&self, endpoint: &str) {
+        if let Ok(mut g) = self.ops_auth_denied_counts.lock() {
+            let n = g.entry(endpoint.to_string()).or_insert(0);
+            *n += 1;
+        }
+    }
+
+    fn ops_auth_denied_prometheus_text(&self) -> String {
+        let mut out = String::new();
+        out.push_str("# HELP panda_ops_auth_denied_total Count of denied ops endpoint auth checks.\n");
+        out.push_str("# TYPE panda_ops_auth_denied_total counter\n");
+        if let Ok(g) = self.ops_auth_denied_counts.lock() {
+            let mut entries: Vec<(&String, &u64)> = g.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            for (endpoint, count) in entries {
+                out.push_str(&format!(
+                    "panda_ops_auth_denied_total{{endpoint=\"{}\"}} {}\n",
+                    endpoint, count
+                ));
+            }
+        }
+        out
+    }
 }
 
 #[derive(Default)]
@@ -364,6 +396,7 @@ pub async fn run(config: Arc<PandaConfig>) -> anyhow::Result<()> {
         tpm,
         bpe,
         prompt_safety_matcher: build_prompt_safety_matcher(&config)?,
+        ops_metrics: OpsMetrics::default(),
         plugins,
     });
 
@@ -483,17 +516,19 @@ async fn dispatch(req: Request<Incoming>, state: Arc<ProxyState>) -> Result<Resp
         let corr = ops_log_correlation_id(req.headers(), &state.config);
         let bucket = ops_bucket_for_path(path, req.headers(), state.as_ref());
         if let Err(resp) = enforce_ops_auth_if_configured(req.headers(), &state.config) {
+            state.ops_metrics.inc_ops_auth_denied(path);
             log_ops_access(path, "deny", &corr, bucket.as_deref());
             return Ok(resp);
         }
         log_ops_access(path, "allow", &corr, bucket.as_deref());
     }
     if method == hyper::Method::GET && path == "/metrics" {
-        let body = state
+        let mut body = state
             .plugins
             .as_ref()
             .map(|p| p.metrics_prometheus_text())
             .unwrap_or_else(|| "# panda plugins disabled\n".to_string());
+        body.push_str(&state.ops_metrics.ops_auth_denied_prometheus_text());
         return Ok(text_with_content_type(
             StatusCode::OK,
             body,
@@ -1327,6 +1362,18 @@ mod tests {
         std::env::remove_var("PANDA_TEST_OPS_SECRET");
     }
 
+    #[test]
+    fn ops_denied_metrics_render_prometheus_lines() {
+        let m = OpsMetrics::default();
+        m.inc_ops_auth_denied("/metrics");
+        m.inc_ops_auth_denied("/metrics");
+        m.inc_ops_auth_denied("/tpm/status");
+        let s = m.ops_auth_denied_prometheus_text();
+        assert!(s.contains("panda_ops_auth_denied_total"));
+        assert!(s.contains("endpoint=\"/metrics\""));
+        assert!(s.contains("endpoint=\"/tpm/status\""));
+    }
+
     #[tokio::test]
     async fn tpm_status_json_reports_budget_fields() {
         let cfg = Arc::new(PandaConfig {
@@ -1354,6 +1401,7 @@ mod tests {
             tpm,
             bpe: None,
             prompt_safety_matcher: None,
+            ops_metrics: OpsMetrics::default(),
             plugins: None,
         };
         let json = tpm_status_json(&state, &HeaderMap::new()).await;
@@ -1430,6 +1478,7 @@ mod tests {
             tpm: Arc::new(TpmCounters::connect(None).await.unwrap()),
             bpe: None,
             prompt_safety_matcher: None,
+            ops_metrics: OpsMetrics::default(),
             plugins: Some(Arc::new(
                 PluginManager::new(
                     PathBuf::from(cfg.plugins.directory.as_deref().unwrap()),
