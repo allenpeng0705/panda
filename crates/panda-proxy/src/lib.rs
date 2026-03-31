@@ -480,9 +480,13 @@ async fn dispatch(req: Request<Incoming>, state: Arc<ProxyState>) -> Result<Resp
         return Ok(text_response(StatusCode::OK, "ready"));
     }
     if is_ops_endpoint {
+        let corr = ops_log_correlation_id(req.headers(), &state.config);
+        let bucket = ops_bucket_for_path(path, req.headers(), state.as_ref());
         if let Err(resp) = enforce_ops_auth_if_configured(req.headers(), &state.config) {
+            log_ops_access(path, "deny", &corr, bucket.as_deref());
             return Ok(resp);
         }
+        log_ops_access(path, "allow", &corr, bucket.as_deref());
     }
     if method == hyper::Method::GET && path == "/metrics" {
         let body = state
@@ -735,6 +739,48 @@ async fn tpm_status_json(state: &ProxyState, req_headers: &HeaderMap) -> serde_j
         "remaining": remaining,
         "retry_after_seconds": retry_after_seconds,
     })
+}
+
+fn ops_bucket_for_path(path: &str, req_headers: &HeaderMap, state: &ProxyState) -> Option<String> {
+    if path != "/tpm/status" {
+        return None;
+    }
+    let mut headers = req_headers.clone();
+    let secret = gateway::trusted_gateway_secret_from_env();
+    let ctx = gateway::apply_trusted_gateway(&mut headers, &state.config.trusted_gateway, secret.as_deref());
+    Some(tpm_bucket_key(&ctx))
+}
+
+fn ops_log_correlation_id(headers: &HeaderMap, cfg: &PandaConfig) -> String {
+    if let Some(v) = headers
+        .get(cfg.observability.correlation_header.as_str())
+        .and_then(|v| v.to_str().ok())
+    {
+        let t = v.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    if let Some(tp) = headers
+        .get("traceparent")
+        .or_else(|| headers.get("Traceparent"))
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(id) = gateway::trace_id_from_traceparent(tp) {
+            return id;
+        }
+    }
+    "-".to_string()
+}
+
+fn log_ops_access(path: &str, outcome: &str, correlation_id: &str, bucket: Option<&str>) {
+    eprintln!(
+        "panda ops endpoint={} outcome={} correlation_id={} bucket={}",
+        path,
+        outcome,
+        correlation_id,
+        bucket.unwrap_or("-")
+    );
 }
 
 fn is_sse(headers: &HeaderMap) -> bool {
