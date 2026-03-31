@@ -639,7 +639,12 @@ fn maybe_exchange_agent_token(headers: &HeaderMap, cfg: &PandaConfig) -> Result<
 
 enum ProxyError {
     PolicyReject(String),
-    RateLimited(String),
+    RateLimited {
+        limit: u64,
+        estimate: u64,
+        used: u64,
+        remaining: u64,
+    },
     Upstream(anyhow::Error),
 }
 
@@ -742,13 +747,17 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
 
     let est = estimate_prompt_tokens_hint(&headers);
     let bucket = tpm_bucket_key(&ctx);
-    if state.config.tpm.enforce_budget
-        && state
-            .tpm
-            .would_exceed_prompt_budget(&bucket, est, state.config.tpm.budget_tokens_per_minute)
-            .await
-    {
-        return Err(ProxyError::RateLimited("tpm budget exceeded".to_string()));
+    if state.config.tpm.enforce_budget {
+        let limit = state.config.tpm.budget_tokens_per_minute;
+        if state.tpm.would_exceed_prompt_budget(&bucket, est, limit).await {
+            let (used, remaining) = state.tpm.prompt_budget_snapshot(&bucket, limit).await;
+            return Err(ProxyError::RateLimited {
+                limit,
+                estimate: est,
+                used,
+                remaining,
+            });
+        }
     }
     state
         .tpm
@@ -928,9 +937,29 @@ fn proxy_error_response(e: ProxyError) -> Response<BoxBody> {
             eprintln!("policy reject: {msg}");
             text_response(StatusCode::FORBIDDEN, "forbidden: request rejected by policy")
         }
-        ProxyError::RateLimited(msg) => {
-            eprintln!("rate limited: {msg}");
-            text_response(StatusCode::TOO_MANY_REQUESTS, "too many requests: token budget exceeded")
+        ProxyError::RateLimited {
+            limit,
+            estimate,
+            used,
+            remaining,
+        } => {
+            eprintln!("rate limited: used={used} est={estimate} limit={limit}");
+            let mut resp = text_response(StatusCode::TOO_MANY_REQUESTS, "too many requests: token budget exceeded");
+            let h = resp.headers_mut();
+            h.insert(HeaderName::from_static("retry-after"), HeaderValue::from_static("60"));
+            if let Ok(v) = HeaderValue::from_str(&limit.to_string()) {
+                h.insert(HeaderName::from_static("x-panda-budget-limit"), v);
+            }
+            if let Ok(v) = HeaderValue::from_str(&estimate.to_string()) {
+                h.insert(HeaderName::from_static("x-panda-budget-estimate"), v);
+            }
+            if let Ok(v) = HeaderValue::from_str(&used.to_string()) {
+                h.insert(HeaderName::from_static("x-panda-budget-used"), v);
+            }
+            if let Ok(v) = HeaderValue::from_str(&remaining.to_string()) {
+                h.insert(HeaderName::from_static("x-panda-budget-remaining"), v);
+            }
+            resp
         }
         ProxyError::Upstream(err) => {
             eprintln!("upstream error: {err:#}");
@@ -1136,8 +1165,15 @@ mod tests {
 
     #[test]
     fn rate_limited_maps_to_429() {
-        let resp = proxy_error_response(ProxyError::RateLimited("budget".to_string()));
+        let resp = proxy_error_response(ProxyError::RateLimited {
+            limit: 100,
+            estimate: 20,
+            used: 90,
+            remaining: 10,
+        });
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.headers().get("retry-after").and_then(|v| v.to_str().ok()), Some("60"));
+        assert_eq!(resp.headers().get("x-panda-budget-limit").and_then(|v| v.to_str().ok()), Some("100"));
     }
 
     #[tokio::test]
