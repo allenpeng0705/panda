@@ -248,6 +248,9 @@ pub struct PromptSafetyConfig {
     /// If true, run deny-pattern scan on request path/query/body.
     #[serde(default)]
     pub enabled: bool,
+    /// If true, log would-block events but do not reject traffic.
+    #[serde(default)]
+    pub shadow_mode: bool,
     /// Case-insensitive literal patterns that trigger 403 when found.
     #[serde(default)]
     pub deny_patterns: Vec<String>,
@@ -259,6 +262,9 @@ pub struct PiiConfig {
     /// If true, redact request body using regex patterns.
     #[serde(default)]
     pub enabled: bool,
+    /// If true, detect/log redaction candidates but do not mutate request body.
+    #[serde(default)]
+    pub shadow_mode: bool,
     /// Regex patterns to redact from buffered request body.
     #[serde(default)]
     pub redact_patterns: Vec<String>,
@@ -275,6 +281,7 @@ impl Default for PiiConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            shadow_mode: false,
             redact_patterns: vec![],
             replacement: default_pii_replacement(),
         }
@@ -286,6 +293,12 @@ impl Default for PiiConfig {
 pub struct SemanticCacheConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// Backend kind: `memory` (default) or `redis` (Redis-compatible; works with Dragonfly).
+    #[serde(default = "default_semantic_cache_backend")]
+    pub backend: String,
+    /// Optional Redis URL for `backend=redis`; env `PANDA_SEMANTIC_CACHE_REDIS_URL` also supported.
+    #[serde(default)]
+    pub redis_url: Option<String>,
     /// Similarity threshold placeholder for future embedding/vector backend.
     #[serde(default = "default_semantic_cache_similarity_threshold")]
     pub similarity_threshold: f32,
@@ -301,6 +314,10 @@ fn default_semantic_cache_similarity_threshold() -> f32 {
     0.92
 }
 
+fn default_semantic_cache_backend() -> String {
+    "memory".to_string()
+}
+
 fn default_semantic_cache_max_entries() -> usize {
     10_000
 }
@@ -313,6 +330,8 @@ impl Default for SemanticCacheConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            backend: default_semantic_cache_backend(),
+            redis_url: None,
             similarity_threshold: default_semantic_cache_similarity_threshold(),
             max_entries: default_semantic_cache_max_entries(),
             ttl_seconds: default_semantic_cache_ttl_seconds(),
@@ -722,6 +741,18 @@ impl PandaConfig {
             }
         }
         if self.semantic_cache.enabled {
+            match self.semantic_cache.backend.as_str() {
+                "memory" | "redis" => {}
+                _ => anyhow::bail!("semantic_cache.backend must be one of: memory, redis"),
+            }
+            if self
+                .semantic_cache
+                .redis_url
+                .as_ref()
+                .is_some_and(|v| v.trim().is_empty())
+            {
+                anyhow::bail!("semantic_cache.redis_url must be non-empty when set");
+            }
             if !(0.0..=1.0).contains(&self.semantic_cache.similarity_threshold) {
                 anyhow::bail!("semantic_cache.similarity_threshold must be within [0.0, 1.0]");
             }
@@ -748,6 +779,24 @@ impl PandaConfig {
             .redis_url
             .clone()
             .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                std::env::var("PANDA_REDIS_URL")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
+    }
+
+    /// Effective semantic-cache Redis URL: YAML, then env `PANDA_SEMANTIC_CACHE_REDIS_URL`, then `PANDA_REDIS_URL`.
+    pub fn effective_semantic_cache_redis_url(&self) -> Option<String> {
+        self.semantic_cache
+            .redis_url
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                std::env::var("PANDA_SEMANTIC_CACHE_REDIS_URL")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
             .or_else(|| {
                 std::env::var("PANDA_REDIS_URL")
                     .ok()
@@ -814,8 +863,10 @@ mod tests {
         assert_eq!(cfg.identity.agent_token_ttl_seconds, 300);
         assert!(cfg.identity.agent_token_scopes.is_empty());
         assert!(!cfg.prompt_safety.enabled);
+        assert!(!cfg.prompt_safety.shadow_mode);
         assert!(cfg.prompt_safety.deny_patterns.is_empty());
         assert!(!cfg.pii.enabled);
+        assert!(!cfg.pii.shadow_mode);
         assert!(cfg.pii.redact_patterns.is_empty());
         assert_eq!(cfg.pii.replacement, "[REDACTED]");
         assert!(!cfg.mcp.enabled);
@@ -830,6 +881,8 @@ mod tests {
         assert!(cfg.mcp.intent_tool_policies.is_empty());
         assert!(cfg.mcp.servers.is_empty());
         assert!(!cfg.semantic_cache.enabled);
+        assert_eq!(cfg.semantic_cache.backend, "memory");
+        assert!(cfg.semantic_cache.redis_url.is_none());
         assert_eq!(cfg.semantic_cache.similarity_threshold, 0.92);
         assert_eq!(cfg.semantic_cache.max_entries, 10_000);
         assert_eq!(cfg.semantic_cache.ttl_seconds, 300);
@@ -917,6 +970,16 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("semantic_cache.similarity_threshold"));
+    }
+
+    #[test]
+    fn rejects_invalid_semantic_cache_backend() {
+        let err = PandaConfig::from_yaml_str(
+            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+             semantic_cache:\n  enabled: true\n  backend: dragonfly\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("semantic_cache.backend"));
     }
 
     #[test]

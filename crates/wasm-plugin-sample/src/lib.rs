@@ -1,15 +1,14 @@
 //! Minimal guest module for Panda ABI v0.
 //! Build: `cargo build -p wasm-plugin-sample --target wasm32-unknown-unknown --release`
 
-extern "C" {
-    fn panda_set_header(name_ptr: i32, name_len: i32, value_ptr: i32, value_len: i32);
-    fn panda_set_body(ptr: i32, len: i32);
-}
+use panda_pdk::{
+    PANDA_WASM_ABI_VERSION, RC_ALLOW, set_body, set_header, set_response_chunk,
+};
 
 /// Must match `panda_wasm::PANDA_WASM_ABI_VERSION` (duplicated to avoid a host dep in the guest).
 #[no_mangle]
 pub extern "C" fn panda_abi_version() -> i32 {
-    0
+    PANDA_WASM_ABI_VERSION
 }
 
 /// Optional smoke export called by host startup.
@@ -21,18 +20,8 @@ pub extern "C" fn add(a: i32, b: i32) -> i32 {
 /// Request hook: inject a marker header via host import.
 #[no_mangle]
 pub extern "C" fn panda_on_request() -> i32 {
-    let name = b"x-panda-plugin";
-    let value = b"sample-rust";
-    // Safety: host provides `panda_set_header` with pointer+len reads in guest memory.
-    unsafe {
-        panda_set_header(
-            name.as_ptr() as i32,
-            name.len() as i32,
-            value.as_ptr() as i32,
-            value.len() as i32,
-        );
-    }
-    0
+    set_header(b"x-panda-plugin", b"sample-rust");
+    RC_ALLOW
 }
 
 /// Body hook: replace ASCII `password` with `********` when present.
@@ -58,14 +47,33 @@ pub extern "C" fn panda_on_request_body(ptr: i32, len: i32) -> i32 {
             i += 1;
         }
     }
-    unsafe {
-        panda_set_header(
-            b"x-panda-redacted".as_ptr() as i32,
-            "x-panda-redacted".len() as i32,
-            b"true".as_ptr() as i32,
-            4,
-        );
-        panda_set_body(out.as_ptr() as i32, out.len() as i32);
+    set_header(b"x-panda-redacted", b"true");
+    set_body(&out);
+    RC_ALLOW
+}
+
+/// Streaming response chunk hook (ABI v1): mask `secret` in each chunk.
+#[no_mangle]
+pub extern "C" fn panda_on_response_chunk(ptr: i32, len: i32) -> i32 {
+    if ptr < 0 || len <= 0 {
+        return RC_ALLOW;
     }
-    0
+    let input = unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) };
+    let needle = b"secret";
+    if !input.windows(needle.len()).any(|w| w == needle) {
+        return RC_ALLOW;
+    }
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0usize;
+    while i < input.len() {
+        if i + needle.len() <= input.len() && &input[i..i + needle.len()] == needle {
+            out.extend_from_slice(b"******");
+            i += needle.len();
+        } else {
+            out.push(input[i]);
+            i += 1;
+        }
+    }
+    set_response_chunk(&out);
+    RC_ALLOW
 }

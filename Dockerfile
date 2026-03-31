@@ -6,7 +6,8 @@ WORKDIR /work
 # Prime dependency build cache first.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --release -p panda-server
+ARG PANDA_BUILD_FEATURES="mimalloc"
+RUN cargo build --release -p panda-server --features "${PANDA_BUILD_FEATURES}"
 
 FROM debian:bookworm-slim
 RUN apt-get update \

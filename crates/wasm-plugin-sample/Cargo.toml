@@ -10,3 +10,4 @@ description = "Minimal Wasm guest for Panda plugin smoke tests (wasm32-unknown-u
 crate-type = ["cdylib"]
 
 [dependencies]
+panda-pdk = { path = "../panda-pdk" }

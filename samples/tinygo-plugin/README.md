@@ -1,13 +1,14 @@
-# TinyGo Plugin Sample (Panda ABI v0)
+# TinyGo Plugin Sample (Panda ABI v1)
 
 This sample mirrors the Rust sample plugin but uses TinyGo.
 
 ## What it does
 
-- Exports `panda_abi_version` (returns `0`)
+- Exports `panda_abi_version` (returns `1`)
 - Exports `panda_on_request` (adds `x-panda-plugin: tinygo-sample`)
 - Exports `panda_on_request_body` (optional; currently no-op allow)
-- Imports `panda_set_header` and `panda_set_body` from host
+- Exports `panda_on_response_chunk` (optional; currently no-op allow)
+- Imports `panda_set_header`, `panda_set_body`, and `panda_set_response_chunk` from host
 
 ## Build
 

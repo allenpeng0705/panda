@@ -1369,6 +1369,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "panda-pdk"
+version = "0.1.0"
+
+[[package]]
 name = "panda-proxy"
 version = "0.1.0"
 dependencies = [
@@ -2789,6 +2793,9 @@ dependencies = [
 [[package]]
 name = "wasm-plugin-sample"
 version = "0.1.0"
+dependencies = [
+ "panda-pdk",
+]
 
 [[package]]
 name = "wasmparser"

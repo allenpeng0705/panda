@@ -97,6 +97,7 @@ struct OpsMetrics {
     mcp_stream_probe_bytes_total: std::sync::Mutex<u64>,
     mcp_stream_probe_bytes_bucket_counts: std::sync::Mutex<HashMap<String, u64>>,
     mcp_stream_probe_events: std::sync::Mutex<VecDeque<(u128, String, usize)>>,
+    policy_shadow_would_block_counts: std::sync::Mutex<HashMap<String, u64>>,
 }
 
 impl OpsMetrics {
@@ -124,6 +125,14 @@ impl OpsMetrics {
     fn inc_tpm_budget_rejected(&self, bucket_class: &str) {
         if let Ok(mut g) = self.tpm_budget_rejected_counts.lock() {
             let n = g.entry(bucket_class.to_string()).or_insert(0);
+            *n += 1;
+        }
+    }
+
+    fn inc_policy_shadow_would_block(&self, source: &str, reason: &str) {
+        if let Ok(mut g) = self.policy_shadow_would_block_counts.lock() {
+            let key = format!("{source}|{reason}");
+            let n = g.entry(key).or_insert(0);
             *n += 1;
         }
     }
@@ -237,6 +246,21 @@ impl OpsMetrics {
                 out.push_str(&format!(
                     "panda_tpm_budget_rejected_total{{bucket_class=\"{}\"}} {}\n",
                     bucket_class, count
+                ));
+            }
+        }
+        out.push_str("# HELP panda_policy_shadow_would_block_total Count of policy checks that would have blocked in shadow mode.\n");
+        out.push_str("# TYPE panda_policy_shadow_would_block_total counter\n");
+        if let Ok(g) = self.policy_shadow_would_block_counts.lock() {
+            let mut entries: Vec<(&String, &u64)> = g.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            for (key, count) in entries {
+                let mut parts = key.splitn(2, '|');
+                let source = parts.next().unwrap_or("-");
+                let reason = parts.next().unwrap_or("-");
+                out.push_str(&format!(
+                    "panda_policy_shadow_would_block_total{{source=\"{}\",reason=\"{}\"}} {}\n",
+                    source, reason, count
                 ));
             }
         }
@@ -479,6 +503,24 @@ impl PluginManager {
                 rs.skipped_rate_limit
             ));
         }
+        if let Ok(runtime) = self.runtime.try_read() {
+            let s = runtime.stats_snapshot();
+            lines.push("# HELP panda_wasm_module_instantiate_total Wasm module instance initializations.".to_string());
+            lines.push("# TYPE panda_wasm_module_instantiate_total counter".to_string());
+            lines.push(format!("panda_wasm_module_instantiate_total {}", s.module_instantiate_total));
+            lines.push("# HELP panda_wasm_pool_instances_total Total warm Wasm instances in pools.".to_string());
+            lines.push("# TYPE panda_wasm_pool_instances_total gauge".to_string());
+            lines.push(format!("panda_wasm_pool_instances_total {}", s.pool_instances_total));
+            lines.push("# HELP panda_wasm_pool_acquire_total Total Wasm instance pool acquisitions.".to_string());
+            lines.push("# TYPE panda_wasm_pool_acquire_total counter".to_string());
+            lines.push(format!("panda_wasm_pool_acquire_total {}", s.pool_acquire_total));
+            lines.push("# HELP panda_wasm_pool_contended_total Wasm instance pool acquisitions that contended on lock.".to_string());
+            lines.push("# TYPE panda_wasm_pool_contended_total counter".to_string());
+            lines.push(format!("panda_wasm_pool_contended_total {}", s.pool_contended_total));
+            lines.push("# HELP panda_wasm_pool_wait_ns_total Aggregate lock wait time for pool contention.".to_string());
+            lines.push("# TYPE panda_wasm_pool_wait_ns_total counter".to_string());
+            lines.push(format!("panda_wasm_pool_wait_ns_total {}", s.pool_wait_ns_total));
+        }
         lines.join("\n")
     }
 
@@ -584,6 +626,19 @@ pub async fn run(config: Arc<PandaConfig>) -> anyhow::Result<()> {
             config.mcp.advertise_tools
         );
     }
+    let semantic_cache = if config.semantic_cache.enabled {
+        let semantic_cache_redis_url = config.effective_semantic_cache_redis_url();
+        Some(Arc::new(SemanticCache::connect(
+            &config.semantic_cache.backend,
+            config.semantic_cache.max_entries,
+            Duration::from_secs(config.semantic_cache.ttl_seconds),
+            config.semantic_cache.similarity_threshold,
+            semantic_cache_redis_url.as_deref(),
+        )
+        .await?))
+    } else {
+        None
+    };
 
     let state = Arc::new(ProxyState {
         config: Arc::clone(&config),
@@ -594,15 +649,7 @@ pub async fn run(config: Arc<PandaConfig>) -> anyhow::Result<()> {
         ops_metrics: OpsMetrics::default(),
         plugins,
         mcp,
-        semantic_cache: if config.semantic_cache.enabled {
-            Some(Arc::new(SemanticCache::new(
-                config.semantic_cache.max_entries,
-                Duration::from_secs(config.semantic_cache.ttl_seconds),
-                config.semantic_cache.similarity_threshold,
-            )))
-        } else {
-            None
-        },
+        semantic_cache,
         context_enricher: build_context_enricher_from_env(),
         draining: AtomicBool::new(false),
         active_connections: AtomicUsize::new(0),
@@ -1860,7 +1907,14 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
             state.prompt_safety_matcher.as_deref(),
             &state.config.prompt_safety.deny_patterns,
         ) {
-            return Err(ProxyError::PolicyReject(format!("prompt_safety path/query pattern={pat}")));
+            if state.config.prompt_safety.shadow_mode {
+                state
+                    .ops_metrics
+                    .inc_policy_shadow_would_block("prompt_safety_path_query", pat);
+                eprintln!("panda shadow-mode: would block prompt_safety path/query pattern={pat}");
+            } else {
+                return Err(ProxyError::PolicyReject(format!("prompt_safety path/query pattern={pat}")));
+            }
         }
     }
 
@@ -1896,10 +1950,13 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
             }
             Err(e) => {
                 record_wasm_error_metrics(plugins, &e, "headers");
-                if state.config.plugins.fail_closed {
+                if maybe_shadow_wasm_policy_reject(state, &e, "headers") {
+                    eprintln!("panda shadow-mode: would block wasm headers policy reject: {e:?}");
+                } else if state.config.plugins.fail_closed {
                     return Err(proxy_error_from_wasm(e));
+                } else {
+                    eprintln!("panda: wasm headers hook fail-open: {e:?}");
                 }
-                eprintln!("panda: wasm headers hook fail-open: {e:?}");
             }
         }
     }
@@ -2002,7 +2059,14 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
                 state.prompt_safety_matcher.as_deref(),
                 &state.config.prompt_safety.deny_patterns,
             ) {
-                return Err(ProxyError::PolicyReject(format!("prompt_safety body pattern={pat}")));
+                if state.config.prompt_safety.shadow_mode {
+                    state
+                        .ops_metrics
+                        .inc_policy_shadow_would_block("prompt_safety_body", pat);
+                    eprintln!("panda shadow-mode: would block prompt_safety body pattern={pat}");
+                } else {
+                    return Err(ProxyError::PolicyReject(format!("prompt_safety body pattern={pat}")));
+                }
             }
         }
 
@@ -2014,10 +2078,22 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
             )
             .map_err(ProxyError::Upstream)?;
             if next_bytes != original {
-                parts.headers.insert(
-                    HeaderName::from_static("x-panda-pii-redacted"),
-                    HeaderValue::from_static("true"),
-                );
+                if state.config.pii.shadow_mode {
+                    state
+                        .ops_metrics
+                        .inc_policy_shadow_would_block("pii_redact", "regex_match");
+                    eprintln!("panda shadow-mode: would redact pii from request body");
+                    next_bytes = original.clone();
+                    parts.headers.insert(
+                        HeaderName::from_static("x-panda-pii-shadow-detected"),
+                        HeaderValue::from_static("true"),
+                    );
+                } else {
+                    parts.headers.insert(
+                        HeaderName::from_static("x-panda-pii-redacted"),
+                        HeaderValue::from_static("true"),
+                    );
+                }
             }
         }
         if parts.method == hyper::Method::POST
@@ -2048,7 +2124,7 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
             None
         };
         if let (Some(ref cache), Some(ref key)) = (state.semantic_cache.as_ref(), semantic_cache_key.as_ref()) {
-            if let Some(hit) = cache.get(key) {
+            if let Some(hit) = cache.get(key).await {
                 let mut out = Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", "application/json; charset=utf-8")
@@ -2141,11 +2217,15 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
                 }
                 Err(e) => {
                     record_wasm_error_metrics(plugins, &e, "body");
-                    if state.config.plugins.fail_closed {
+                    if maybe_shadow_wasm_policy_reject(state, &e, "body") {
+                        eprintln!("panda shadow-mode: would block wasm body policy reject: {e:?}");
+                        original
+                    } else if state.config.plugins.fail_closed {
                         return Err(proxy_error_from_wasm(e));
+                    } else {
+                        eprintln!("panda: wasm body hook fail-open: {e:?}");
+                        original
                     }
-                    eprintln!("panda: wasm body hook fail-open: {e:?}");
-                    original
                 }
             };
         }
@@ -2533,7 +2613,21 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
             .take()
             .ok_or_else(|| ProxyError::Upstream(anyhow::anyhow!("missing upstream response body")))?;
         let inner = adapter_stream::AnthropicToOpenAiSseBody::new(body, adapter_model_hint.clone());
-        if let Some(ref bpe) = state.bpe {
+        if let Some(ref plugins) = state.plugins {
+            let runtime = plugins.runtime_snapshot().await;
+            let hooked = sse::WasmChunkHookBody::new(
+                inner,
+                runtime,
+                state.config.plugins.max_request_body_bytes,
+            );
+            if let Some(ref bpe) = state.bpe {
+                sse::SseCountingBody::new(hooked, Arc::clone(&state.tpm), bucket, Arc::clone(bpe))
+                    .map_err(|e| e)
+                    .boxed_unsync()
+            } else {
+                hooked.map_err(|e| e).boxed_unsync()
+            }
+        } else if let Some(ref bpe) = state.bpe {
             sse::SseCountingBody::new(inner, Arc::clone(&state.tpm), bucket, Arc::clone(bpe))
                 .map_err(|e| e)
                 .boxed_unsync()
@@ -2544,7 +2638,21 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
         let body = body_opt
             .take()
             .ok_or_else(|| ProxyError::Upstream(anyhow::anyhow!("missing upstream response body")))?;
-        if let Some(ref bpe) = state.bpe {
+        if let Some(ref plugins) = state.plugins {
+            let runtime = plugins.runtime_snapshot().await;
+            let hooked = sse::WasmChunkHookBody::new(
+                body,
+                runtime,
+                state.config.plugins.max_request_body_bytes,
+            );
+            if let Some(ref bpe) = state.bpe {
+                sse::SseCountingBody::new(hooked, Arc::clone(&state.tpm), bucket, Arc::clone(bpe))
+                    .map_err(|e| e)
+                    .boxed_unsync()
+            } else {
+                hooked.map_err(|e| e).boxed_unsync()
+            }
+        } else if let Some(ref bpe) = state.bpe {
             sse::SseCountingBody::new(body, Arc::clone(&state.tpm), bucket, Arc::clone(bpe))
                 .map_err(|e| e)
                 .boxed_unsync()
@@ -2561,7 +2669,7 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
         if let (Some(ref cache), Some(key), Some(value)) =
             (state.semantic_cache.as_ref(), semantic_cache_key, semantic_cache_store_value)
         {
-            cache.put(key, value);
+            cache.put(key, value).await;
             out_headers.insert(
                 HeaderName::from_static("x-panda-semantic-cache"),
                 HeaderValue::from_static("miss"),
@@ -2600,6 +2708,19 @@ fn record_wasm_error_metrics(manager: &PluginManager, e: &WasmCallError, hook: &
         WasmCallError::Timeout(_) => manager.record_timeout(hook),
         WasmCallError::Join(_) => manager.record_runtime("_all", RuntimeReason::Internal, hook),
     }
+}
+
+fn maybe_shadow_wasm_policy_reject(state: &ProxyState, e: &WasmCallError, hook: &str) -> bool {
+    if !state.config.prompt_safety.shadow_mode {
+        return false;
+    }
+    if let WasmCallError::Hook(HookFailure::PolicyReject { plugin, code }) = e {
+        state
+            .ops_metrics
+            .inc_policy_shadow_would_block("wasm_policy_reject", &format!("{plugin}:{code:?}:{hook}"));
+        return true;
+    }
+    false
 }
 
 fn proxy_error_response(e: ProxyError) -> Response<BoxBody> {
@@ -3461,7 +3582,7 @@ mod tests {
         let reject_wasm = wat::parse_str(
             r#"(module
                 (memory (export "memory") 1)
-                (func (export "panda_abi_version") (result i32) i32.const 0)
+                (func (export "panda_abi_version") (result i32) i32.const 1)
                 (func (export "panda_on_request") (result i32) i32.const 1)
             )"#,
         )

@@ -88,6 +88,8 @@ upstream: "http://127.0.0.1:11434"
 # Optional: prompt safety deny patterns (starter jailbreak/injection heuristics).
 # prompt_safety:
 #   enabled: true
+#   # Shadow mode: do not block, only log/metric would-block events.
+#   shadow_mode: false
 #   deny_patterns:
 #     - "ignore previous instructions"
 #     - "reveal system prompt"
@@ -95,14 +97,20 @@ upstream: "http://127.0.0.1:11434"
 # Optional: starter PII scrubber (regex-based body redaction on buffered request bodies).
 # pii:
 #   enabled: true
+#   # Shadow mode: detect/log would-redact events without mutating request body.
+#   shadow_mode: false
 #   replacement: "[REDACTED]"
 #   redact_patterns:
 #     - "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}"
 #     - "\\b\\d{3}-\\d{2}-\\d{4}\\b"
 
-# Phase 4: semantic cache (MVP in-memory backend, exact canonical-key match).
+# Phase 4: semantic cache (switchable backend).
 # semantic_cache:
 #   enabled: false
+#   # backend: "memory" (default) or "redis" (Redis-compatible; Dragonfly supported)
+#   backend: "memory"
+#   # Optional when backend=redis; env PANDA_SEMANTIC_CACHE_REDIS_URL overrides.
+#   # redis_url: "redis://127.0.0.1:6379"
 #   similarity_threshold: 0.92
 #   max_entries: 10000
 #   ttl_seconds: 300

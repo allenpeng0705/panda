@@ -6,6 +6,7 @@ use std::task::{Context, Poll};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use hyper::body::{Body, Frame, Incoming};
+use panda_wasm::PluginRuntime;
 use serde_json::Value;
 use tiktoken_rs::CoreBPE;
 
@@ -37,6 +38,12 @@ pub struct SseCountingBody<B = Incoming> {
     usage_completion: Option<u64>,
     delta_tokens: u64,
     finished: bool,
+}
+
+pub struct WasmChunkHookBody<B = Incoming> {
+    inner: B,
+    runtime: Arc<PluginRuntime>,
+    max_output_bytes: usize,
 }
 
 impl<B> SseCountingBody<B>
@@ -121,6 +128,19 @@ where
     }
 }
 
+impl<B> WasmChunkHookBody<B>
+where
+    B: Body<Data = Bytes, Error = hyper::Error> + Unpin,
+{
+    pub fn new(inner: B, runtime: Arc<PluginRuntime>, max_output_bytes: usize) -> Self {
+        Self {
+            inner,
+            runtime,
+            max_output_bytes,
+        }
+    }
+}
+
 fn trim_bytes(b: &[u8]) -> &[u8] {
     let mut s = b;
     while s.first().is_some_and(|x| x.is_ascii_whitespace()) {
@@ -194,5 +214,41 @@ where
             return Poll::Ready(Some(Ok(Frame::data(p))));
         }
         Pin::new(&mut this.inner).poll_frame(cx)
+    }
+}
+
+impl<B> Body for WasmChunkHookBody<B>
+where
+    B: Body<Data = Bytes, Error = hyper::Error> + Unpin,
+{
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.as_mut().get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                Ok(mut data) => {
+                    let data = data.copy_to_bytes(data.remaining());
+                    match this
+                        .runtime
+                        .apply_response_chunk_plugins_strict(&data, this.max_output_bytes)
+                    {
+                        Ok(Some(next)) => Poll::Ready(Some(Ok(Frame::data(Bytes::from(next))))),
+                        Ok(None) => Poll::Ready(Some(Ok(Frame::data(data)))),
+                        Err(e) => {
+                            eprintln!("panda: wasm response chunk hook fail-open: {e}");
+                            Poll::Ready(Some(Ok(Frame::data(data))))
+                        }
+                    }
+                }
+                Err(frame) => Poll::Ready(Some(Ok(frame))),
+            },
+            other => other,
+        }
     }
 }

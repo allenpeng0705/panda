@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="${ROOT_DIR}/artifacts/release"
 TARGET_TRIPLE="${PANDA_RELEASE_TARGET:-$(rustc -vV | awk '/host:/ {print $2}')}"
 TARGET_DIR="${CARGO_TARGET_DIR:-${ROOT_DIR}/target}"
+RELEASE_FEATURES="${PANDA_RELEASE_FEATURES:-mimalloc}"
 
 if [[ -z "${SOURCE_DATE_EPOCH:-}" ]]; then
   SOURCE_DATE_EPOCH="$(git -C "${ROOT_DIR}" log -1 --format=%ct)"
@@ -13,10 +14,10 @@ fi
 
 mkdir -p "${OUT_DIR}"
 
-echo "Building panda-server (target=${TARGET_TRIPLE}) with --locked"
+echo "Building panda-server (target=${TARGET_TRIPLE}, features=${RELEASE_FEATURES}) with --locked"
 (
   cd "${ROOT_DIR}"
-  cargo build --locked --release -p panda-server --target "${TARGET_TRIPLE}"
+  cargo build --locked --release -p panda-server --target "${TARGET_TRIPLE}" --features "${RELEASE_FEATURES}"
 )
 
 BIN="${TARGET_DIR}/${TARGET_TRIPLE}/release/panda"

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/panda-pdk",
     "crates/panda-config",
     "crates/panda-proxy",
     "crates/panda-server",

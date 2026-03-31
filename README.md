@@ -61,6 +61,9 @@ Optional structured logs:
   - `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318/v1/traces`
   - `PANDA_OTEL_SERVICE_NAME=panda-gateway`
   - When set, the gateway also exports OpenTelemetry **trace spans** to that endpoint (HTTP/protobuf); structured JSON logs still go to stdout.
+- Semantic cache backend override (when `semantic_cache.enabled=true`):
+  - `PANDA_SEMANTIC_CACHE_REDIS_URL=redis://127.0.0.1:6379`
+  - `semantic_cache.backend: "redis"` in `panda.yaml` (Redis-compatible; Dragonfly works too)
 
 ### 2) Docker
 
@@ -72,6 +75,8 @@ docker run --rm -p 8080:8080 \
   -v "$(pwd)/panda.yaml:/app/panda.yaml:ro" \
   panda:latest /app/panda.yaml
 ```
+
+By default, the Docker build enables `mimalloc` (`PANDA_BUILD_FEATURES=mimalloc`).
 
 ### 3) Kubernetes
 
@@ -127,16 +132,27 @@ All script outputs are written to `artifacts/` (git-ignored).
   - `./scripts/release_repro_build.sh`
 - Optional target override:
   - `PANDA_RELEASE_TARGET=x86_64-unknown-linux-gnu ./scripts/release_repro_build.sh`
+- Optional feature override:
+  - `PANDA_RELEASE_FEATURES="mimalloc" ./scripts/release_repro_build.sh`
 
 ## Optional Allocator Tuning
 
-For long-lived streaming workloads, compare allocator behavior with:
+For long-lived streaming workloads, `mimalloc` is enabled by default in Docker/release scripts; compare behavior manually with:
 
 ```bash
 cargo build -p panda-server --release --features mimalloc
 ```
 
 Enable only after load/soak evidence in your environment.
+
+## Wasm Plugin Runtime Notes
+
+- Panda uses warm Wasm instances (pool) per plugin; set `PANDA_WASM_INSTANCE_POOL_SIZE` (default `4`).
+- Current guest ABI is v1 (`panda_abi_version() == 1`) with optional hooks:
+  - `panda_on_request`
+  - `panda_on_request_body`
+  - `panda_on_response_chunk` (streaming chunk hook)
+- Rust plugin authors should use `crates/panda-pdk`; TinyGo sample parity lives in `samples/tinygo-plugin/`.
 
 ## Documentation Map
 
