@@ -90,7 +90,9 @@ This plan matches the **Kong-style lesson** you care about: a **thin, native dat
 - **Workspace crate `panda-wasm`:** `PANDA_WASM_ABI_VERSION`, **Wasmtime** loader, `plugins.directory` in config; loads `*.wasm` at startup and runs an optional `add` smoke export per module.
 - **`panda-proxy`:** loads plugins when `plugins.directory` is set; keeps `Arc<PluginRuntime>` for upcoming per-request hooks.
 - **Sample Rust guest (`wasm-plugin-sample`):** minimal `panda_abi_version` + `add` for smoke tests; build with `wasm32-unknown-unknown`.
-- **Next:** host ↔ guest ABI (headers/body/context), TinyGo sample, trap isolation per request, optional hot reload.
+- **ABI spec doc:** `docs/wasm_abi.md` now defines v0 exports/imports, return codes, limits, and compatibility.
+- **TinyGo sample skeleton:** `samples/tinygo-plugin/` added for cross-toolchain parity and rollout validation.
+- **Next:** trap isolation hardening per request, TinyGo build matrix validation, optional hot reload.
 
 ### Review
 
