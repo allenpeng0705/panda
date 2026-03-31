@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use redis::AsyncCommands;
 
@@ -47,6 +48,10 @@ impl TpmCounters {
             let mut conn = mgr.clone();
             let key = format!("panda:tpm:v1:prompt:{bucket}");
             let _: Result<i64, _> = conn.incr(&key, n as i64).await;
+            let minute = unix_minute();
+            let window_key = format!("panda:tpm:v1:prompt_window:{bucket}:{minute}");
+            let _: Result<i64, _> = conn.incr(&window_key, n as i64).await;
+            let _: Result<bool, _> = conn.expire(&window_key, 120).await;
         }
     }
 
@@ -67,6 +72,15 @@ impl TpmCounters {
 
     /// Returns true when adding `n` would exceed `limit_per_minute`.
     pub async fn would_exceed_prompt_budget(&self, bucket: &str, n: u64, limit_per_minute: u64) -> bool {
+        if let Some(ref mgr) = self.redis {
+            let mut conn = mgr.clone();
+            let minute = unix_minute();
+            let window_key = format!("panda:tpm:v1:prompt_window:{bucket}:{minute}");
+            let cur: Result<Option<u64>, _> = conn.get(&window_key).await;
+            if let Ok(current) = cur {
+                return current.unwrap_or(0).saturating_add(n) > limit_per_minute;
+            }
+        }
         let now = std::time::Instant::now();
         let mut g = self.mem_prompt_window.lock().expect("tpm mutex poisoned");
         let e = g.entry(bucket.to_string()).or_insert((now, 0));
@@ -75,6 +89,13 @@ impl TpmCounters {
         }
         e.1.saturating_add(n) > limit_per_minute
     }
+}
+
+fn unix_minute() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() / 60)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
