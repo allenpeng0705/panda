@@ -7,6 +7,7 @@ members = [
     "crates/panda-server",
     "crates/panda-wasm",
     "crates/wasm-plugin-sample",
+    "crates/wasm-plugin-ssrf-guard",
 ]
 
 [workspace.package]

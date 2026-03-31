@@ -1,7 +1,7 @@
 use serde_json::json;
 
-pub fn is_anthropic_provider(cfg: &panda_config::PandaConfig) -> bool {
-    cfg.adapter.provider == "anthropic"
+pub fn is_anthropic_provider(cfg: &panda_config::PandaConfig, ingress_path: &str) -> bool {
+    cfg.effective_adapter_provider(ingress_path) == "anthropic"
 }
 
 pub fn openai_chat_to_anthropic(body: &[u8]) -> anyhow::Result<(Vec<u8>, bool)> {

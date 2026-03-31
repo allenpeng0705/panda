@@ -1,8 +1,10 @@
 //! HTTP reverse proxy with streaming bodies (SSE-friendly).
 //!
-//! [`panda_config::PandaConfig`] supplies the upstream base URL; this crate does not read YAML.
+//! [`panda_config::PandaConfig`] supplies the upstream base URL (and optional per-path routes); this crate does not read YAML.
 
 mod gateway;
+pub mod jwks;
+mod route_rps;
 mod adapter;
 mod adapter_stream;
 mod mcp;
@@ -23,12 +25,13 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use std::fs;
 
 use aho_corasick::AhoCorasick;
 use bytes::{Buf, BufMut};
 use constant_time_eq::constant_time_eq;
+use futures_util::SinkExt;
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http_body_util::BodyExt;
 use http_body_util::Limited;
@@ -42,14 +45,17 @@ use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode};
 use panda_config::PandaConfig;
 use panda_wasm::{HookFailure, PluginRuntime, RuntimeReason};
 use regex::Regex;
 use serde::Deserialize;
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, broadcast};
+use tokio::sync::broadcast::error::RecvError;
 use tokio_rustls::TlsAcceptor;
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::protocol::Message;
 use tpm::TpmCounters;
 use semantic_cache::SemanticCache;
 use tracing::info;
@@ -60,6 +66,7 @@ const AGENT_TOKEN_HEADER: &str = "x-panda-agent-token";
 const DEFAULT_SHUTDOWN_DRAIN_SECONDS: u64 = 30;
 const DEFAULT_UPSTREAM_REQUEST_TIMEOUT_SECONDS: u64 = 120;
 const DEFAULT_SEMANTIC_CACHE_TIMEOUT_MS: u64 = 50;
+const DEFAULT_CONSOLE_CHANNEL_CAPACITY: usize = 1024;
 
 /// Shared state for each connection handler.
 pub struct ProxyState {
@@ -81,6 +88,33 @@ pub struct ProxyState {
     draining: AtomicBool,
     /// In-flight accepted TCP connections being served.
     active_connections: AtomicUsize,
+    /// Optional developer-console event fanout (disabled by default).
+    console_hub: Option<Arc<ConsoleEventHub>>,
+    /// Optional per-route HTTP RPS limits.
+    rps: Option<Arc<route_rps::RouteRpsLimiters>>,
+    /// JWKS-backed RSA JWT verification when `identity.jwks_url` is set.
+    pub jwks: Option<Arc<jwks::JwksResolver>>,
+}
+
+#[derive(Clone)]
+struct ConsoleEventHub {
+    tx: broadcast::Sender<ConsoleEvent>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct ConsoleEvent {
+    version: &'static str,
+    request_id: String,
+    trace_id: Option<String>,
+    ts_unix_ms: u128,
+    stage: &'static str,
+    kind: &'static str,
+    method: String,
+    route: String,
+    status: Option<u16>,
+    elapsed_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload: Option<serde_json::Value>,
 }
 
 #[derive(Default)]
@@ -551,6 +585,101 @@ impl PluginManager {
     }
 }
 
+impl ConsoleEventHub {
+    fn new(capacity: usize) -> Self {
+        let (tx, _) = broadcast::channel(capacity);
+        Self { tx }
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<ConsoleEvent> {
+        self.tx.subscribe()
+    }
+
+    fn has_subscribers(&self) -> bool {
+        self.tx.receiver_count() > 0
+    }
+
+    fn emit(&self, event: ConsoleEvent) {
+        // Fast-path no-op keeps disabled/unused console overhead minimal.
+        if !self.has_subscribers() {
+            return;
+        }
+        let _ = self.tx.send(event);
+    }
+}
+
+fn now_epoch_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+fn dev_console_enabled_from_env() -> bool {
+    matches!(
+        std::env::var("PANDA_DEV_CONSOLE_ENABLED")
+            .ok()
+            .as_deref()
+            .map(|s| s.trim().to_ascii_lowercase()),
+        Some(v) if v == "1" || v == "true" || v == "yes" || v == "on"
+    )
+}
+
+fn truncate_route(path: &str) -> String {
+    const MAX_ROUTE_LEN: usize = 256;
+    if path.len() <= MAX_ROUTE_LEN {
+        return path.to_string();
+    }
+    format!("{}...", &path[..MAX_ROUTE_LEN])
+}
+
+/// Recursively redact map keys that look sensitive (substring match, case-insensitive).
+fn redact_sensitive_json_keys(v: &serde_json::Value) -> serde_json::Value {
+    const KEY_MARKERS: &[&str] = &[
+        "password",
+        "secret",
+        "token",
+        "api_key",
+        "apikey",
+        "credential",
+        "authorization",
+        "cookie",
+        "bearer",
+    ];
+    fn key_is_sensitive(key: &str) -> bool {
+        let lk = key.to_ascii_lowercase();
+        KEY_MARKERS.iter().any(|m| lk.contains(m))
+    }
+    match v {
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, val) in map {
+                if key_is_sensitive(k) {
+                    out.insert(k.clone(), serde_json::Value::String("[REDACTED]".to_string()));
+                } else {
+                    out.insert(k.clone(), redact_sensitive_json_keys(val));
+                }
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(arr) => serde_json::Value::Array(
+            arr.iter().map(redact_sensitive_json_keys).collect(),
+        ),
+        _ => v.clone(),
+    }
+}
+
+fn console_mcp_args_preview(args: &serde_json::Value) -> String {
+    const MAX: usize = 512;
+    let redacted = redact_sensitive_json_keys(args);
+    let s = serde_json::to_string(&redacted).unwrap_or_else(|_| "\"\"".to_string());
+    if s.len() <= MAX {
+        s
+    } else {
+        format!("{}...", &s[..MAX])
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct JwtClaims {
     #[allow(dead_code)]
@@ -641,6 +770,30 @@ pub async fn run(config: Arc<PandaConfig>) -> anyhow::Result<()> {
     } else {
         None
     };
+    let console_hub = if dev_console_enabled_from_env() {
+        eprintln!("panda: developer console stream enabled at /console/ws");
+        Some(Arc::new(ConsoleEventHub::new(
+            DEFAULT_CONSOLE_CHANNEL_CAPACITY,
+        )))
+    } else {
+        None
+    };
+
+    let rps = route_rps::RouteRpsLimiters::from_config(config.as_ref());
+
+    let jwks = if let Some(ref u) = config.identity.jwks_url {
+        if !u.trim().is_empty() {
+            Some(Arc::new(jwks::JwksResolver::new(
+                client.clone(),
+                u.clone(),
+                Duration::from_secs(config.identity.jwks_cache_ttl_seconds),
+            )))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let state = Arc::new(ProxyState {
         config: Arc::clone(&config),
@@ -655,6 +808,9 @@ pub async fn run(config: Arc<PandaConfig>) -> anyhow::Result<()> {
         context_enricher: build_context_enricher_from_env(),
         draining: AtomicBool::new(false),
         active_connections: AtomicUsize::new(0),
+        console_hub,
+        rps,
+        jwks,
     });
 
     if let Some(ref tls_cfg) = config.tls {
@@ -716,7 +872,7 @@ async fn accept_loop(
                             let st = Arc::clone(&st_svc);
                             dispatch(req, st)
                         });
-                        if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+                        if let Err(e) = http1::Builder::new().serve_connection(io, svc).with_upgrades().await {
                             eprintln!("connection error: {e}");
                         }
                         st.active_connections.fetch_sub(1, Ordering::SeqCst);
@@ -729,7 +885,7 @@ async fn accept_loop(
                             let st = Arc::clone(&st_svc);
                             dispatch(req, st)
                         });
-                        if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+                        if let Err(e) = http1::Builder::new().serve_connection(io, svc).with_upgrades().await {
                             eprintln!("connection error: {e}");
                         }
                         st.active_connections.fetch_sub(1, Ordering::SeqCst);
@@ -789,8 +945,72 @@ fn build_http_client() -> anyhow::Result<HttpClient> {
     Ok(Client::builder(TokioExecutor::new()).build(https))
 }
 
+fn ws_handshake_response(req: &Request<Incoming>) -> Result<Response<BoxBody>, Response<BoxBody>> {
+    let ws_req = http::Request::builder()
+        .method(req.method())
+        .uri(req.uri())
+        .version(req.version())
+        .body(())
+        .map_err(|_| text_response(StatusCode::BAD_REQUEST, "bad websocket request"))?;
+    let mut ws_req = ws_req;
+    *ws_req.headers_mut() = req.headers().clone();
+    match tokio_tungstenite::tungstenite::handshake::server::create_response(&ws_req) {
+        Ok(resp) => {
+            let (parts, _) = resp.into_parts();
+            let body = Full::new(bytes::Bytes::new())
+                .map_err(|never: std::convert::Infallible| match never {})
+                .boxed_unsync();
+            Ok(Response::from_parts(parts, body))
+        }
+        Err(_) => Err(text_response(
+            StatusCode::BAD_REQUEST,
+            "bad websocket handshake",
+        )),
+    }
+}
+
+async fn handle_console_ws(req: Request<Incoming>, hub: Arc<ConsoleEventHub>) -> Response<BoxBody> {
+    let handshake = match ws_handshake_response(&req) {
+        Ok(resp) => resp,
+        Err(resp) => return resp,
+    };
+    tokio::spawn(async move {
+        match hyper::upgrade::on(req).await {
+            Ok(upgraded) => {
+                let io = TokioIo::new(upgraded);
+                let mut ws = WebSocketStream::from_raw_socket(
+                    io,
+                    tokio_tungstenite::tungstenite::protocol::Role::Server,
+                    None,
+                )
+                .await;
+                let mut rx = hub.subscribe();
+                loop {
+                    match rx.recv().await {
+                        Ok(evt) => match serde_json::to_string(&evt) {
+                            Ok(payload) => {
+                                if ws.send(Message::Text(payload)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => continue,
+                        },
+                        Err(RecvError::Lagged(_)) => {
+                            // Slow consumer: skip missed messages and keep streaming.
+                            continue;
+                        }
+                        Err(RecvError::Closed) => break,
+                    }
+                }
+            }
+            Err(e) => eprintln!("panda: console websocket upgrade failed: {e}"),
+        }
+    });
+    handshake
+}
+
 async fn dispatch(mut req: Request<Incoming>, state: Arc<ProxyState>) -> Result<Response<BoxBody>, Infallible> {
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let corr = gateway::ensure_correlation_id(
@@ -798,6 +1018,58 @@ async fn dispatch(mut req: Request<Incoming>, state: Arc<ProxyState>) -> Result<
         &state.config.observability.correlation_header,
     )
     .unwrap_or_else(|_| "-".to_string());
+    if method == hyper::Method::GET && (path == "/console" || path == "/console/ws") {
+        let Some(ref hub) = state.console_hub else {
+            return Ok(text_response(
+                StatusCode::NOT_FOUND,
+                "developer console is disabled",
+            ));
+        };
+        if state
+            .config
+            .observability
+            .admin_secret_env
+            .as_ref()
+            .is_some_and(|v| !v.trim().is_empty())
+        {
+            let corr_ops = ops_log_correlation_id(req.headers(), &state.config);
+            if let Err(resp) = enforce_ops_auth_if_configured(req.headers(), &state.config) {
+                state.ops_metrics.inc_ops_auth_denied(&path);
+                log_ops_access(&path, "deny", &corr_ops, None);
+                return Ok(resp);
+            }
+            state.ops_metrics.inc_ops_auth_allowed(&path);
+            log_ops_access(&path, "allow", &corr_ops, None);
+        }
+        if path == "/console/ws" {
+            return Ok(handle_console_ws(req, Arc::clone(hub)).await);
+        }
+        trace_request(
+            &path,
+            &method,
+            &corr,
+            StatusCode::OK,
+            started.elapsed().as_millis(),
+        );
+        return Ok(console_html_response());
+    }
+    if let Some(ref hub) = state.console_hub {
+        if path != "/console" {
+            hub.emit(ConsoleEvent {
+                version: "v1",
+                request_id: corr.clone(),
+                trace_id: None,
+                ts_unix_ms: now_epoch_ms(),
+                stage: "ingress",
+                kind: "request_started",
+                method: method.to_string(),
+                route: truncate_route(&path),
+                status: None,
+                elapsed_ms: None,
+                payload: None,
+            });
+        }
+    }
     let is_ops_endpoint = method == hyper::Method::GET
         && (path == "/metrics"
             || path == "/plugins/status"
@@ -806,16 +1078,46 @@ async fn dispatch(mut req: Request<Incoming>, state: Arc<ProxyState>) -> Result<
 
     if method == hyper::Method::GET && path == "/health" {
         trace_request(&path, &method, &corr, StatusCode::OK, started.elapsed().as_millis());
+        if let Some(ref hub) = state.console_hub {
+            hub.emit(ConsoleEvent {
+                version: "v1",
+                request_id: corr.clone(),
+                trace_id: None,
+                ts_unix_ms: now_epoch_ms(),
+                stage: "egress",
+                kind: "request_finished",
+                method: method.to_string(),
+                route: truncate_route(&path),
+                status: Some(StatusCode::OK.as_u16()),
+                elapsed_ms: Some(started.elapsed().as_millis() as u64),
+                payload: None,
+            });
+        }
         return Ok(text_response(StatusCode::OK, "ok"));
     }
     if method == hyper::Method::GET && path == "/ready" {
         let (status, body) = readiness_status(state.as_ref());
         trace_request(&path, &method, &corr, status, started.elapsed().as_millis());
+        if let Some(ref hub) = state.console_hub {
+            hub.emit(ConsoleEvent {
+                version: "v1",
+                request_id: corr.clone(),
+                trace_id: None,
+                ts_unix_ms: now_epoch_ms(),
+                stage: "egress",
+                kind: "request_finished",
+                method: method.to_string(),
+                route: truncate_route(&path),
+                status: Some(status.as_u16()),
+                elapsed_ms: Some(started.elapsed().as_millis() as u64),
+                payload: None,
+            });
+        }
         return Ok(json_response(status, body));
     }
     if is_ops_endpoint {
         let corr = ops_log_correlation_id(req.headers(), &state.config);
-        let bucket = ops_bucket_for_path(&path, req.headers(), state.as_ref());
+        let bucket = ops_bucket_for_path(&path, req.headers(), state.as_ref()).await;
         if let Err(resp) = enforce_ops_auth_if_configured(req.headers(), &state.config) {
             state.ops_metrics.inc_ops_auth_denied(&path);
             log_ops_access(&path, "deny", &corr, bucket.as_deref());
@@ -858,7 +1160,7 @@ async fn dispatch(mut req: Request<Incoming>, state: Arc<ProxyState>) -> Result<
         return Ok(json_response(StatusCode::OK, json));
     }
 
-    if let Err(resp) = enforce_jwt_if_required(&req, &state.config) {
+    if let Err(resp) = enforce_jwt_if_required(&req, state.as_ref()).await {
         trace_request(&path, &method, &corr, resp.status(), started.elapsed().as_millis());
         return Ok(resp);
     }
@@ -866,11 +1168,41 @@ async fn dispatch(mut req: Request<Incoming>, state: Arc<ProxyState>) -> Result<
     match forward_to_upstream(req, state.as_ref()).await {
         Ok(resp) => {
             trace_request(&path, &method, &corr, resp.status(), started.elapsed().as_millis());
+            if let Some(ref hub) = state.console_hub {
+                hub.emit(ConsoleEvent {
+                    version: "v1",
+                    request_id: corr.clone(),
+                    trace_id: None,
+                    ts_unix_ms: now_epoch_ms(),
+                    stage: "egress",
+                    kind: "request_finished",
+                    method: method.to_string(),
+                    route: truncate_route(&path),
+                    status: Some(resp.status().as_u16()),
+                    elapsed_ms: Some(started.elapsed().as_millis() as u64),
+                    payload: None,
+                });
+            }
             Ok(resp)
         }
         Err(e) => {
             let resp = proxy_error_response(e);
             trace_request(&path, &method, &corr, resp.status(), started.elapsed().as_millis());
+            if let Some(ref hub) = state.console_hub {
+                hub.emit(ConsoleEvent {
+                    version: "v1",
+                    request_id: corr.clone(),
+                    trace_id: None,
+                    ts_unix_ms: now_epoch_ms(),
+                    stage: "error",
+                    kind: "request_failed",
+                    method: method.to_string(),
+                    route: truncate_route(&path),
+                    status: Some(resp.status().as_u16()),
+                    elapsed_ms: Some(started.elapsed().as_millis() as u64),
+                    payload: None,
+                });
+            }
             Ok(resp)
         }
     }
@@ -895,11 +1227,11 @@ fn trace_request(path: &str, method: &hyper::Method, correlation_id: &str, statu
     );
 }
 
-fn enforce_jwt_if_required(req: &Request<Incoming>, cfg: &PandaConfig) -> Result<(), Response<BoxBody>> {
-    if !cfg.identity.require_jwt {
+async fn enforce_jwt_if_required(req: &Request<Incoming>, state: &ProxyState) -> Result<(), Response<BoxBody>> {
+    if !state.config.identity.require_jwt {
         return Ok(());
     }
-    if let Err(msg) = validate_bearer_jwt(req.headers(), req.uri().path(), cfg) {
+    if let Err(msg) = validate_bearer_jwt(req.headers(), req.uri().path(), state).await {
         let status = if msg.starts_with("forbidden:") {
             StatusCode::FORBIDDEN
         } else {
@@ -934,12 +1266,17 @@ fn enforce_ops_auth_if_configured(headers: &HeaderMap, cfg: &PandaConfig) -> Res
     }
 }
 
-fn validate_bearer_jwt(headers: &HeaderMap, path: &str, cfg: &PandaConfig) -> Result<(), &'static str> {
-    let _ = validate_and_decode_bearer_jwt(headers, path, cfg)?;
+async fn validate_bearer_jwt(headers: &HeaderMap, path: &str, state: &ProxyState) -> Result<(), &'static str> {
+    let _ = validate_and_decode_bearer_jwt(headers, path, state).await?;
     Ok(())
 }
 
-fn validate_and_decode_bearer_jwt(headers: &HeaderMap, path: &str, cfg: &PandaConfig) -> Result<JwtClaims, &'static str> {
+async fn validate_and_decode_bearer_jwt(
+    headers: &HeaderMap,
+    path: &str,
+    state: &ProxyState,
+) -> Result<JwtClaims, &'static str> {
+    let cfg = state.config.as_ref();
     let auth = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -948,9 +1285,9 @@ fn validate_and_decode_bearer_jwt(headers: &HeaderMap, path: &str, cfg: &PandaCo
         .strip_prefix("Bearer ")
         .filter(|t| !t.trim().is_empty())
         .ok_or("unauthorized: missing bearer token")?;
-    let secret = std::env::var(&cfg.identity.jwt_hs256_secret_env)
-        .map_err(|_| "unauthorized: jwt secret not configured")?;
-    let mut validation = Validation::new(Algorithm::HS256);
+    let header = decode_header(token).map_err(|_| "unauthorized: invalid bearer token")?;
+    let alg = header.alg;
+    let mut validation = Validation::new(alg);
     validation.validate_exp = true;
     if !cfg.identity.accepted_issuers.is_empty() {
         validation.set_issuer(&cfg.identity.accepted_issuers);
@@ -958,8 +1295,25 @@ fn validate_and_decode_bearer_jwt(headers: &HeaderMap, path: &str, cfg: &PandaCo
     if !cfg.identity.accepted_audiences.is_empty() {
         validation.set_audience(&cfg.identity.accepted_audiences);
     }
-    let data = decode::<JwtClaims>(token, &DecodingKey::from_secret(secret.as_bytes()), &validation)
-        .map_err(|_| "unauthorized: invalid bearer token")?;
+    let data = match alg {
+        Algorithm::HS256 => {
+            let secret = std::env::var(&cfg.identity.jwt_hs256_secret_env)
+                .map_err(|_| "unauthorized: jwt secret not configured")?;
+            decode::<JwtClaims>(token, &DecodingKey::from_secret(secret.as_bytes()), &validation)
+        }
+        Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512 => {
+            let resolver = state
+                .jwks
+                .as_ref()
+                .ok_or("unauthorized: jwks not configured")?;
+            let key = resolver
+                .decoding_key_for(header.kid.as_deref(), alg)
+                .await?;
+            decode::<JwtClaims>(token, &key, &validation)
+        }
+        _ => return Err("unauthorized: unsupported jwt algorithm"),
+    }
+    .map_err(|_| "unauthorized: invalid bearer token")?;
     let available = extract_scopes(&data.claims);
     if !cfg.identity.required_scopes.is_empty() {
         let has_all = cfg
@@ -1017,11 +1371,15 @@ fn extract_scopes(claims: &JwtClaims) -> std::collections::HashSet<String> {
     out
 }
 
-fn maybe_exchange_agent_token(headers: &HeaderMap, cfg: &PandaConfig) -> Result<Option<String>, &'static str> {
+async fn maybe_exchange_agent_token(
+    headers: &HeaderMap,
+    state: &ProxyState,
+) -> Result<Option<String>, &'static str> {
+    let cfg = state.config.as_ref();
     if !cfg.identity.enable_token_exchange {
         return Ok(None);
     }
-    let claims = validate_and_decode_bearer_jwt(headers, "", cfg)?;
+    let claims = validate_and_decode_bearer_jwt(headers, "", state).await?;
     let sub = claims
         .sub
         .filter(|s| !s.trim().is_empty())
@@ -1052,6 +1410,10 @@ fn maybe_exchange_agent_token(headers: &HeaderMap, cfg: &PandaConfig) -> Result<
 enum ProxyError {
     PolicyReject(String),
     PayloadTooLarge(&'static str),
+    /// Per-route HTTP method not allowed (405); `allow` is the `Allow` header value.
+    MethodNotAllowed { allow: String },
+    /// Per-route HTTP RPS limit (429).
+    RpsLimited { rps: u32 },
     RateLimited {
         limit: u64,
         estimate: u64,
@@ -1087,11 +1449,17 @@ fn tpm_token_estimate(content_length: Option<usize>, body_len: Option<usize>) ->
     e
 }
 
-fn merge_jwt_identity_into_context(ctx: &mut RequestContext, headers: &HeaderMap, path: &str, cfg: &PandaConfig) {
+async fn merge_jwt_identity_into_context(
+    ctx: &mut RequestContext,
+    headers: &HeaderMap,
+    path: &str,
+    state: &ProxyState,
+) {
+    let cfg = state.config.as_ref();
     if !cfg.identity.require_jwt || ctx.subject.is_some() {
         return;
     }
-    if let Ok(claims) = validate_and_decode_bearer_jwt(headers, path, cfg) {
+    if let Ok(claims) = validate_and_decode_bearer_jwt(headers, path, state).await {
         if let Some(s) = claims.sub {
             let t = s.trim();
             if !t.is_empty() {
@@ -1778,7 +2146,7 @@ fn mcp_status_json(state: &ProxyState) -> serde_json::Value {
 
 fn readiness_status(state: &ProxyState) -> (StatusCode, serde_json::Value) {
     let draining = state.draining.load(Ordering::SeqCst);
-    let upstream_ok = state.config.upstream.parse::<http::Uri>().is_ok();
+    let upstream_ok = state.config.all_upstream_uris_valid();
     let mcp_ok = !state.config.mcp.enabled || state.mcp.is_some() || state.config.mcp.fail_open;
     let context_enrichment_ok = if let Ok(path) = std::env::var("PANDA_CONTEXT_ENRICHMENT_FILE") {
         let t = path.trim();
@@ -1831,7 +2199,7 @@ async fn tpm_status_json(state: &ProxyState, path: &str, req_headers: &HeaderMap
     let mut headers = req_headers.clone();
     let secret = gateway::trusted_gateway_secret_from_env();
     let mut ctx = gateway::apply_trusted_gateway(&mut headers, &state.config.trusted_gateway, secret.as_deref());
-    merge_jwt_identity_into_context(&mut ctx, &headers, path, &state.config);
+    merge_jwt_identity_into_context(&mut ctx, &headers, path, state).await;
     let bucket = tpm_bucket_key(&ctx);
     if !state.config.tpm.enforce_budget {
         return serde_json::json!({
@@ -1856,14 +2224,14 @@ async fn tpm_status_json(state: &ProxyState, path: &str, req_headers: &HeaderMap
     })
 }
 
-fn ops_bucket_for_path(path: &str, req_headers: &HeaderMap, state: &ProxyState) -> Option<String> {
+async fn ops_bucket_for_path(path: &str, req_headers: &HeaderMap, state: &ProxyState) -> Option<String> {
     if path != "/tpm/status" {
         return None;
     }
     let mut headers = req_headers.clone();
     let secret = gateway::trusted_gateway_secret_from_env();
     let mut ctx = gateway::apply_trusted_gateway(&mut headers, &state.config.trusted_gateway, secret.as_deref());
-    merge_jwt_identity_into_context(&mut ctx, &headers, path, &state.config);
+    merge_jwt_identity_into_context(&mut ctx, &headers, path, state).await;
     Some(tpm_bucket_key(&ctx))
 }
 
@@ -1929,13 +2297,29 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
         }
     }
 
-    let uri = upstream::join_upstream_uri(&state.config.upstream, req.uri()).map_err(ProxyError::Upstream)?;
+    let ingress_path = req.uri().path().to_string();
+    if let Some(ref rps) = state.rps {
+        if let Err(limit) = rps.check(state.config.as_ref(), &ingress_path) {
+            return Err(ProxyError::RpsLimited { rps: limit });
+        }
+    }
+
+    if let Err(allow) = state
+        .config
+        .check_ingress_method(&ingress_path, req.method())
+    {
+        return Err(ProxyError::MethodNotAllowed { allow });
+    }
+
+    let base = state.config.effective_upstream_base(&ingress_path);
+    let uri = upstream::join_upstream_uri(base, req.uri()).map_err(ProxyError::Upstream)?;
 
     let (mut parts, body) = req.into_parts();
     parts.uri = uri;
     let mut headers = HeaderMap::new();
     upstream::filter_request_headers(&parts.headers, &mut headers);
-    if let Some(tok) = maybe_exchange_agent_token(&parts.headers, &state.config)
+    if let Some(tok) = maybe_exchange_agent_token(&parts.headers, state)
+        .await
         .map_err(|m| ProxyError::Upstream(anyhow::anyhow!("{m}")))?
     {
         headers.insert(
@@ -1981,9 +2365,10 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
     let secret = gateway::trusted_gateway_secret_from_env();
     let mut ctx = gateway::apply_trusted_gateway(&mut headers, &state.config.trusted_gateway, secret.as_deref());
     ctx.correlation_id = correlation_id;
-    let path = parts.uri.path();
-    merge_jwt_identity_into_context(&mut ctx, &headers, path, &state.config);
+    let path = ingress_path.as_str();
+    merge_jwt_identity_into_context(&mut ctx, &headers, path, state).await;
     let bucket = tpm_bucket_key(&ctx);
+    let tpm_limit = state.config.effective_tpm_budget_tokens_per_minute(path);
 
     let max_body = state.config.plugins.max_request_body_bytes;
     let cl = parse_content_length(&parts.headers);
@@ -1993,15 +2378,16 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
         }
     }
 
-    let adapter_anthropic_candidate = adapter::is_anthropic_provider(&state.config)
+    let adapter_anthropic_candidate = adapter::is_anthropic_provider(&state.config, path)
         && parts.method == hyper::Method::POST
-        && parts.uri.path() == "/v1/chat/completions"
+        && path == "/v1/chat/completions"
         && is_json_request(&parts.headers);
     let advertise_mcp_tools =
-        should_advertise_mcp_tools(state, &parts.method, parts.uri.path(), &parts.headers);
+        should_advertise_mcp_tools(state, &parts.method, path, &parts.headers);
     let semantic_cache_candidate = state.semantic_cache.is_some()
+        && state.config.effective_semantic_cache_enabled_for_path(path)
         && parts.method == hyper::Method::POST
-        && parts.uri.path() == "/v1/chat/completions"
+        && path == "/v1/chat/completions"
         && is_json_request(&parts.headers);
     let maybe_mcp_followup = advertise_mcp_tools;
     let needs_body_hooks = state.plugins.is_some() || state.config.pii.enabled || state.config.prompt_safety.enabled;
@@ -2036,7 +2422,7 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
         let buf = collect_body_bounded(body, max_body).await?.to_vec();
         let est = tpm_token_estimate(cl, Some(buf.len()));
         if tpm_on {
-            let limit = state.config.tpm.budget_tokens_per_minute;
+            let limit = tpm_limit;
             if !state.tpm.try_reserve_prompt_budget(&bucket, est, limit).await {
                 state
                     .ops_metrics
@@ -2181,6 +2567,10 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
                         } else {
                             descriptors
                         };
+                        let descriptors = mcp::filter_tools_by_allowed_servers(
+                            descriptors,
+                            state.config.effective_mcp_server_names(path),
+                        );
                         if !descriptors.is_empty() {
                             let tools_json = openai_tools_json_value(&descriptors);
                             match inject_openai_tools_into_chat_body(&next_bytes, tools_json) {
@@ -2267,7 +2657,7 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
     } else {
         let est = tpm_token_estimate(cl, None);
         if tpm_on {
-            let limit = state.config.tpm.budget_tokens_per_minute;
+            let limit = tpm_limit;
             if !state.tpm.try_reserve_prompt_budget(&bucket, est, limit).await {
                 state
                     .ops_metrics
@@ -2455,6 +2845,38 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
                         else {
                             continue;
                         };
+                        if let Some(allowed) = state.config.effective_mcp_server_names(ingress_path.as_str()) {
+                            if !allowed.iter().any(|a| a == &server) {
+                                continue;
+                            }
+                        }
+                        let mcp_route = truncate_route(mcp_followup_uri.path());
+                        let mcp_method = mcp_followup_method.to_string();
+                        let t_mcp = Instant::now();
+                        if let Some(ref hub) = state.console_hub {
+                            hub.emit(ConsoleEvent {
+                                version: "v1",
+                                request_id: ctx.correlation_id.clone(),
+                                trace_id: None,
+                                ts_unix_ms: now_epoch_ms(),
+                                stage: "mcp",
+                                kind: "mcp_call",
+                                method: mcp_method.clone(),
+                                route: mcp_route.clone(),
+                                status: None,
+                                elapsed_ms: None,
+                                payload: Some(serde_json::json!({
+                                    "phase": "start",
+                                    "round": rounds,
+                                    "server": &server,
+                                    "tool": &tool,
+                                    "arguments_preview": console_mcp_args_preview(&tc.function_arguments),
+                                    "arguments_redacted": true
+                                })),
+                            });
+                        }
+                        let server_lbl = server.clone();
+                        let tool_lbl = tool.clone();
                         let call = mcp::McpToolCallRequest {
                             server,
                             tool,
@@ -2463,6 +2885,30 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
                         };
                         match mcp_runtime.call_tool(call).await {
                             Ok(result) => {
+                                let dur_ms = t_mcp.elapsed().as_millis() as u64;
+                                if let Some(ref hub) = state.console_hub {
+                                    hub.emit(ConsoleEvent {
+                                        version: "v1",
+                                        request_id: ctx.correlation_id.clone(),
+                                        trace_id: None,
+                                        ts_unix_ms: now_epoch_ms(),
+                                        stage: "mcp",
+                                        kind: "mcp_call",
+                                        method: mcp_method.clone(),
+                                        route: mcp_route.clone(),
+                                        status: None,
+                                        elapsed_ms: Some(dur_ms),
+                                        payload: Some(serde_json::json!({
+                                            "phase": "finish",
+                                            "round": rounds,
+                                            "server": server_lbl.as_str(),
+                                            "tool": tool_lbl.as_str(),
+                                            "status": "success",
+                                            "duration_ms": dur_ms,
+                                            "error": null
+                                        })),
+                                    });
+                                }
                                 let content = if result.content.is_string() {
                                     result.content
                                 } else {
@@ -2475,6 +2921,31 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
                                 }));
                             }
                             Err(e) => {
+                                let dur_ms = t_mcp.elapsed().as_millis() as u64;
+                                let err_short = e.to_string().chars().take(512).collect::<String>();
+                                if let Some(ref hub) = state.console_hub {
+                                    hub.emit(ConsoleEvent {
+                                        version: "v1",
+                                        request_id: ctx.correlation_id.clone(),
+                                        trace_id: None,
+                                        ts_unix_ms: now_epoch_ms(),
+                                        stage: "mcp",
+                                        kind: "mcp_call",
+                                        method: mcp_method.clone(),
+                                        route: mcp_route.clone(),
+                                        status: None,
+                                        elapsed_ms: Some(dur_ms),
+                                        payload: Some(serde_json::json!({
+                                            "phase": "finish",
+                                            "round": rounds,
+                                            "server": server_lbl.as_str(),
+                                            "tool": tool_lbl.as_str(),
+                                            "status": "error",
+                                            "duration_ms": dur_ms,
+                                            "error": err_short
+                                        })),
+                                    });
+                                }
                                 if mcp_runtime.fail_open() {
                                     eprintln!("panda: mcp tool call fail-open: {e}");
                                 } else {
@@ -2553,11 +3024,11 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
     if state.config.tpm.enforce_budget {
         let (used, remaining) = state
             .tpm
-            .prompt_budget_snapshot(&bucket, state.config.tpm.budget_tokens_per_minute)
+            .prompt_budget_snapshot(&bucket, tpm_limit)
             .await;
         out_headers.insert(
             HeaderName::from_static("x-panda-budget-limit"),
-            HeaderValue::from_str(&state.config.tpm.budget_tokens_per_minute.to_string())
+            HeaderValue::from_str(&tpm_limit.to_string())
                 .map_err(|_| ProxyError::Upstream(anyhow::anyhow!("budget limit header value")))?,
         );
         out_headers.insert(
@@ -2803,6 +3274,33 @@ fn proxy_error_response(e: ProxyError) -> Response<BoxBody> {
             eprintln!("payload too large: {msg}");
             text_response(StatusCode::PAYLOAD_TOO_LARGE, "payload too large")
         }
+        ProxyError::MethodNotAllowed { allow } => {
+            eprintln!("method not allowed: allow={allow}");
+            let mut resp = text_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method not allowed for this route",
+            );
+            if let Ok(v) = HeaderValue::from_str(&allow) {
+                resp.headers_mut()
+                    .insert(header::ALLOW, v);
+            }
+            resp
+        }
+        ProxyError::RpsLimited { rps } => {
+            eprintln!("rps limited: rps={rps}");
+            let mut resp = text_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many requests: per-route rate limit exceeded",
+            );
+            let h = resp.headers_mut();
+            if let Ok(v) = HeaderValue::from_str("1") {
+                h.insert(HeaderName::from_static("retry-after"), v);
+            }
+            if let Ok(v) = HeaderValue::from_str(&rps.to_string()) {
+                h.insert(HeaderName::from_static("x-panda-rps-limit"), v);
+            }
+            resp
+        }
         ProxyError::RateLimited {
             limit,
             estimate,
@@ -2974,10 +3472,72 @@ fn json_response(status: StatusCode, value: serde_json::Value) -> Response<BoxBo
     text_with_content_type(status, body, "application/json; charset=utf-8")
 }
 
+fn console_html_response() -> Response<BoxBody> {
+    const HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Panda Developer Console</title>
+<style>
+  :root { color-scheme: dark; --bg:#0f1115; --fg:#e8eaed; --muted:#9aa0a6; --accent:#7ab4ff; }
+  body { font-family: ui-sans-serif, system-ui, sans-serif; margin:0; background:var(--bg); color:var(--fg); }
+  header { padding:12px 16px; border-bottom:1px solid #2a2f3a; display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  h1 { font-size:15px; font-weight:600; margin:0; }
+  .pill { font-size:12px; color:var(--muted); }
+  #status { font-size:12px; color:var(--accent); }
+  #log { margin:0; padding:12px 16px; white-space:pre-wrap; word-break:break-word; font-size:12px; line-height:1.45; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .line { border-left:2px solid #2a2f3a; padding-left:8px; margin-bottom:8px; }
+  .kind { color:var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Panda Developer Console</h1>
+  <span class="pill">Live trace (JSON lines)</span>
+  <span id="status">connecting…</span>
+</header>
+<pre id="log"></pre>
+<script>
+(function(){
+  const log = document.getElementById('log');
+  const status = document.getElementById('status');
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const url = proto + '//' + location.host + '/console/ws';
+  const ws = new WebSocket(url);
+  ws.onopen = function(){ status.textContent = 'connected: ' + url; };
+  ws.onclose = function(){ status.textContent = 'disconnected'; };
+  ws.onerror = function(){ status.textContent = 'websocket error'; };
+  ws.onmessage = function(ev){
+    const line = document.createElement('div');
+    line.className = 'line';
+    var k = '(event)';
+    try {
+      const o = JSON.parse(ev.data);
+      k = o.kind || k;
+    } catch(e) {}
+    const kindSpan = document.createElement('span');
+    kindSpan.className = 'kind';
+    kindSpan.textContent = k;
+    line.appendChild(kindSpan);
+    line.appendChild(document.createTextNode(' '));
+    line.appendChild(document.createTextNode(String(ev.data)));
+    log.appendChild(line);
+    log.scrollTop = log.scrollHeight;
+  };
+})();
+</script>
+</body>
+</html>"#;
+    text_with_content_type(StatusCode::OK, HTML.to_string(), "text/html; charset=utf-8")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
     use std::sync::Arc as StdArc;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration as StdDuration, SystemTime as StdSystemTime, UNIX_EPOCH};
 
@@ -2989,6 +3549,39 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
     use panda_wasm::{HookFailure, PolicyCode};
+
+    async fn test_proxy_state(cfg: Arc<PandaConfig>) -> ProxyState {
+        ProxyState {
+            config: cfg,
+            client: build_http_client().unwrap(),
+            tpm: Arc::new(TpmCounters::connect(None).await.unwrap()),
+            bpe: None,
+            prompt_safety_matcher: None,
+            ops_metrics: OpsMetrics::default(),
+            plugins: None,
+            mcp: None,
+            semantic_cache: None,
+            context_enricher: None,
+            draining: AtomicBool::new(false),
+            active_connections: AtomicUsize::new(0),
+            console_hub: None,
+            rps: None,
+            jwks: None,
+        }
+    }
+
+    #[test]
+    fn console_mcp_args_preview_redacts_sensitive_keys() {
+        let v = serde_json::json!({
+            "path": "/tmp/x",
+            "api_key": "sk-secret",
+            "nested": { "user_password": "p" }
+        });
+        let s = super::console_mcp_args_preview(&v);
+        assert!(!s.contains("sk-secret"));
+        assert!(s.contains("[REDACTED]"));
+        assert!(s.contains("/tmp/x") || s.contains("path"));
+    }
 
     #[test]
     fn config_roundtrip_for_listener() {
@@ -3031,8 +3624,8 @@ mod tests {
         assert_eq!(super::tpm_token_estimate(Some(100), Some(200)), 50);
     }
 
-    #[test]
-    fn merge_jwt_identity_sets_subject_when_require_jwt_and_no_gateway_subject() {
+    #[tokio::test]
+    async fn merge_jwt_identity_sets_subject_when_require_jwt_and_no_gateway_subject() {
         #[derive(serde::Serialize)]
         struct Claims {
             sub: &'static str,
@@ -3066,9 +3659,11 @@ mod tests {
             header::AUTHORIZATION,
             HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
         );
-        let cfg = PandaConfig {
+        let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
+            server: None,
             upstream: "http://127.0.0.1:1".to_string(),
+            routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
             tpm: Default::default(),
@@ -3077,6 +3672,8 @@ mod tests {
             identity: panda_config::IdentityConfig {
                 require_jwt: true,
                 jwt_hs256_secret_env: secret_env.to_string(),
+                jwks_url: None,
+                jwks_cache_ttl_seconds: 3600,
                 accepted_issuers: vec!["https://issuer.example".to_string()],
                 accepted_audiences: vec!["panda-gateway".to_string()],
                 required_scopes: vec!["gateway:invoke".to_string()],
@@ -3090,18 +3687,20 @@ mod tests {
             pii: Default::default(),
             mcp: Default::default(),
             semantic_cache: Default::default(),
+            auth: Default::default(),
             adapter: Default::default(),
-        };
+        });
+        let state = test_proxy_state(Arc::clone(&cfg)).await;
         let mut ctx = RequestContext::default();
-        super::merge_jwt_identity_into_context(&mut ctx, &headers, "/v1/chat", &cfg);
+        super::merge_jwt_identity_into_context(&mut ctx, &headers, "/v1/chat", &state).await;
         assert_eq!(ctx.subject.as_deref(), Some("jwt-user"));
         unsafe {
             std::env::remove_var(secret_env);
         }
     }
 
-    #[test]
-    fn merge_jwt_identity_preserves_gateway_subject() {
+    #[tokio::test]
+    async fn merge_jwt_identity_preserves_gateway_subject() {
         #[derive(serde::Serialize)]
         struct Claims {
             sub: &'static str,
@@ -3135,9 +3734,11 @@ mod tests {
             header::AUTHORIZATION,
             HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
         );
-        let cfg = PandaConfig {
+        let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
+            server: None,
             upstream: "http://127.0.0.1:1".to_string(),
+            routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
             tpm: Default::default(),
@@ -3146,6 +3747,8 @@ mod tests {
             identity: panda_config::IdentityConfig {
                 require_jwt: true,
                 jwt_hs256_secret_env: secret_env.to_string(),
+                jwks_url: None,
+                jwks_cache_ttl_seconds: 3600,
                 accepted_issuers: vec!["https://issuer.example".to_string()],
                 accepted_audiences: vec!["panda-gateway".to_string()],
                 required_scopes: vec!["gateway:invoke".to_string()],
@@ -3159,13 +3762,15 @@ mod tests {
             pii: Default::default(),
             mcp: Default::default(),
             semantic_cache: Default::default(),
+            auth: Default::default(),
             adapter: Default::default(),
-        };
+        });
+        let state = test_proxy_state(Arc::clone(&cfg)).await;
         let mut ctx = RequestContext {
             subject: Some("gateway-subject".into()),
             ..Default::default()
         };
-        super::merge_jwt_identity_into_context(&mut ctx, &headers, "/v1/chat", &cfg);
+        super::merge_jwt_identity_into_context(&mut ctx, &headers, "/v1/chat", &state).await;
         assert_eq!(ctx.subject.as_deref(), Some("gateway-subject"));
         unsafe {
             std::env::remove_var(secret_env);
@@ -3217,7 +3822,9 @@ mod tests {
     fn ops_auth_guard_enforces_shared_secret() {
         let cfg = PandaConfig {
             listen: "127.0.0.1:0".to_string(),
+            server: None,
             upstream: "http://127.0.0.1:1".to_string(),
+            routes: vec![],
             trusted_gateway: Default::default(),
             observability: panda_config::ObservabilityConfig {
                 correlation_header: "x-request-id".to_string(),
@@ -3232,6 +3839,7 @@ mod tests {
             pii: Default::default(),
             mcp: Default::default(),
             semantic_cache: Default::default(),
+            auth: Default::default(),
             adapter: Default::default(),
         };
         let mut headers = HeaderMap::new();
@@ -3244,6 +3852,104 @@ mod tests {
         headers.insert("x-panda-admin-secret", HeaderValue::from_static("s3cr3t"));
         assert!(enforce_ops_auth_if_configured(&headers, &cfg).is_ok());
         std::env::remove_var("PANDA_TEST_OPS_SECRET");
+    }
+
+    #[tokio::test]
+    async fn console_http_requires_ops_secret_when_configured() {
+        const SECRET_ENV: &str = "PANDA_TEST_CONSOLE_OPS_SECRET";
+        std::env::set_var(SECRET_ENV, "console-secret-ops");
+        let cfg = Arc::new(PandaConfig {
+            listen: "127.0.0.1:0".to_string(),
+            server: None,
+            upstream: "http://127.0.0.1:1".to_string(),
+            routes: vec![],
+            trusted_gateway: Default::default(),
+            observability: panda_config::ObservabilityConfig {
+                correlation_header: "x-request-id".to_string(),
+                admin_auth_header: "x-panda-admin-secret".to_string(),
+                admin_secret_env: Some(SECRET_ENV.to_string()),
+            },
+            tpm: Default::default(),
+            tls: None,
+            plugins: Default::default(),
+            identity: Default::default(),
+            prompt_safety: Default::default(),
+            pii: Default::default(),
+            mcp: Default::default(),
+            semantic_cache: Default::default(),
+            auth: Default::default(),
+            adapter: Default::default(),
+        });
+        let hub = Arc::new(ConsoleEventHub::new(DEFAULT_CONSOLE_CHANNEL_CAPACITY));
+        let state = Arc::new(ProxyState {
+            config: Arc::clone(&cfg),
+            client: build_http_client().unwrap(),
+            tpm: Arc::new(TpmCounters::connect(None).await.unwrap()),
+            bpe: None,
+            prompt_safety_matcher: None,
+            ops_metrics: OpsMetrics::default(),
+            plugins: None,
+            mcp: None,
+            semantic_cache: None,
+            context_enricher: None,
+            draining: AtomicBool::new(false),
+            active_connections: AtomicUsize::new(0),
+            console_hub: Some(Arc::clone(&hub)),
+            rps: None,
+            jwks: None,
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let st = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let io = TokioIo::new(stream);
+                let st2 = Arc::clone(&st);
+                let svc = service_fn(move |req| {
+                    let s = Arc::clone(&st2);
+                    dispatch(req, s)
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(io, svc)
+                    .with_upgrades()
+                    .await;
+            }
+        });
+
+        let mut c1 = TcpStream::connect(addr).await.unwrap();
+        c1.write_all(b"GET /console HTTP/1.1\r\nHost: panda\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut b1 = Vec::new();
+        c1.read_to_end(&mut b1).await.unwrap();
+        let r1 = String::from_utf8_lossy(&b1);
+        assert!(r1.contains("401"), "expected 401 without secret: {r1}");
+
+        let mut c2 = TcpStream::connect(addr).await.unwrap();
+        c2.write_all(
+            b"GET /console HTTP/1.1\r\nHost: panda\r\nConnection: close\r\nx-panda-admin-secret: console-secret-ops\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut b2 = Vec::new();
+        c2.read_to_end(&mut b2).await.unwrap();
+        let r2 = String::from_utf8_lossy(&b2);
+        assert!(r2.contains("200 OK"), "expected 200 with valid secret: {r2}");
+        assert!(r2.contains("text/html"), "{r2}");
+        assert!(r2.contains("Panda Developer Console"), "{r2}");
+
+        let mut c3 = TcpStream::connect(addr).await.unwrap();
+        c3.write_all(b"GET /console/ws HTTP/1.1\r\nHost: panda\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut b3 = Vec::new();
+        c3.read_to_end(&mut b3).await.unwrap();
+        let r3 = String::from_utf8_lossy(&b3);
+        assert!(r3.contains("401"), "expected 401 for /console/ws without secret: {r3}");
+
+        server.await.ok();
+        std::env::remove_var(SECRET_ENV);
     }
 
     #[test]
@@ -3277,7 +3983,9 @@ mod tests {
     async fn tpm_status_json_reports_budget_fields() {
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
+            server: None,
             upstream: "http://127.0.0.1:1".to_string(),
+            routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
             tpm: panda_config::TpmConfig {
@@ -3293,6 +4001,7 @@ mod tests {
             pii: Default::default(),
             mcp: Default::default(),
             semantic_cache: Default::default(),
+            auth: Default::default(),
             adapter: Default::default(),
         });
         let tpm = Arc::new(TpmCounters::connect(None).await.unwrap());
@@ -3310,6 +4019,9 @@ mod tests {
             context_enricher: None,
             draining: AtomicBool::new(false),
             active_connections: AtomicUsize::new(0),
+            console_hub: None,
+            rps: None,
+            jwks: None,
         };
         let json = tpm_status_json(&state, "/tpm/status", &HeaderMap::new()).await;
         assert_eq!(json.get("enforce_budget").and_then(|v| v.as_bool()), Some(true));
@@ -3324,7 +4036,9 @@ mod tests {
     async fn mcp_status_json_reports_config() {
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
+            server: None,
             upstream: "http://127.0.0.1:1".to_string(),
+            routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
             tpm: Default::default(),
@@ -3338,6 +4052,7 @@ mod tests {
                 ..Default::default()
             },
             semantic_cache: Default::default(),
+            auth: Default::default(),
             adapter: Default::default(),
         });
         let state = ProxyState {
@@ -3353,6 +4068,9 @@ mod tests {
             context_enricher: None,
             draining: AtomicBool::new(false),
             active_connections: AtomicUsize::new(0),
+            console_hub: None,
+            rps: None,
+            jwks: None,
         };
         state
             .ops_metrics
@@ -3440,7 +4158,9 @@ mod tests {
         );
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
+            server: None,
             upstream: "http://127.0.0.1:1".to_string(),
+            routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
             tpm: Default::default(),
@@ -3449,6 +4169,8 @@ mod tests {
             identity: panda_config::IdentityConfig {
                 require_jwt: true,
                 jwt_hs256_secret_env: secret_env.to_string(),
+                jwks_url: None,
+                jwks_cache_ttl_seconds: 3600,
                 accepted_issuers: vec!["https://issuer.example".to_string()],
                 accepted_audiences: vec!["panda-gateway".to_string()],
                 required_scopes: vec!["gateway:invoke".to_string()],
@@ -3462,6 +4184,7 @@ mod tests {
             pii: Default::default(),
             mcp: Default::default(),
             semantic_cache: Default::default(),
+            auth: Default::default(),
             adapter: Default::default(),
         });
         let state = ProxyState {
@@ -3477,6 +4200,9 @@ mod tests {
             context_enricher: None,
             draining: AtomicBool::new(false),
             active_connections: AtomicUsize::new(0),
+            console_hub: None,
+            rps: None,
+            jwks: None,
         };
         let json = tpm_status_json(&state, "/tpm/status", &headers).await;
         assert_eq!(json.get("bucket").and_then(|v| v.as_str()), Some("status-user"));
@@ -3490,7 +4216,9 @@ mod tests {
     async fn readiness_status_ok_by_default() {
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
+            server: None,
             upstream: "http://127.0.0.1:1".to_string(),
+            routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
             tpm: Default::default(),
@@ -3501,6 +4229,7 @@ mod tests {
             pii: Default::default(),
             mcp: Default::default(),
             semantic_cache: Default::default(),
+            auth: Default::default(),
             adapter: Default::default(),
         });
         let state = ProxyState {
@@ -3516,6 +4245,9 @@ mod tests {
             context_enricher: None,
             draining: AtomicBool::new(false),
             active_connections: AtomicUsize::new(0),
+            console_hub: None,
+            rps: None,
+            jwks: None,
         };
         let (status, body) = readiness_status(&state);
         assert_eq!(status, StatusCode::OK);
@@ -3526,7 +4258,9 @@ mod tests {
     async fn readiness_status_fails_when_mcp_required_not_connected() {
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
+            server: None,
             upstream: "http://127.0.0.1:1".to_string(),
+            routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
             tpm: Default::default(),
@@ -3541,6 +4275,7 @@ mod tests {
                 ..Default::default()
             },
             semantic_cache: Default::default(),
+            auth: Default::default(),
             adapter: Default::default(),
         });
         let state = ProxyState {
@@ -3556,6 +4291,9 @@ mod tests {
             context_enricher: None,
             draining: AtomicBool::new(false),
             active_connections: AtomicUsize::new(0),
+            console_hub: None,
+            rps: None,
+            jwks: None,
         };
         let (status, body) = readiness_status(&state);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -3572,7 +4310,9 @@ mod tests {
     async fn readiness_status_fails_when_draining() {
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
+            server: None,
             upstream: "http://127.0.0.1:1".to_string(),
+            routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
             tpm: Default::default(),
@@ -3583,6 +4323,7 @@ mod tests {
             pii: Default::default(),
             mcp: Default::default(),
             semantic_cache: Default::default(),
+            auth: Default::default(),
             adapter: Default::default(),
         });
         let state = ProxyState {
@@ -3598,6 +4339,9 @@ mod tests {
             context_enricher: None,
             draining: AtomicBool::new(true),
             active_connections: AtomicUsize::new(1),
+            console_hub: None,
+            rps: None,
+            jwks: None,
         };
         let (status, body) = readiness_status(&state);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -3695,7 +4439,9 @@ mod tests {
 
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
+            server: None,
             upstream: format!("http://{upstream_addr}"),
+            routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
             tpm: Default::default(),
@@ -3715,6 +4461,7 @@ mod tests {
             pii: Default::default(),
             mcp: Default::default(),
             semantic_cache: Default::default(),
+            auth: Default::default(),
             adapter: Default::default(),
         });
 
@@ -3747,6 +4494,9 @@ mod tests {
             context_enricher: None,
             draining: AtomicBool::new(false),
             active_connections: AtomicUsize::new(0),
+            console_hub: None,
+            rps: None,
+            jwks: None,
         });
         assert!(state.plugins.is_some());
         assert!(state.config.plugins.fail_closed);
@@ -3872,6 +4622,9 @@ mcp:
             context_enricher: None,
             draining: AtomicBool::new(false),
             active_connections: AtomicUsize::new(0),
+            console_hub: None,
+            rps: None,
+            jwks: None,
         });
 
         let panda_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4013,6 +4766,9 @@ mcp:
             context_enricher: None,
             draining: AtomicBool::new(false),
             active_connections: AtomicUsize::new(0),
+            console_hub: None,
+            rps: None,
+            jwks: None,
         });
 
         let panda_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4157,6 +4913,9 @@ mcp:
             context_enricher: None,
             draining: AtomicBool::new(false),
             active_connections: AtomicUsize::new(0),
+            console_hub: None,
+            rps: None,
+            jwks: None,
         });
 
         let panda_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4194,11 +4953,13 @@ mcp:
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 2);
     }
 
-    #[test]
-    fn jwt_validation_rejects_missing_token() {
-        let cfg = PandaConfig {
+    #[tokio::test]
+    async fn jwt_validation_rejects_missing_token() {
+        let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
+            server: None,
             upstream: "http://127.0.0.1:1".to_string(),
+            routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
             tpm: Default::default(),
@@ -4207,6 +4968,8 @@ mcp:
             identity: panda_config::IdentityConfig {
                 require_jwt: true,
                 jwt_hs256_secret_env: "PANDA_TEST_JWT_SECRET".to_string(),
+                jwks_url: None,
+                jwks_cache_ttl_seconds: 3600,
                 accepted_issuers: vec![],
                 accepted_audiences: vec![],
                 required_scopes: vec![],
@@ -4220,15 +4983,19 @@ mcp:
             pii: Default::default(),
             mcp: Default::default(),
             semantic_cache: Default::default(),
+            auth: Default::default(),
             adapter: Default::default(),
-        };
+        });
+        let state = test_proxy_state(Arc::clone(&cfg)).await;
         let headers = HeaderMap::new();
-        let err = validate_bearer_jwt(&headers, "/v1/chat", &cfg).unwrap_err();
+        let err = validate_bearer_jwt(&headers, "/v1/chat", &state)
+            .await
+            .unwrap_err();
         assert!(err.contains("missing bearer token"));
     }
 
-    #[test]
-    fn jwt_validation_accepts_valid_token() {
+    #[tokio::test]
+    async fn jwt_validation_accepts_valid_token() {
         #[derive(serde::Serialize)]
         struct Claims {
             sub: &'static str,
@@ -4264,9 +5031,11 @@ mcp:
             header::AUTHORIZATION,
             HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
         );
-        let cfg = PandaConfig {
+        let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
+            server: None,
             upstream: "http://127.0.0.1:1".to_string(),
+            routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
             tpm: Default::default(),
@@ -4275,6 +5044,8 @@ mcp:
             identity: panda_config::IdentityConfig {
                 require_jwt: true,
                 jwt_hs256_secret_env: secret_env.to_string(),
+                jwks_url: None,
+                jwks_cache_ttl_seconds: 3600,
                 accepted_issuers: vec!["https://issuer.example".to_string()],
                 accepted_audiences: vec!["panda-gateway".to_string()],
                 required_scopes: vec!["gateway:invoke".to_string()],
@@ -4288,14 +5059,16 @@ mcp:
             pii: Default::default(),
             mcp: Default::default(),
             semantic_cache: Default::default(),
+            auth: Default::default(),
             adapter: Default::default(),
-        };
+        });
+        let state = test_proxy_state(Arc::clone(&cfg)).await;
 
-        assert!(validate_bearer_jwt(&headers, "/v1/chat", &cfg).is_ok());
+        assert!(validate_bearer_jwt(&headers, "/v1/chat", &state).await.is_ok());
     }
 
-    #[test]
-    fn jwt_validation_rejects_missing_scope() {
+    #[tokio::test]
+    async fn jwt_validation_rejects_missing_scope() {
         #[derive(serde::Serialize)]
         struct Claims {
             sub: &'static str,
@@ -4330,9 +5103,11 @@ mcp:
             header::AUTHORIZATION,
             HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
         );
-        let cfg = PandaConfig {
+        let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
+            server: None,
             upstream: "http://127.0.0.1:1".to_string(),
+            routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
             tpm: Default::default(),
@@ -4341,6 +5116,8 @@ mcp:
             identity: panda_config::IdentityConfig {
                 require_jwt: true,
                 jwt_hs256_secret_env: secret_env.to_string(),
+                jwks_url: None,
+                jwks_cache_ttl_seconds: 3600,
                 accepted_issuers: vec!["https://issuer.example".to_string()],
                 accepted_audiences: vec!["panda-gateway".to_string()],
                 required_scopes: vec!["gateway:invoke".to_string()],
@@ -4354,14 +5131,18 @@ mcp:
             pii: Default::default(),
             mcp: Default::default(),
             semantic_cache: Default::default(),
+            auth: Default::default(),
             adapter: Default::default(),
-        };
-        let err = validate_bearer_jwt(&headers, "/v1/chat", &cfg).unwrap_err();
+        });
+        let state = test_proxy_state(Arc::clone(&cfg)).await;
+        let err = validate_bearer_jwt(&headers, "/v1/chat", &state)
+            .await
+            .unwrap_err();
         assert_eq!(err, "forbidden: missing required scope");
     }
 
-    #[test]
-    fn token_exchange_mints_agent_token() {
+    #[tokio::test]
+    async fn token_exchange_mints_agent_token() {
         #[derive(serde::Serialize)]
         struct Claims {
             sub: &'static str,
@@ -4398,9 +5179,11 @@ mcp:
             header::AUTHORIZATION,
             HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
         );
-        let cfg = PandaConfig {
+        let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
+            server: None,
             upstream: "http://127.0.0.1:1".to_string(),
+            routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
             tpm: Default::default(),
@@ -4409,6 +5192,8 @@ mcp:
             identity: panda_config::IdentityConfig {
                 require_jwt: true,
                 jwt_hs256_secret_env: user_secret_env.to_string(),
+                jwks_url: None,
+                jwks_cache_ttl_seconds: 3600,
                 accepted_issuers: vec!["https://issuer.example".to_string()],
                 accepted_audiences: vec!["panda-gateway".to_string()],
                 required_scopes: vec!["gateway:invoke".to_string()],
@@ -4422,9 +5207,14 @@ mcp:
             pii: Default::default(),
             mcp: Default::default(),
             semantic_cache: Default::default(),
+            auth: Default::default(),
             adapter: Default::default(),
-        };
-        let exchanged = maybe_exchange_agent_token(&headers, &cfg).unwrap().unwrap();
+        });
+        let state = test_proxy_state(Arc::clone(&cfg)).await;
+        let exchanged = maybe_exchange_agent_token(&headers, &state)
+            .await
+            .unwrap()
+            .unwrap();
         let mut v = Validation::new(Algorithm::HS256);
         v.set_audience(&["panda-agent"]);
         v.set_issuer(&["panda-gateway"]);
@@ -4589,8 +5379,8 @@ data: [DONE]
         assert_eq!(calls[1].id, "c2");
     }
 
-    #[test]
-    fn jwt_validation_rejects_missing_route_scope() {
+    #[tokio::test]
+    async fn jwt_validation_rejects_missing_route_scope() {
         #[derive(serde::Serialize)]
         struct Claims {
             sub: &'static str,
@@ -4625,9 +5415,11 @@ data: [DONE]
             header::AUTHORIZATION,
             HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
         );
-        let cfg = PandaConfig {
+        let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
+            server: None,
             upstream: "http://127.0.0.1:1".to_string(),
+            routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
             tpm: Default::default(),
@@ -4636,6 +5428,8 @@ data: [DONE]
             identity: panda_config::IdentityConfig {
                 require_jwt: true,
                 jwt_hs256_secret_env: secret_env.to_string(),
+                jwks_url: None,
+                jwks_cache_ttl_seconds: 3600,
                 accepted_issuers: vec!["https://issuer.example".to_string()],
                 accepted_audiences: vec!["panda-gateway".to_string()],
                 required_scopes: vec!["gateway:invoke".to_string()],
@@ -4652,9 +5446,13 @@ data: [DONE]
             pii: Default::default(),
             mcp: Default::default(),
             semantic_cache: Default::default(),
+            auth: Default::default(),
             adapter: Default::default(),
-        };
-        let err = validate_bearer_jwt(&headers, "/v1/admin/users", &cfg).unwrap_err();
+        });
+        let state = test_proxy_state(Arc::clone(&cfg)).await;
+        let err = validate_bearer_jwt(&headers, "/v1/admin/users", &state)
+            .await
+            .unwrap_err();
         assert_eq!(err, "forbidden: missing required route scope");
     }
 }

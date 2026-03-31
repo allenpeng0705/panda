@@ -236,6 +236,23 @@ pub fn filter_tools_for_intent(
         .collect()
 }
 
+/// When `allowed` is set, keep only tools whose `server` is in the list.
+pub fn filter_tools_by_allowed_servers(
+    tools: Vec<McpToolDescriptor>,
+    allowed: Option<&[String]>,
+) -> Vec<McpToolDescriptor> {
+    let Some(allowed) = allowed else {
+        return tools;
+    };
+    if allowed.is_empty() {
+        return vec![];
+    }
+    tools
+        .into_iter()
+        .filter(|t| allowed.iter().any(|a| a == &t.server))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,6 +312,28 @@ mcp:
             .await
             .unwrap_err();
         assert!(err.to_string().contains("max_tool_payload_bytes"));
+    }
+
+    #[test]
+    fn filter_tools_by_allowed_servers_keeps_subset() {
+        let tools = vec![
+            McpToolDescriptor {
+                server: "a".into(),
+                name: "t1".into(),
+                description: None,
+                input_schema: serde_json::json!({}),
+            },
+            McpToolDescriptor {
+                server: "b".into(),
+                name: "t2".into(),
+                description: None,
+                input_schema: serde_json::json!({}),
+            },
+        ];
+        let allowed = vec!["a".to_string()];
+        let out = filter_tools_by_allowed_servers(tools, Some(&allowed));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].server, "a");
     }
 
     #[test]

@@ -31,7 +31,7 @@ When Panda moves to the **client-facing edge** for AI (Step 2), **avoid terminat
 | **`ai.company.com`** | **Panda** | AI clients; TPM, intent, MCP, streaming-native path. |
 | **`api.company.com`** | **Kong** | Existing legacy REST and non-AI workflows (unchanged). |
 
-**Inter-connectivity:** If a Panda-backed agent or tool needs a **legacy** resource exposed only through Kong, Panda calls Kong over an **internal** path—ideally **mTLS** (service mesh, private VPC, or Kong’s internal listener)—not over the public internet. Identity and correlation propagate via **trusted internal headers** and **W3C trace context**, configured explicitly (see [Kong handshake](./implementation_plan.md#kong-handshake-milestone-13) in the implementation plan).
+**Inter-connectivity:** If a Panda-backed agent or tool needs a **legacy** resource exposed only through Kong, Panda calls Kong over an **internal** path—ideally **mTLS** (service mesh, private VPC, or Kong’s internal listener)—not over the public internet. Identity and correlation propagate via **trusted internal headers** and **W3C trace context**; see the **[Kong handshake contract](./kong_handshake.md)** (header names, attestation, correlation) and [implementation plan](./implementation_plan.md#kong-handshake-milestone-13) for milestone context.
 
 This pattern keeps **one TLS + one primary auth story per hostname** and makes ownership obvious to platform teams.
 
@@ -54,6 +54,8 @@ Exact behavior is implementation-dependent; this table states **design intent** 
 ---
 
 ## 3. Migration path: from “behind Kong” to “in front of Kong”
+
+For a concise **Phase 1–3** summary (coexistence → AI-first edge → optional consolidation), see **[evolution phases](./evolution_phases.md)**.
 
 Evolution is a **choice**, not a one-shot cutover. A practical three-step arc:
 
@@ -87,6 +89,8 @@ Replacement is **per scope** (per app, per line of business), not necessarily co
 | **Service** | Logical model provider or backend (e.g. `openai-gpt4`, `anthropic-coding`). |
 | **Route** | Path/method/host match → service + policy profile. |
 | **Plugin** | **Wasm module** (and first-party middleware) composed on the chain. |
+
+**What ships in `panda.yaml` today (Kong-like, not Kong-identical):** longest-prefix **`routes`** with per-route **`upstream`**, optional **`rate_limit.rps`** (HTTP), **`tpm_limit`**, **`semantic_cache`**, **`mcp_servers`**, and **`type`** (adapter). A nested **`server`** block can set **`listen`** / **`address`+`port`** / **`tls`** instead of (or layered with) top-level `listen` and `tls`. See **`panda.example.yaml`** for patterns. Full Kong parity (per-route plugins DB, Lua, control plane) is **not** the goal; the goal is **GitOps-friendly** static config for teams that want one binary and one file.
 
 **Improvement:** Panda is **GitOps-native** by default—one (or a few) versioned YAML files per environment, without a mandatory heavy DB inside every data-plane replica. (Shared stores for cache/TPM remain **optional**, as in the [implementation plan](./implementation_plan.md).)
 

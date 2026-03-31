@@ -211,6 +211,9 @@ Later refinements (multi-tenant isolation, formal compliance programs, advanced 
 |----------|---------|
 | [Implementation plan](./implementation_plan.md) | Phased execution (Plan → Implement → Review → Refine), benchmarks, packaging. |
 | [Integration & evolution (Kong coexistence)](./integration_and_evolution.md) | Neighbor strategy, migration steps, shadow mode, familiar service/route/plugin model. |
+| [Evolution phases (1–3)](./evolution_phases.md) | Coexistence, AI-first edge, optional consolidation—org deployment story vs Kong. |
+| [Kong / edge handshake](./kong_handshake.md) | Header contract: attestation, identity, correlation; Kong recipe outline. |
+| [Deployment](./deployment.md) | Binary, YAML, optional Redis / Prometheus / OTLP / Kong; standalone and TLS. |
 | Request / stream canonical model | Internal representation, SSE chunk semantics, error envelope. |
 | Configuration schema | Routes, backends, Shield rules, plugin manifests. |
 | Wasm plugin ABI | Host functions, versioning, security boundaries. |

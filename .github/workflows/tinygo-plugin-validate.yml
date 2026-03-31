@@ -22,5 +22,7 @@ jobs:
       - name: Install wasm-tools
         run: cargo install wasm-tools
 
-      - name: Validate TinyGo sample plugin
-        run: bash ./scripts/validate_tinygo_plugin.sh
+      - name: Validate TinyGo sample plugins
+        run: |
+          bash ./scripts/validate_tinygo_plugin.sh
+          bash ./scripts/validate_tinygo_pci_plugin.sh

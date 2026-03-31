@@ -66,6 +66,11 @@ Optional structured logs:
   - `PANDA_SEMANTIC_CACHE_REDIS_URL=redis://127.0.0.1:6379`
   - `semantic_cache.backend: "redis"` in `panda.yaml` (Redis-compatible; Dragonfly works too)
   - `PANDA_SEMANTIC_CACHE_TIMEOUT_MS=50` (cache bypass timeout budget)
+- Developer Console event stream (disabled by default):
+  - `PANDA_DEV_CONSOLE_ENABLED=true`
+  - UI: `GET /console` (minimal live timeline; connects to the WebSocket below)
+  - WebSocket: `GET /console/ws` (same listener as proxy; JSON events: request lifecycle + `mcp_call` with `payload.phase` `start`/`finish`)
+  - When `observability.admin_secret_env` is set (same as `/metrics`), `/console` and `/console/ws` require the `observability.admin_auth_header` secret; without that env, the console is open to anyone who can reach the listen address (use only on trusted networks or bind to loopback).
 
 ### 2) Docker
 
@@ -115,6 +120,55 @@ kubectl rollout status deployment/panda
 - `/ready` reports real readiness (config/runtime checks) and turns not-ready during shutdown drain.
 - On `SIGTERM`/`SIGINT`, Panda stops accepting new work and drains active connections up to `PANDA_SHUTDOWN_DRAIN_SECONDS` (default `30`).
 
+## Developer Console
+
+The Developer Console is an optional live debug surface for request flow and MCP tool activity.
+
+### Enable It
+
+1. Start Panda with:
+   - `PANDA_DEV_CONSOLE_ENABLED=true cargo run -p panda-server -- panda.yaml`
+2. Open:
+   - UI: `http://127.0.0.1:8080/console`
+   - Event stream: `ws://127.0.0.1:8080/console/ws`
+
+### Protect It (Recommended)
+
+Use the same auth model as ops endpoints:
+
+1. In `panda.yaml`, set:
+   - `observability.admin_secret_env: PANDA_OPS_SECRET`
+2. Export a secret:
+   - `export PANDA_OPS_SECRET='change-me'`
+3. Send the header name from config (default is `x-panda-admin-secret`):
+   - `x-panda-admin-secret: <secret>`
+
+When `observability.admin_secret_env` is set, both `/console` and `/console/ws` require this secret.
+
+### What You See
+
+- `request_started` / `request_finished` / `request_failed` events.
+- `mcp_call` events with `payload.phase`:
+  - `start`: round, server, tool, redacted argument preview.
+  - `finish`: status (`success`/`error`) and duration.
+- Core event fields:
+  - `request_id`, `ts_unix_ms`, `stage`, `kind`, `method`, `route`, `status`, `elapsed_ms`.
+
+### Quick Verify
+
+- Console page reachable:
+  - `curl -i http://127.0.0.1:8080/console`
+- WebSocket handshake:
+  - `curl -i -N -H "Connection: Upgrade" -H "Upgrade: websocket" -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: SGVsbG8sIHdvcmxkIQ==" http://127.0.0.1:8080/console/ws`
+- Trigger traffic:
+  - `curl -s http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hello"}]}'`
+
+### Notes
+
+- Disabled by default; when disabled, `/console` and `/console/ws` return `404`.
+- Event fanout uses a bounded channel. Slow viewers may skip old events under load (stream stays connected).
+- Redaction is best-effort for sensitive MCP argument keys; do not expose the console on untrusted networks.
+
 ## Validation and Performance Scripts
 
 - Pre-rollout gate:
@@ -156,10 +210,19 @@ Enable only after load/soak evidence in your environment.
   - `panda_on_request`
   - `panda_on_request_body`
   - `panda_on_response_chunk` (streaming chunk hook)
-- Rust plugin authors should use `crates/panda-pdk`; TinyGo sample parity lives in `samples/tinygo-plugin/`.
+- Rust plugin authors should use `crates/panda-pdk`.
+- **Minimal samples**: `crates/wasm-plugin-sample` (Rust), `samples/tinygo-plugin/` (TinyGo).
+- **Useful examples**:
+  - **Rust** — `crates/wasm-plugin-ssrf-guard`: block private URLs / dangerous schemes in request bodies (SSRF-style guard).
+  - **TinyGo** — `samples/tinygo-plugin-pci-guard`: block bodies with long runs of ASCII digits (PAN-style paste guard).
 
 ## Documentation Map
 
+- **Deployment** (binary, config, Redis / Prometheus / OTLP / Kong): `docs/deployment.md`
 - Implementation roadmap: `docs/implementation_plan.md`
 - High-level architecture: `docs/high_level_design.md`
 - Integration strategy: `docs/integration_and_evolution.md`
+- Kong / Panda evolution (phases 1–3): `docs/evolution_phases.md`
+- Standalone (no Kong) — see `docs/deployment.md#standalone-no-kong` (legacy: `docs/standalone_deployment.md`)
+- Kong / edge handshake (trusted headers): `docs/kong_handshake.md`
+- Developer Console usage: `docs/developer_console.md`

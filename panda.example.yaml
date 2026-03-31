@@ -2,6 +2,33 @@
 listen: "127.0.0.1:8080"
 upstream: "http://127.0.0.1:11434"
 
+# Alternative to top-level `listen` / `tls`: nested `server` (merged at load time).
+# server:
+#   port: 8080
+#   address: "127.0.0.1"
+#   tls:
+#     cert_pem: "/path/to/fullchain.pem"
+#     key_pem: "/path/to/privkey.pem"
+
+# Optional: path-based routing (longest path_prefix wins; otherwise `upstream` above).
+# Per-route: rate_limit (HTTP RPS), tpm_limit, semantic_cache, mcp_servers, type (openai|anthropic),
+# methods (optional allowlist: GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS, …).
+# Global middleware still runs for every hop; these fields override behavior for matching paths.
+# routes:
+#   - path: /api/inventory
+#     upstream: "http://inventory-service:8001"
+#     rate_limit:
+#       rps: 100
+#   - path_prefix: /v1/chat
+#     upstream: "https://api.openai.com/v1"
+#     tpm_limit: 50000
+#     semantic_cache: true
+#     type: openai
+#     mcp_servers: ["local-db"]
+#   - path_prefix: /api/v1/users
+#     upstream: "http://user-service.internal:8080"
+#     methods: [GET, POST, PUT, PATCH, DELETE]
+
 # Optional: Kong / edge injects identity after OIDC. Attestation uses HMAC-then-constant-time
 # compare (see gateway.rs). Set PANDA_TRUSTED_GATEWAY_SECRET to the same value as the edge sends.
 # trusted_gateway:
@@ -14,7 +41,7 @@ upstream: "http://127.0.0.1:11434"
 # Falls back to W3C traceparent trace id, then UUID.
 # observability:
 #   correlation_header: "x-request-id"
-#   # Optional ops endpoint auth for /metrics, /plugins/status, /tpm/status, /mcp/status
+#   # Optional ops endpoint auth for /metrics, /plugins/status, /tpm/status, /mcp/status, /console, /console/ws
 #   admin_auth_header: "x-panda-admin-secret"
 #   admin_secret_env: "PANDA_ADMIN_STATUS_SECRET"
 #   # Ops auth telemetry on /metrics:
@@ -73,10 +100,19 @@ upstream: "http://127.0.0.1:11434"
 #   n => reject (plugin-specific)   -> HTTP 403 when fail_closed=true
 # Runtime/trap/timeout/join failures map to HTTP 502 when fail_closed=true.
 
+# Optional: unified-edge auth (merged into `identity` at load time).
+# Use `jwks_url` for RS256/RS384/RS512 tokens; keep `jwt_hs256_secret_env` for HS256, or use both.
+# auth:
+#   type: jwt
+#   jwks_url: "https://auth.company.com/.well-known/jwks.json"
+#   enforce_on_all_routes: true
+#
 # Optional: Phase 3 entry point (JWT bearer required before proxy forwarding).
 # identity:
 #   require_jwt: true
 #   jwt_hs256_secret_env: "PANDA_JWT_HS256_SECRET"
+#   # jwks_url: "https://auth.company.com/.well-known/jwks.json"
+#   # jwks_cache_ttl_seconds: 3600
 #   accepted_issuers: ["https://issuer.example"]
 #   accepted_audiences: ["panda-gateway"]
 #   required_scopes: ["gateway:invoke"]

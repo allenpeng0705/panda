@@ -8,6 +8,14 @@ use std::path::Path;
 use http::header::HeaderName;
 use serde::Deserialize;
 
+fn format_listen_address(addr: &str, port: u16) -> String {
+    if addr.contains(':') && !addr.starts_with('[') {
+        format!("[{addr}]:{port}")
+    } else {
+        format!("{addr}:{port}")
+    }
+}
+
 /// Optional “Kong handshake”: attested edge injects identity headers; Panda verifies before trusting them.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct TrustedGatewayConfig {
@@ -171,6 +179,22 @@ impl Default for PluginsConfig {
     }
 }
 
+/// Unified edge auth block (merged into [`IdentityConfig`] at load time).
+///
+/// Use this for JWKS-backed verification; legacy HS256 remains under `identity`.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct AuthConfig {
+    /// Optional marker (e.g. `"jwt"`); reserved for future auth kinds.
+    #[serde(default, rename = "type")]
+    pub auth_type: Option<String>,
+    /// When set, RSA tokens (`RS256`/`RS384`/`RS512`) are verified using keys from this JWKS URL.
+    #[serde(default)]
+    pub jwks_url: Option<String>,
+    /// When true, sets [`IdentityConfig::require_jwt`] so every proxied route requires a bearer JWT.
+    #[serde(default)]
+    pub enforce_on_all_routes: bool,
+}
+
 /// Optional identity controls for Phase 3 entry.
 #[derive(Debug, Clone, Deserialize)]
 pub struct IdentityConfig {
@@ -180,6 +204,12 @@ pub struct IdentityConfig {
     /// Env var name containing HS256 secret (default: PANDA_JWT_HS256_SECRET).
     #[serde(default = "default_jwt_hs256_secret_env")]
     pub jwt_hs256_secret_env: String,
+    /// When set, asymmetric JWTs are verified with keys loaded from this JWKS document (HTTPS GET).
+    #[serde(default)]
+    pub jwks_url: Option<String>,
+    /// How long to cache a fetched JWKS before refresh (seconds).
+    #[serde(default = "default_jwks_cache_ttl_seconds")]
+    pub jwks_cache_ttl_seconds: u64,
     /// Expected issuer (`iss`) values. Empty means issuer is not checked.
     #[serde(default)]
     pub accepted_issuers: Vec<String>,
@@ -218,6 +248,8 @@ impl Default for IdentityConfig {
         Self {
             require_jwt: false,
             jwt_hs256_secret_env: default_jwt_hs256_secret_env(),
+            jwks_url: None,
+            jwks_cache_ttl_seconds: default_jwks_cache_ttl_seconds(),
             accepted_issuers: vec![],
             accepted_audiences: vec![],
             required_scopes: vec![],
@@ -228,6 +260,10 @@ impl Default for IdentityConfig {
             agent_token_scopes: vec![],
         }
     }
+}
+
+fn default_jwks_cache_ttl_seconds() -> u64 {
+    3600
 }
 
 fn default_jwt_hs256_secret_env() -> String {
@@ -486,11 +522,70 @@ pub struct TlsListenConfig {
     pub client_ca_pem: Option<String>,
 }
 
+/// Optional `server:` block: nested listen/port/TLS (alternative to top-level `listen` / `tls`).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ServerSection {
+    /// Full `host:port` or `[ipv6]:port` (overrides top-level `listen` when set).
+    #[serde(default)]
+    pub listen: Option<String>,
+    /// When `listen` is unset, combined with `port` (default address `127.0.0.1`).
+    #[serde(default)]
+    pub address: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub tls: Option<TlsListenConfig>,
+}
+
+/// Per-route HTTP rate limit (requests per second, shared across clients for that route).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RouteRateLimitConfig {
+    pub rps: u32,
+}
+
+/// Optional path-based upstream override (Kong-style routing light).
+///
+/// The first matching route with the **longest** `path_prefix` wins; otherwise the top-level
+/// [`PandaConfig::upstream`] is used. Optional [`RouteConfig::methods`] restricts HTTP verbs for
+/// that prefix (405 + `Allow` when not listed).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RouteConfig {
+    /// Must start with `/`. Request paths that start with this prefix use `upstream` for that hop.
+    #[serde(alias = "path")]
+    pub path_prefix: String,
+    pub upstream: String,
+    #[serde(default)]
+    pub rate_limit: Option<RouteRateLimitConfig>,
+    /// Override TPM budget (tokens/minute) for this path; inherits [`TpmConfig::budget_tokens_per_minute`] when unset.
+    #[serde(default)]
+    pub tpm_limit: Option<u64>,
+    /// Override semantic cache: `None` = use global `semantic_cache.enabled`; `false` = never cache this path.
+    #[serde(default)]
+    pub semantic_cache: Option<bool>,
+    /// Restrict MCP tool exposure/calls to these server names (must exist in global `mcp.servers`).
+    #[serde(default)]
+    pub mcp_servers: Option<Vec<String>>,
+    /// Override adapter for this path (`openai` | `anthropic`); YAML key `type`.
+    #[serde(default, rename = "type")]
+    pub adapter_type: Option<String>,
+    /// If non-empty, only these HTTP methods may be used for this path prefix (e.g. `GET`, `POST`, `PUT`, `PATCH`, `DELETE`).
+    /// Omitted or empty → all methods allowed. Values are normalized to canonical form at load time.
+    #[serde(default)]
+    pub methods: Vec<String>,
+}
+
 /// Top-level config as loaded from disk (e.g. `panda.yaml`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct PandaConfig {
+    /// Bind address. Leave empty when using [`PandaConfig::server`] `listen` or `port`.
+    #[serde(default)]
     pub listen: String,
+    #[serde(default)]
+    pub server: Option<ServerSection>,
     pub upstream: String,
+    /// Per-path upstream bases; see [`RouteConfig`]. Empty preserves single-upstream behavior.
+    #[serde(default)]
+    pub routes: Vec<RouteConfig>,
     #[serde(default)]
     pub trusted_gateway: TrustedGatewayConfig,
     #[serde(default)]
@@ -503,6 +598,9 @@ pub struct PandaConfig {
     pub plugins: PluginsConfig,
     #[serde(default)]
     pub identity: IdentityConfig,
+    /// Merged into `identity` (JWKS URL, `enforce_on_all_routes` → `require_jwt`).
+    #[serde(default)]
+    pub auth: AuthConfig,
     #[serde(default)]
     pub prompt_safety: PromptSafetyConfig,
     #[serde(default)]
@@ -522,9 +620,77 @@ impl PandaConfig {
     }
 
     pub fn from_yaml_str(raw: &str) -> anyhow::Result<Self> {
-        let cfg: Self = serde_yaml::from_str(raw)?;
+        let mut cfg: Self = serde_yaml::from_str(raw)?;
+        cfg.resolve_server_section()?;
+        cfg.merge_auth_section();
+        cfg.normalize_route_methods()?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Parse and canonicalize [`RouteConfig::methods`] (dedupe, validate tokens as HTTP methods).
+    fn normalize_route_methods(&mut self) -> anyhow::Result<()> {
+        use http::Method;
+        for r in &mut self.routes {
+            let mut out = Vec::new();
+            for s in std::mem::take(&mut r.methods) {
+                let t = s.trim();
+                if t.is_empty() {
+                    anyhow::bail!("routes.methods entry must not be empty or whitespace");
+                }
+                let m = Method::from_bytes(t.as_bytes()).map_err(|_| {
+                    anyhow::anyhow!("routes.methods invalid HTTP method: {:?}", s)
+                })?;
+                // Canonical form for matching (HTTP methods are uppercase in practice; `http` may keep
+                // lowercase tokens as extension methods).
+                let canon = m.as_str().to_ascii_uppercase();
+                if !out.contains(&canon) {
+                    out.push(canon);
+                }
+            }
+            r.methods = out;
+        }
+        Ok(())
+    }
+
+    /// Merge [`AuthConfig`] into [`IdentityConfig`] (JWKS URL, `enforce_on_all_routes` → `require_jwt`).
+    fn merge_auth_section(&mut self) {
+        if let Some(ref u) = self.auth.jwks_url {
+            let t = u.trim();
+            if !t.is_empty() {
+                self.identity.jwks_url = Some(t.to_string());
+            }
+        }
+        if self.auth.enforce_on_all_routes {
+            self.identity.require_jwt = true;
+        }
+    }
+
+    /// Merge [`PandaConfig::server`] into `listen` / `tls` when present.
+    ///
+    /// - Non-empty `server.listen` overrides the top-level `listen` string.
+    /// - `server.port` (+ optional `server.address`) is used **only** when `listen` is still empty
+    ///   after that, so `listen: "127.0.0.1:9000"` with `server: { port: 8080, tls: ... }` keeps
+    ///   `9000` and only applies nested TLS.
+    fn resolve_server_section(&mut self) -> anyhow::Result<()> {
+        let Some(ref s) = self.server else {
+            return Ok(());
+        };
+        if let Some(ref l) = s.listen {
+            if !l.trim().is_empty() {
+                self.listen = l.clone();
+            }
+        }
+        if self.listen.trim().is_empty() {
+            if let Some(port) = s.port {
+                let addr = s.address.as_deref().unwrap_or("127.0.0.1");
+                self.listen = format_listen_address(addr, port);
+            }
+        }
+        if let Some(ref tls) = s.tls {
+            self.tls = Some(tls.clone());
+        }
+        Ok(())
     }
 
     pub fn listen_addr(&self) -> anyhow::Result<std::net::SocketAddr> {
@@ -533,7 +699,7 @@ impl PandaConfig {
 
     fn validate(&self) -> anyhow::Result<()> {
         if self.listen.trim().is_empty() {
-            anyhow::bail!("`listen` must not be empty");
+            anyhow::bail!("`listen` must be set (top-level `listen`, or `server.listen` / `server.port`)");
         }
         if self.upstream.trim().is_empty() {
             anyhow::bail!("`upstream` must not be empty");
@@ -605,8 +771,28 @@ impl PandaConfig {
         if self.tpm.retry_after_seconds.is_some_and(|n| n == 0) {
             anyhow::bail!("tpm.retry_after_seconds must be > 0 when set");
         }
-        if self.identity.require_jwt && self.identity.jwt_hs256_secret_env.trim().is_empty() {
-            anyhow::bail!("identity.jwt_hs256_secret_env must be non-empty when require_jwt=true");
+        if self.identity.require_jwt {
+            let has_hs256 = !self.identity.jwt_hs256_secret_env.trim().is_empty();
+            let has_jwks = self
+                .identity
+                .jwks_url
+                .as_ref()
+                .is_some_and(|u| !u.trim().is_empty());
+            if !has_hs256 && !has_jwks {
+                anyhow::bail!(
+                    "when identity.require_jwt=true, set identity.jwt_hs256_secret_env and/or identity.jwks_url (or auth.jwks_url)"
+                );
+            }
+        }
+        if let Some(ref u) = self.identity.jwks_url {
+            if !u.trim().is_empty() {
+                let _: http::Uri = u
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("identity.jwks_url invalid URI: {e}"))?;
+                if self.identity.jwks_cache_ttl_seconds == 0 {
+                    anyhow::bail!("identity.jwks_cache_ttl_seconds must be > 0 when jwks_url is set");
+                }
+            }
         }
         if self
             .identity
@@ -770,7 +956,153 @@ impl PandaConfig {
         if self.adapter.anthropic_version.trim().is_empty() {
             anyhow::bail!("adapter.anthropic_version must be non-empty");
         }
+        let mut seen_prefixes = std::collections::HashSet::<String>::new();
+        for r in &self.routes {
+            if r.path_prefix.trim().is_empty() {
+                anyhow::bail!("routes.path_prefix must be non-empty");
+            }
+            if !r.path_prefix.starts_with('/') {
+                anyhow::bail!(
+                    "routes.path_prefix must start with '/': {:?}",
+                    r.path_prefix
+                );
+            }
+            if r.upstream.trim().is_empty() {
+                anyhow::bail!("routes.upstream must not be empty");
+            }
+            let _: http::Uri = r
+                .upstream
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid routes.upstream URL: {e}"))?;
+            if !seen_prefixes.insert(r.path_prefix.clone()) {
+                anyhow::bail!("routes.path_prefix must be unique: {:?}", r.path_prefix);
+            }
+            if let Some(ref rl) = r.rate_limit {
+                if rl.rps == 0 {
+                    anyhow::bail!("routes.rate_limit.rps must be > 0 when set");
+                }
+            }
+            if let Some(n) = r.tpm_limit {
+                if n == 0 {
+                    anyhow::bail!("routes.tpm_limit must be > 0 when set");
+                }
+            }
+            if r.semantic_cache == Some(true) && !self.semantic_cache.enabled {
+                anyhow::bail!("routes.semantic_cache=true requires semantic_cache.enabled=true");
+            }
+            if let Some(ref t) = r.adapter_type {
+                match t.as_str() {
+                    "openai" | "anthropic" => {}
+                    _ => anyhow::bail!("routes.type must be one of: openai, anthropic"),
+                }
+            }
+            if let Some(ref names) = r.mcp_servers {
+                if !names.is_empty() {
+                    if !self.mcp.enabled {
+                        anyhow::bail!("routes.mcp_servers requires mcp.enabled=true");
+                    }
+                    let known: std::collections::HashSet<_> =
+                        self.mcp.servers.iter().map(|s| s.name.as_str()).collect();
+                    for n in names {
+                        if n.trim().is_empty() {
+                            anyhow::bail!("routes.mcp_servers entries must be non-empty");
+                        }
+                        if !known.contains(n.as_str()) {
+                            anyhow::bail!(
+                                "routes.mcp_servers references unknown MCP server: {:?}",
+                                n
+                            );
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Longest-prefix matching route for an **ingress** path (client URI path).
+    pub fn effective_route_for_path(&self, path: &str) -> Option<&RouteConfig> {
+        let mut best: Option<(&RouteConfig, usize)> = None;
+        for r in &self.routes {
+            if path.starts_with(r.path_prefix.as_str()) {
+                let len = r.path_prefix.len();
+                if best.map(|(_, l)| len > l).unwrap_or(true) {
+                    best = Some((r, len));
+                }
+            }
+        }
+        best.map(|(r, _)| r)
+    }
+
+    /// When the matching route sets [`RouteConfig::methods`], verifies the request method is allowed.
+    ///
+    /// Returns `Err(allow_list)` where `allow_list` is suitable for an HTTP `Allow` response header
+    /// (comma-separated methods) when the method is not permitted; otherwise `Ok(())`.
+    /// No matching route or empty `methods` → `Ok(())`.
+    pub fn check_ingress_method(&self, path: &str, method: &http::Method) -> Result<(), String> {
+        let Some(route) = self.effective_route_for_path(path) else {
+            return Ok(());
+        };
+        if route.methods.is_empty() {
+            return Ok(());
+        }
+        let m = method.as_str();
+        if route
+            .methods
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(m))
+        {
+            return Ok(());
+        }
+        Err(route.methods.join(", "))
+    }
+
+    /// Upstream base URL for a request path: longest matching [`PandaConfig::routes`] entry, else [`PandaConfig::upstream`].
+    pub fn effective_upstream_base(&self, path: &str) -> &str {
+        self.effective_route_for_path(path)
+            .map(|r| r.upstream.as_str())
+            .unwrap_or(self.upstream.as_str())
+    }
+
+    /// TPM budget (tokens per minute) for an ingress path (per-route [`RouteConfig::tpm_limit`] or global).
+    pub fn effective_tpm_budget_tokens_per_minute(&self, path: &str) -> u64 {
+        self.effective_route_for_path(path)
+            .and_then(|r| r.tpm_limit)
+            .unwrap_or(self.tpm.budget_tokens_per_minute)
+    }
+
+    /// Whether semantic cache may be used for this ingress path.
+    pub fn effective_semantic_cache_enabled_for_path(&self, path: &str) -> bool {
+        let global_on = self.semantic_cache.enabled;
+        match self.effective_route_for_path(path).and_then(|r| r.semantic_cache) {
+            None => global_on,
+            Some(false) => false,
+            Some(true) => global_on,
+        }
+    }
+
+    /// Adapter provider for an ingress path (`openai` or `anthropic`).
+    pub fn effective_adapter_provider(&self, path: &str) -> &str {
+        self.effective_route_for_path(path)
+            .and_then(|r| r.adapter_type.as_deref())
+            .unwrap_or(self.adapter.provider.as_str())
+    }
+
+    /// When set, only these MCP server names are used for tools on this path (`Some(&[])` disables tools).
+    pub fn effective_mcp_server_names(&self, path: &str) -> Option<&[String]> {
+        self.effective_route_for_path(path)
+            .and_then(|r| r.mcp_servers.as_ref())
+            .map(|v| v.as_slice())
+    }
+
+    /// True when the default and every route `upstream` parses as an HTTP URI.
+    pub fn all_upstream_uris_valid(&self) -> bool {
+        if self.upstream.parse::<http::Uri>().is_err() {
+            return false;
+        }
+        self.routes
+            .iter()
+            .all(|r| r.upstream.parse::<http::Uri>().is_ok())
     }
 
     /// Effective Redis URL: YAML, then env `PANDA_REDIS_URL`.
@@ -854,6 +1186,8 @@ mod tests {
         assert_eq!(cfg.observability.admin_auth_header, "x-panda-admin-secret");
         assert!(cfg.observability.admin_secret_env.is_none());
         assert!(!cfg.identity.require_jwt);
+        assert!(cfg.identity.jwks_url.is_none());
+        assert_eq!(cfg.identity.jwks_cache_ttl_seconds, 3600);
         assert!(cfg.identity.accepted_issuers.is_empty());
         assert!(cfg.identity.accepted_audiences.is_empty());
         assert!(cfg.identity.required_scopes.is_empty());
@@ -888,6 +1222,8 @@ mod tests {
         assert_eq!(cfg.semantic_cache.ttl_seconds, 300);
         assert_eq!(cfg.adapter.provider, "openai");
         assert_eq!(cfg.adapter.anthropic_version, "2023-06-01");
+        assert!(cfg.routes.is_empty());
+        assert!(cfg.server.is_none());
     }
 
     #[test]
@@ -910,6 +1246,20 @@ mod tests {
         assert!(cfg.mcp.enabled);
         assert_eq!(cfg.mcp.servers.len(), 1);
         assert_eq!(cfg.mcp.servers[0].name, "demo");
+    }
+
+    #[test]
+    fn auth_block_merges_jwks_url_and_enforce_on_all_routes() {
+        let cfg = PandaConfig::from_yaml_str(
+            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+             auth:\n  type: jwt\n  jwks_url: 'https://issuer.example/.well-known/jwks.json'\n  enforce_on_all_routes: true\n",
+        )
+        .unwrap();
+        assert!(cfg.identity.require_jwt);
+        assert_eq!(
+            cfg.identity.jwks_url.as_deref(),
+            Some("https://issuer.example/.well-known/jwks.json")
+        );
     }
 
     #[test]
@@ -990,5 +1340,178 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("adapter.provider"));
+    }
+
+    #[test]
+    fn parses_routes_and_effective_upstream_longest_prefix() {
+        let cfg = PandaConfig::from_yaml_str(
+            r#"listen: '127.0.0.1:0'
+upstream: 'http://default.example'
+routes:
+  - path_prefix: /v1
+    upstream: 'http://v1.example'
+  - path_prefix: /v1/chat
+    upstream: 'http://chat.example'
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.effective_upstream_base("/other"), "http://default.example");
+        assert_eq!(cfg.effective_upstream_base("/v1/models"), "http://v1.example");
+        assert_eq!(cfg.effective_upstream_base("/v1/chat/completions"), "http://chat.example");
+    }
+
+    #[test]
+    fn rejects_duplicate_route_path_prefix() {
+        let err = PandaConfig::from_yaml_str(
+            r#"listen: '127.0.0.1:0'
+upstream: 'http://127.0.0.1:1'
+routes:
+  - path_prefix: /api
+    upstream: 'http://a.example'
+  - path_prefix: /api
+    upstream: 'http://b.example'
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unique"));
+    }
+
+    #[test]
+    fn rejects_route_path_prefix_without_leading_slash() {
+        let err = PandaConfig::from_yaml_str(
+            r#"listen: '127.0.0.1:0'
+upstream: 'http://127.0.0.1:1'
+routes:
+  - path_prefix: api
+    upstream: 'http://a.example'
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("routes.path_prefix"));
+    }
+
+    #[test]
+    fn rejects_invalid_route_upstream_url() {
+        let err = PandaConfig::from_yaml_str(
+            r#"listen: '127.0.0.1:0'
+upstream: 'http://127.0.0.1:1'
+routes:
+  - path_prefix: /x
+    upstream: 'http://['
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("routes.upstream"));
+    }
+
+    #[test]
+    fn server_block_port_sets_listen() {
+        let cfg = PandaConfig::from_yaml_str(
+            r#"server:
+  port: 8080
+  address: "127.0.0.1"
+upstream: 'http://127.0.0.1:1'
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.listen, "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn server_port_does_not_override_top_level_listen() {
+        let cfg = PandaConfig::from_yaml_str(
+            r#"listen: '127.0.0.1:9000'
+server:
+  port: 8080
+  address: "127.0.0.1"
+upstream: 'http://127.0.0.1:1'
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.listen, "127.0.0.1:9000");
+    }
+
+    #[test]
+    fn server_listen_empty_falls_back_to_server_port() {
+        let cfg = PandaConfig::from_yaml_str(
+            r#"listen: ''
+server:
+  listen: ''
+  port: 3000
+upstream: 'http://127.0.0.1:1'
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.listen, "127.0.0.1:3000");
+    }
+
+    #[test]
+    fn route_path_alias_and_per_route_overrides() {
+        let cfg = PandaConfig::from_yaml_str(
+            r#"listen: '127.0.0.1:0'
+upstream: 'http://default'
+semantic_cache:
+  enabled: true
+mcp:
+  enabled: true
+  servers:
+    - name: a
+routes:
+  - path: /v1/chat
+    upstream: 'http://chat'
+    rate_limit:
+      rps: 50
+    tpm_limit: 9000
+    semantic_cache: false
+    mcp_servers: [a]
+    type: anthropic
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.effective_upstream_base("/v1/chat/x"), "http://chat");
+        assert_eq!(cfg.effective_tpm_budget_tokens_per_minute("/v1/chat"), 9000);
+        assert!(!cfg.effective_semantic_cache_enabled_for_path("/v1/chat"));
+        assert_eq!(cfg.effective_adapter_provider("/v1/chat"), "anthropic");
+        assert_eq!(
+            cfg.effective_mcp_server_names("/v1/chat").map(|s| s.to_vec()),
+            Some(vec!["a".to_string()])
+        );
+    }
+
+    #[test]
+    fn route_methods_normalize_and_check_ingress() {
+        let cfg = PandaConfig::from_yaml_str(
+            r#"listen: '127.0.0.1:0'
+upstream: 'http://127.0.0.1:1'
+routes:
+  - path_prefix: /api
+    upstream: 'http://api.example'
+    methods: [GET, POST, PUT, PATCH, DELETE]
+"#,
+        )
+        .unwrap();
+        let r = cfg.effective_route_for_path("/api/items").unwrap();
+        assert_eq!(r.methods, vec!["GET", "POST", "PUT", "PATCH", "DELETE"]);
+        assert!(cfg.check_ingress_method("/api", &http::Method::GET).is_ok());
+        assert!(cfg.check_ingress_method("/api/x", &http::Method::DELETE).is_ok());
+        assert!(cfg.check_ingress_method("/other", &http::Method::PATCH).is_ok());
+        assert!(cfg
+            .check_ingress_method("/api", &http::Method::OPTIONS)
+            .is_err());
+    }
+
+    #[test]
+    fn route_methods_rejects_invalid_token() {
+        let err = PandaConfig::from_yaml_str(
+            r#"listen: '127.0.0.1:0'
+upstream: 'http://127.0.0.1:1'
+routes:
+  - path_prefix: /api
+    upstream: 'http://api.example'
+    methods: ["BAD METHOD"]
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid HTTP method"));
     }
 }

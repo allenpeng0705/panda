@@ -238,4 +238,72 @@ mod tests {
         assert!(!ctx.trusted_hop);
         assert!(h.get("X-User-Id").is_none());
     }
+
+    #[test]
+    fn untrusted_strips_tenant_and_scopes() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            http::HeaderName::from_static("x-user-id"),
+            http::HeaderValue::from_static("eve"),
+        );
+        h.insert(
+            http::HeaderName::from_static("x-tenant-id"),
+            http::HeaderValue::from_static("t1"),
+        );
+        h.insert(
+            http::HeaderName::from_static("x-user-scopes"),
+            http::HeaderValue::from_static("admin"),
+        );
+        let ctx = apply_trusted_gateway(&mut h, &sample_trusted_cfg(), Some("s3cret"));
+        assert!(!ctx.trusted_hop);
+        assert!(h.get("X-User-Id").is_none());
+        assert!(h.get("X-Tenant-Id").is_none());
+        assert!(h.get("X-User-Scopes").is_none());
+        assert!(ctx.subject.is_none());
+        assert!(ctx.tenant.is_none());
+        assert!(ctx.scopes.is_empty());
+    }
+
+    #[test]
+    fn attestation_rejects_extremely_long_values() {
+        let sec = "s3cret";
+        let long = "a".repeat(20_000);
+        assert!(!attestation_equals(&long, sec, sec.as_bytes()));
+        assert!(!attestation_equals(sec, &long, sec.as_bytes()));
+    }
+
+    #[test]
+    fn ensure_correlation_id_prefers_existing_header() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            HeaderName::from_static("x-request-id"),
+            HeaderValue::from_static("corr-existing"),
+        );
+        let id = ensure_correlation_id(&mut h, "x-request-id").unwrap();
+        assert_eq!(id, "corr-existing");
+    }
+
+    #[test]
+    fn ensure_correlation_id_derives_from_traceparent() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            HeaderName::from_static("traceparent"),
+            HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        );
+        let id = ensure_correlation_id(&mut h, "x-request-id").unwrap();
+        assert_eq!(id, "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_eq!(
+            h.get("x-request-id").and_then(|v| v.to_str().ok()),
+            Some("4bf92f3577b34da6a3ce929d0e0e4736")
+        );
+    }
+
+    #[test]
+    fn ensure_correlation_id_generates_uuid_when_missing() {
+        let mut h = HeaderMap::new();
+        let id = ensure_correlation_id(&mut h, "x-request-id").unwrap();
+        assert_eq!(id.len(), 36);
+        assert!(id.chars().filter(|c| *c == '-').count() == 4);
+        assert!(h.get("x-request-id").is_some());
+    }
 }
