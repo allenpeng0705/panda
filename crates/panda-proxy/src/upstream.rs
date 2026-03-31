@@ -35,6 +35,9 @@ pub fn filter_response_headers(src: &HeaderMap, dst: &mut HeaderMap) {
         if is_hop_by_hop_response(name) {
             continue;
         }
+        if is_provider_internal_response_header(name) {
+            continue;
+        }
         dst.append(name.clone(), value.clone());
     }
 }
@@ -67,6 +70,16 @@ fn is_hop_by_hop_response(name: &HeaderName) -> bool {
     ) || name == header::CONTENT_LENGTH
 }
 
+/// Strip provider/internal debug headers so clients only see normalized gateway headers.
+fn is_provider_internal_response_header(name: &HeaderName) -> bool {
+    let n = name.as_str().to_ascii_lowercase();
+    n == "openai-organization"
+        || n == "x-request-id"
+        || n == "server"
+        || n.starts_with("x-openai-")
+        || n.starts_with("x-anthropic-")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,5 +99,24 @@ mod tests {
         let u = join_upstream_uri("https://api.openai.com/v1/", &"/chat/completions".parse().unwrap())
             .unwrap();
         assert_eq!(u.to_string(), "https://api.openai.com/v1/chat/completions");
+    }
+
+    #[test]
+    fn filter_response_headers_strips_hop_by_hop_and_provider_internal_headers() {
+        let mut src = HeaderMap::new();
+        src.insert("content-type", "application/json".parse().unwrap());
+        src.insert("transfer-encoding", "chunked".parse().unwrap());
+        src.insert("x-request-id", "upstream-id".parse().unwrap());
+        src.insert("x-openai-processing-ms", "123".parse().unwrap());
+        src.insert("openai-organization", "org1".parse().unwrap());
+
+        let mut dst = HeaderMap::new();
+        filter_response_headers(&src, &mut dst);
+
+        assert!(dst.get("content-type").is_some());
+        assert!(dst.get("transfer-encoding").is_none());
+        assert!(dst.get("x-request-id").is_none());
+        assert!(dst.get("x-openai-processing-ms").is_none());
+        assert!(dst.get("openai-organization").is_none());
     }
 }

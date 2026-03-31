@@ -58,6 +58,7 @@ type BoxBody = UnsyncBoxBody<bytes::Bytes, hyper::Error>;
 type HttpClient = Client<HttpsConnector<HttpConnector>, BoxBody>;
 const AGENT_TOKEN_HEADER: &str = "x-panda-agent-token";
 const DEFAULT_SHUTDOWN_DRAIN_SECONDS: u64 = 30;
+const DEFAULT_UPSTREAM_REQUEST_TIMEOUT_SECONDS: u64 = 120;
 
 /// Shared state for each connection handler.
 pub struct ProxyState {
@@ -2287,11 +2288,13 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
     let mcp_followup_headers = parts.headers.clone();
     let req_up = Request::from_parts(parts, boxed_req_body);
 
-    let resp = state
-        .client
-        .request(req_up)
-        .await
-        .map_err(|e| ProxyError::Upstream(anyhow::anyhow!("upstream request: {e}")))?;
+    let resp = request_upstream_with_timeout(
+        &state.client,
+        req_up,
+        Duration::from_secs(DEFAULT_UPSTREAM_REQUEST_TIMEOUT_SECONDS),
+        "initial",
+    )
+    .await?;
     let (mut parts, body) = resp.into_parts();
     let mut body_opt = Some(body);
     let mut semantic_cache_store_value: Option<Vec<u8>> = None;
@@ -2504,11 +2507,13 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
                     let (mut p2, b2) = req2.into_parts();
                     p2.headers = headers2;
                     let req2 = Request::from_parts(p2, b2);
-                    let resp2 = state
-                        .client
-                        .request(req2)
-                        .await
-                        .map_err(|e| ProxyError::Upstream(anyhow::anyhow!("upstream request (mcp followup): {e}")))?;
+                    let resp2 = request_upstream_with_timeout(
+                        &state.client,
+                        req2,
+                        Duration::from_secs(DEFAULT_UPSTREAM_REQUEST_TIMEOUT_SECONDS),
+                        "mcp_followup",
+                    )
+                    .await?;
                     let (p2, b2) = resp2.into_parts();
                     parts = p2;
                     current_resp_bytes = collect_body_bounded(b2, max_body).await?.to_vec();
@@ -2682,6 +2687,23 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
         .map_err(|e| ProxyError::Upstream(anyhow::anyhow!("response build: {e}")))?;
     *out.headers_mut() = out_headers;
     Ok(out)
+}
+
+async fn request_upstream_with_timeout(
+    client: &HttpClient,
+    req: Request<BoxBody>,
+    timeout: Duration,
+    phase: &str,
+) -> Result<Response<Incoming>, ProxyError> {
+    tokio::time::timeout(timeout, client.request(req))
+        .await
+        .map_err(|_| {
+            ProxyError::Upstream(anyhow::anyhow!(
+                "upstream request timed out after {}ms (phase={phase})",
+                timeout.as_millis()
+            ))
+        })?
+        .map_err(|e| ProxyError::Upstream(anyhow::anyhow!("upstream request ({phase}): {e}")))
 }
 
 fn proxy_error_from_wasm(e: WasmCallError) -> ProxyError {
@@ -3557,6 +3579,40 @@ mod tests {
         let active = AtomicUsize::new(1);
         let drained = wait_for_active_connections(&active, Duration::from_millis(150)).await;
         assert!(!drained);
+    }
+
+    #[tokio::test]
+    async fn upstream_request_timeout_fails_when_backend_hangs() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hold = tokio::spawn(async move {
+            if let Ok((_sock, _peer)) = listener.accept().await {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+
+        let client = build_http_client().unwrap();
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("http://{addr}/"))
+            .body(
+                Full::new(bytes::Bytes::new())
+                    .map_err(|never: std::convert::Infallible| match never {})
+                    .boxed_unsync(),
+            )
+            .unwrap();
+
+        let err = request_upstream_with_timeout(&client, req, Duration::from_millis(80), "test")
+            .await
+            .unwrap_err();
+        match err {
+            ProxyError::Upstream(e) => {
+                let msg = format!("{e:#}");
+                assert!(msg.contains("timed out"), "{msg}");
+            }
+            _ => panic!("expected upstream timeout error"),
+        }
+        hold.abort();
     }
 
     #[tokio::test]

@@ -252,3 +252,40 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NoopBody;
+
+    impl Body for NoopBody {
+        type Data = Bytes;
+        type Error = hyper::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            let _ = self;
+            Poll::Ready(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_counting_buffers_fragmented_data_lines() {
+        let tpm = Arc::new(TpmCounters::connect(None).await.unwrap());
+        let bpe = Arc::new(tiktoken_rs::cl100k_base().unwrap());
+        let mut body = SseCountingBody::new(NoopBody, tpm, "b1".to_string(), bpe);
+
+        body.buf.put_slice(br#"data: {"choices":[{"delta":{"content":"hel"#);
+        body.process_buffer();
+        assert_eq!(body.delta_tokens, 0, "must not parse incomplete line");
+
+        body.buf
+            .put_slice(br#"lo"}}]}
+"#);
+        body.process_buffer();
+        assert!(body.delta_tokens > 0, "must parse once full line arrives");
+    }
+}
