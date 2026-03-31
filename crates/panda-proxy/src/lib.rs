@@ -850,7 +850,32 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
             .map_err(|_| ProxyError::Upstream(anyhow::anyhow!("correlation id header value")))?,
     );
 
-    let bucket = tpm_bucket_key(&ctx);
+    if state.config.tpm.enforce_budget {
+        let (used, remaining) = state
+            .tpm
+            .prompt_budget_snapshot(&bucket, state.config.tpm.budget_tokens_per_minute)
+            .await;
+        out_headers.insert(
+            HeaderName::from_static("x-panda-budget-limit"),
+            HeaderValue::from_str(&state.config.tpm.budget_tokens_per_minute.to_string())
+                .map_err(|_| ProxyError::Upstream(anyhow::anyhow!("budget limit header value")))?,
+        );
+        out_headers.insert(
+            HeaderName::from_static("x-panda-budget-estimate"),
+            HeaderValue::from_str(&est.to_string())
+                .map_err(|_| ProxyError::Upstream(anyhow::anyhow!("budget estimate header value")))?,
+        );
+        out_headers.insert(
+            HeaderName::from_static("x-panda-budget-used"),
+            HeaderValue::from_str(&used.to_string())
+                .map_err(|_| ProxyError::Upstream(anyhow::anyhow!("budget used header value")))?,
+        );
+        out_headers.insert(
+            HeaderName::from_static("x-panda-budget-remaining"),
+            HeaderValue::from_str(&remaining.to_string())
+                .map_err(|_| ProxyError::Upstream(anyhow::anyhow!("budget remaining header value")))?,
+        );
+    }
     let body_in: BoxBody = if is_sse(&out_headers) {
         if let Some(ref bpe) = state.bpe {
             sse::SseCountingBody::new(body, Arc::clone(&state.tpm), bucket, Arc::clone(bpe))

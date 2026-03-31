@@ -20,6 +20,8 @@ upstream: "http://127.0.0.1:11434"
 # tpm:
 #   redis_url: "redis://127.0.0.1:6379"
 #   # Starter per-instance budget guard (429 when estimated prompt budget is exceeded).
+#   # When enabled, responses include:
+#   #   x-panda-budget-limit, x-panda-budget-estimate, x-panda-budget-used, x-panda-budget-remaining
 #   enforce_budget: false
 #   budget_tokens_per_minute: 60000
 

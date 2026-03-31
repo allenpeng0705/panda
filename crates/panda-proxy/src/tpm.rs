@@ -89,6 +89,34 @@ impl TpmCounters {
         }
         e.1.saturating_add(n) > limit_per_minute
     }
+
+    /// Returns `(used, remaining)` for the active prompt budget window.
+    pub async fn prompt_budget_snapshot(&self, bucket: &str, limit_per_minute: u64) -> (u64, u64) {
+        let used = if let Some(ref mgr) = self.redis {
+            let mut conn = mgr.clone();
+            let minute = unix_minute();
+            let window_key = format!("panda:tpm:v1:prompt_window:{bucket}:{minute}");
+            let cur: Result<Option<u64>, _> = conn.get(&window_key).await;
+            if let Ok(current) = cur {
+                current.unwrap_or(0)
+            } else {
+                self.local_prompt_window_used(bucket)
+            }
+        } else {
+            self.local_prompt_window_used(bucket)
+        };
+        (used, limit_per_minute.saturating_sub(used))
+    }
+
+    fn local_prompt_window_used(&self, bucket: &str) -> u64 {
+        let now = std::time::Instant::now();
+        let mut g = self.mem_prompt_window.lock().expect("tpm mutex poisoned");
+        let e = g.entry(bucket.to_string()).or_insert((now, 0));
+        if now.duration_since(e.0) >= std::time::Duration::from_secs(60) {
+            *e = (now, 0);
+        }
+        e.1
+    }
 }
 
 fn unix_minute() -> u64 {
@@ -109,5 +137,14 @@ mod tests {
         counters.add_prompt_tokens("u1", 50).await;
         assert!(counters.would_exceed_prompt_budget("u1", 51, 100).await);
         assert!(!counters.would_exceed_prompt_budget("u1", 50, 100).await);
+    }
+
+    #[tokio::test]
+    async fn in_memory_budget_snapshot_reports_remaining() {
+        let counters = TpmCounters::connect(None).await.unwrap();
+        counters.add_prompt_tokens("u2", 25).await;
+        let (used, remaining) = counters.prompt_budget_snapshot("u2", 100).await;
+        assert_eq!(used, 25);
+        assert_eq!(remaining, 75);
     }
 }
