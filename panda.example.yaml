@@ -17,8 +17,10 @@ upstream: "http://127.0.0.1:11434"
 #   # Optional ops endpoint auth for /metrics, /plugins/status, /tpm/status
 #   admin_auth_header: "x-panda-admin-secret"
 #   admin_secret_env: "PANDA_ADMIN_STATUS_SECRET"
-#   # Denied ops auth attempts are exported as:
-#   #   panda_ops_auth_denied_total{endpoint="..."} on /metrics
+#   # Ops auth telemetry on /metrics:
+#   #   panda_ops_auth_allowed_total{endpoint="..."}
+#   #   panda_ops_auth_denied_total{endpoint="..."}
+#   #   panda_ops_auth_deny_ratio{endpoint="..."}
 
 # Optional: Redis for cross-replica TPM counters (INCRBY panda:tpm:v1:prompt:* and completion:*).
 # Env PANDA_REDIS_URL overrides this field.

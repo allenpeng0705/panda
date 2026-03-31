@@ -58,10 +58,18 @@ pub struct ProxyState {
 
 #[derive(Default)]
 struct OpsMetrics {
+    ops_auth_allowed_counts: std::sync::Mutex<HashMap<String, u64>>,
     ops_auth_denied_counts: std::sync::Mutex<HashMap<String, u64>>,
 }
 
 impl OpsMetrics {
+    fn inc_ops_auth_allowed(&self, endpoint: &str) {
+        if let Ok(mut g) = self.ops_auth_allowed_counts.lock() {
+            let n = g.entry(endpoint.to_string()).or_insert(0);
+            *n += 1;
+        }
+    }
+
     fn inc_ops_auth_denied(&self, endpoint: &str) {
         if let Ok(mut g) = self.ops_auth_denied_counts.lock() {
             let n = g.entry(endpoint.to_string()).or_insert(0);
@@ -69,17 +77,48 @@ impl OpsMetrics {
         }
     }
 
-    fn ops_auth_denied_prometheus_text(&self) -> String {
+    fn ops_auth_prometheus_text(&self) -> String {
         let mut out = String::new();
+        out.push_str("# HELP panda_ops_auth_allowed_total Count of allowed ops endpoint auth checks.\n");
+        out.push_str("# TYPE panda_ops_auth_allowed_total counter\n");
         out.push_str("# HELP panda_ops_auth_denied_total Count of denied ops endpoint auth checks.\n");
         out.push_str("# TYPE panda_ops_auth_denied_total counter\n");
-        if let Ok(g) = self.ops_auth_denied_counts.lock() {
-            let mut entries: Vec<(&String, &u64)> = g.iter().collect();
-            entries.sort_by(|a, b| a.0.cmp(b.0));
-            for (endpoint, count) in entries {
+        out.push_str("# HELP panda_ops_auth_deny_ratio Ratio of denied ops endpoint auth checks.\n");
+        out.push_str("# TYPE panda_ops_auth_deny_ratio gauge\n");
+        let allowed = self
+            .ops_auth_allowed_counts
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
+        let denied = self
+            .ops_auth_denied_counts
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
+        let mut endpoints: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        endpoints.extend(allowed.keys().cloned());
+        endpoints.extend(denied.keys().cloned());
+        for endpoint in endpoints {
+            let a = *allowed.get(&endpoint).unwrap_or(&0);
+            let d = *denied.get(&endpoint).unwrap_or(&0);
+            if a > 0 {
+                out.push_str(&format!(
+                    "panda_ops_auth_allowed_total{{endpoint=\"{}\"}} {}\n",
+                    endpoint, a
+                ));
+            }
+            if d > 0 {
                 out.push_str(&format!(
                     "panda_ops_auth_denied_total{{endpoint=\"{}\"}} {}\n",
-                    endpoint, count
+                    endpoint, d
+                ));
+            }
+            let total = a + d;
+            if total > 0 {
+                let ratio = (d as f64) / (total as f64);
+                out.push_str(&format!(
+                    "panda_ops_auth_deny_ratio{{endpoint=\"{}\"}} {:.6}\n",
+                    endpoint, ratio
                 ));
             }
         }
@@ -520,6 +559,7 @@ async fn dispatch(req: Request<Incoming>, state: Arc<ProxyState>) -> Result<Resp
             log_ops_access(path, "deny", &corr, bucket.as_deref());
             return Ok(resp);
         }
+        state.ops_metrics.inc_ops_auth_allowed(path);
         log_ops_access(path, "allow", &corr, bucket.as_deref());
     }
     if method == hyper::Method::GET && path == "/metrics" {
@@ -528,7 +568,7 @@ async fn dispatch(req: Request<Incoming>, state: Arc<ProxyState>) -> Result<Resp
             .as_ref()
             .map(|p| p.metrics_prometheus_text())
             .unwrap_or_else(|| "# panda plugins disabled\n".to_string());
-        body.push_str(&state.ops_metrics.ops_auth_denied_prometheus_text());
+        body.push_str(&state.ops_metrics.ops_auth_prometheus_text());
         return Ok(text_with_content_type(
             StatusCode::OK,
             body,
@@ -1363,13 +1403,16 @@ mod tests {
     }
 
     #[test]
-    fn ops_denied_metrics_render_prometheus_lines() {
+    fn ops_auth_metrics_render_prometheus_lines() {
         let m = OpsMetrics::default();
-        m.inc_ops_auth_denied("/metrics");
+        m.inc_ops_auth_allowed("/metrics");
+        m.inc_ops_auth_allowed("/metrics");
         m.inc_ops_auth_denied("/metrics");
         m.inc_ops_auth_denied("/tpm/status");
-        let s = m.ops_auth_denied_prometheus_text();
+        let s = m.ops_auth_prometheus_text();
+        assert!(s.contains("panda_ops_auth_allowed_total"));
         assert!(s.contains("panda_ops_auth_denied_total"));
+        assert!(s.contains("panda_ops_auth_deny_ratio"));
         assert!(s.contains("endpoint=\"/metrics\""));
         assert!(s.contains("endpoint=\"/tpm/status\""));
     }
