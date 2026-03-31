@@ -1,0 +1,17 @@
+[package]
+name = "panda-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Panda gateway binary: wires config loader to proxy engine"
+
+[[bin]]
+name = "panda"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+panda-config = { path = "../panda-config" }
+panda-proxy = { path = "../panda-proxy" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

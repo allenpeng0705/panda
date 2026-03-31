@@ -1,0 +1,19 @@
+[package]
+name = "panda-proxy"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "HTTP proxy engine: listener, forwarding, future SSE and middleware"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+http-body-util = "0.1"
+http = "1"
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "webpki-roots", "tls12", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+hyper-util = { version = "0.1", features = ["tokio", "client", "client-legacy", "http1"] }
+panda-config = { path = "../panda-config" }
+tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "signal"] }

@@ -1,0 +1,3 @@
+# Example Panda config (copy to panda.yaml for local runs).
+listen: "127.0.0.1:8080"
+upstream: "http://127.0.0.1:11434"

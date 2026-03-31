@@ -1,0 +1,242 @@
+# Panda: Implementation Plan
+
+This document is the **step-by-step execution plan** for building Panda as a self-contained, high-performance AI gateway. Work follows a **Plan → Implement → Review → Refine** cycle within each phase.
+
+**Why Rust:** The shipping artifact is a single **copy-and-run** static binary—no Python runtimes, no embedded Lua VM, and minimal operational surface area compared with traditional API gateways.
+
+The [high-level design](./high_level_design.md) describes *what* Panda is; this document describes *how* we build it in order.
+
+---
+
+## Alignment with the “enterprise AI gateway” bar
+
+This plan matches the **Kong-style lesson** you care about: a **thin, native data plane** on the hot path (fast intercept, stream-safe forward, hooks for policy), with a **separate, long-term control plane story** implied by GitOps config—not a fat database inside every replica.
+
+**Already explicit:** OpenAI-style ingress, real-time SSE, Wasm extensibility (vs Lua), JWT + TPM, PII scrubbing path, intent routing + MCP, OTel + K8s hardening.
+
+**Cargo from discussions, tracked in phases below:** **universal adapter** (one client contract → many provider schemas), **semantic cache** (embedding + vector lookup—not URL key cache), **circuit breaking / failover** between upstreams, optional **context-enrichment** middleware (gateway-side RAG), and **proof-of-intent** gates on dangerous tool calls (see Phase 4).
+
+**High concurrency:** Throughput scales with **horizontal replicas** behind an L4/L7 load balancer; each instance must keep **per-connection memory flat** on long SSE. Phase 1/5 numbers below are **quality gates**, not product ceilings—document baseline hardware when reporting.
+
+---
+
+## Phase 1: Foundations — the core proxy (“Panda Heart”)
+
+**Goal:** A high-performance HTTP/1.1 + **HTTP/2**-ready streaming proxy that can sit **behind Kong** (upstream from the edge gateway) or run **standalone** for LLM chat streaming. Initial MVP targets **OpenAI-compatible** Chat Completions; adapter-style transforms expand in Phase 4.
+
+**Milestone structure:**
+
+| Step | Name | Intent |
+|------|------|--------|
+| **1.1** | Workspace | Modular crate layout: **proxy engine** decoupled from **config loader** so each is unit-testable without the other. |
+| **1.2** | Streaming hot-path | Tokio + Hyper service loop proving **low overhead** on proxied SSE (TTFT target in Review). |
+| **1.3** | Kong handshake | Middleware for **trusted gateway headers** so when Kong (or another edge) already authenticated the caller, Panda extracts **subject / tenant** and **scopes** for immediate **TPM accounting keys** and audit context (full JWT validation remains Phase 3). |
+
+### Plan
+
+- Initialize the Rust **workspace** with **Tokio** (async) and **Hyper** (HTTP); keep **config types + file loading** in a dedicated module or crate consumed by the server binary.
+- Define a minimal configuration structure (YAML or JSON) for upstream LLM endpoints (URL, timeouts, optional **priority / failover group** for later circuit breaking).
+- Specify **request passthrough** for Chat Completions: preserve semantics the backend expects.
+- Specify **trusted ingress** configuration: optional **mTLS** or **shared secret** (e.g. network policy) for the Kong → Panda hop; **header allowlist** mapping to internal identity (see Implement).
+
+### Implement
+
+**1.1 — Workspace** *(implemented in repo)*
+
+- Crate boundaries: **`panda-config`** (parse + validate), **`panda-proxy`** (Tokio/Hyper listener + future forwarder), **`panda-server`** binary crate producing the **`panda`** executable.
+- Tests: invalid config in `panda-config`; optional proxy tests with mock upstream **without** binding a real port where possible.
+- Run locally: `cp panda.example.yaml panda.yaml` then `cargo run -p panda-server` (or `cargo build -p panda-server` → `target/debug/panda`).
+
+**1.2 — Streaming hot-path** *(core reverse proxy implemented)*
+
+- Listener + **Hyper HTTP/1 client** (`hyper-util` legacy client + **`hyper-rustls`** with **ring** + Mozilla roots): forward **any** path (except `/health` and `/ready`) to `upstream` + client path/query.
+- Request/response bodies use **`UnsyncBoxBody`** so bytes **stream through** (SSE-friendly; no full-response buffer in Panda).
+- Hop-by-hop header filtering; strip upstream **`content-length`** on the way back so Hyper can re-frame chunked streams safely.
+- **Still to do for full Phase 1 review:** explicit **max body / stream** limits, **retry / circuit breaker** groups from config, and measured TTFT benchmarks.
+
+### Kong handshake (milestone 1.3)
+
+- Middleware applied **early** in the request path:
+  - If the request arrives on a **trusted** listener (or carries a configurable **gateway auth** secret / mTLS identity), read **configurable header names** for end-user identity (e.g. subject / user id, tenant, scope list)—Kong (or a Kong plugin) is responsible for **setting** these after OIDC termination.
+  - Populate an internal **`RequestContext`** (subject, scopes, correlation id from `traceparent` or `X-Request-Id`) used for **TPM bucket keys** and structured logs.
+  - **Strip or sanitize** incoming client spoof attempts: drop untrusted `X-*` identity headers from **untrusted** hops; only accept trust headers from **verified** edge (network + optional HMAC or mTLS).
+- Document the recommended Kong pattern: terminate OIDC at Kong, inject headers, forward to Panda upstream (see [integration & evolution](./integration_and_evolution.md)).
+
+### Review
+
+- Does the proxy sustain **~1,000 concurrent** streams per instance **on a defined baseline machine** without degradation (tail latency, error rate)?
+- Is **time to first token (TTFT)** overhead from the gateway **under ~2 ms** in a controlled lab setup? (Tune baselines per hardware; treat this as a target, not a guarantee.)
+- **Kong handshake:** With trust configured, does a request **without** a valid edge hop **not** inherit privileged identity? With trust + injected headers, do TPM counters attribute to the **correct** subject?
+
+### Refine
+
+- Profile allocations; prefer **`Bytes`** / shared buffers for bodies and SSE chunks where it measurably helps.
+
+---
+
+## Phase 2: Plugin engine — the Wasm sandbox
+
+**Goal:** Extensibility via **Rust / Go (TinyGo)** plugins **without** recompiling the main binary.
+
+### Plan
+
+- Integrate **Wasmtime** (or a similarly mature embedded Wasm runtime) as the plugin VM.
+- Define the **host ↔ plugin ABI:** what the plugin receives (headers, body chunks, request context) and what it may return (mutations, early reject, metrics tags).
+
+### Implement
+
+- **Plugin manager:** load `.wasm` modules from a configured directory; versioned metadata (name, ABI version).
+- **Sample TinyGo plugin:** adds a custom header (proves non-Rust toolchain path).
+- **Sample Rust plugin:** redacts the literal substring `password` in the prompt (simple policy hook).
+
+### Review
+
+- Misbehaving or trapping plugins **must not** crash the gateway process; isolate failures per invocation and surface structured errors.
+
+### Refine
+
+- **Hot reload:** detect `.wasm` changes on disk and swap modules **without** a full process restart (with explicit grace period / in-flight drain rules).
+
+---
+
+## Phase 3: Identity & security — the bouncer
+
+**Goal:** Answer **who is calling** and reduce **enterprise data** leakage risk on the hot path.
+
+### Plan
+
+- JWT validation middleware (**OIDC-compatible** issuers: Okta, Azure AD, etc.).
+- **Token exchange:** map a **user token → scoped agent token** with tight tool/route claims.
+
+### Implement
+
+- **PII scrubber:** regex-based first; evolve toward NER or hybrid detection when Phase 4+ depth lands.
+- **Token-based rate limiting** (TPM / token budgets): start with **in-memory** per-instance counters; design boundaries so **Redis** (or similar) can back **global** counts later.
+
+### Review
+
+- Can we block or flag prompts that match **jailbreak / injection** heuristics (starter rules before full ML)?
+
+### Refine
+
+- Multi-pattern matching at scale: **Aho–Corasick** (e.g. via the `aho-corasick` crate) for many fixed-string / pattern scans.
+
+---
+
+## Phase 4: Intelligence & MCP — the agentic brain
+
+**Goal:** Move beyond dumb proxying to a **tool-aware** gateway with **cost-aware** reuse and **multi-vendor** egress.
+
+### Plan
+
+- Embed an **MCP host client** in the binary.
+- Add a **semantic router** using a **small ONNX** model (e.g. sentence embedding + k-NN routes, or a tiny classifier—`all-MiniLM-L6-v2` class of model is a reasonable starting point).
+- **Semantic cache:** normalize prompt (+ optional fingerprint of system/tools), embed with a **fast local** model, query **Redis / Milvus / other** vector index for similarity ≥ configured threshold; on hit, return cached completion (skip upstream). Keeps **store pluggable**—the gateway owns the policy and keying, not necessarily the database binary.
+- **Universal adapter:** map **one** stable inbound API (OpenAI-compatible) to **backend-specific** JSON for Anthropic, Gemini, local llama.cpp servers, etc., so clients swap models without code changes.
+
+### Implement
+
+- Connect to at least one MCP server locally (e.g. SQLite or filesystem demo server).
+- Surface discovered tools to the LLM through the **`/v1/chat/completions` tools** field (or equivalent for your chosen API compatibility layer).
+- Optional **context enrichment** middleware: gateway performs retrieval (vector search against corp KB), **injects** snippets into the prompt or messages, then forwards—keeps application clients thin (same pattern as “RAG at the edge”).
+
+### Review
+
+- End-to-end: **LLM invokes an MCP tool** through Panda and the result flows back correctly.
+- **Proof of intent (MVP):** block or audit tool calls that are **inconsistent** with routed intent / user prompt class (starter rules before full ML)—aligns with [HLD proof-of-intent](./high_level_design.md#42-proof-of-intent-agentic-security-model).
+
+### Refine
+
+- **Tool discovery:** send only **intent-relevant** tools to the model to save context window and reduce misuse surface.
+
+---
+
+## Phase 5: Production & scale — enterprise finish
+
+**Goal:** Deployment is **boring**; failure modes are **bounded** and observable.
+
+### Plan
+
+- **OpenTelemetry** for traces and metrics (HTTP, upstream latency, TTFT, stream duration, plugin time, TPM).
+- **Packaging:** Docker image wrapping the **single static binary**; reproducible builds.
+
+### Implement
+
+- Kubernetes **Deployment** + **ConfigMap** (and Secrets) templates; document upgrade and rollback; **PodDisruptionBudget** / **HPA** hooks as needed for **many replicas** at egress.
+- **Health endpoints:** `/health` (process up) and `/ready` (config loaded, critical deps reachable—define criteria explicitly).
+
+### Review
+
+- Load test at scale (e.g. **~5,000** concurrent streams **aggregate** or per shard, per environment—state the topology); watch CPU, RSS, and tail latency; validate no systematic memory growth on long-lived SSE.
+- **Soak test:** run **≥ 24 hours** of steady **SSE** traffic (mix of short and long streams) and confirm **no creep** in RSS, open sockets, or in-flight task counts; catch slow leaks that burst tests miss.
+- Revisit **Phase 1** SLOs under load: TTFT overhead, p99 stream stall time, upstream failover correctness.
+
+### Refine
+
+- Allocator tuning (**mimalloc** / **jemalloc**) if fragmentation shows up under long-lived AI streams; validate with benchmarks before committing.
+
+---
+
+## Deployment complexity (illustrative)
+
+| Aspect | Phase 1–2 (MVP) | Phase 5 (enterprise) |
+|--------|------------------|-------------------------|
+| **Binary size** | ~15 MB order of magnitude | ~45 MB order of magnitude (Wasm + ONNX / models bundled or mounted) |
+| **Runtime dependencies** | None required at OS level beyond libc | Optional **Redis** (or equivalent) for **global** TPM / shared limits |
+| **Deployment** | Copy binary, run `./panda` | `kubectl apply -f` on maintained manifests (e.g. `k8s/` or Helm) |
+
+Sizes are **targets** until measured on the release pipeline; track them in CI.
+
+---
+
+## Mapping to the conceptual layers
+
+| Implementation phase | Primary HLD layers |
+|----------------------|--------------------|
+| Phase 1 | Ingress + Egress (minimal) |
+| Phase 2 | Cross-cutting (extensibility) |
+| Phase 3 | Shield (+ Ingress hooks) |
+| Phase 4 | Brain + MCP aggregation |
+| Phase 5 | Operations, observability, packaging |
+
+This plan can be revised as benchmarks and security reviews land; keep the **Plan → Implement → Review → Refine** loop explicit in PRs and milestones.
+
+---
+
+## Enterprise final targets (north star)
+
+The phases above deliver a **credible MVP through production-ready core**. For **final** enterprise positioning—competing with mature API gateways on operability and trust—track the items below (not all need to ship on day one; prioritize by tenant and industry).
+
+### Reliability and performance
+
+- Published **SLOs** (e.g. availability, p99 TTFT add-on, p99 time-to-last-token under load) and **error budgets**; dashboards that match those SLOs.
+- **Graceful shutdown:** stop accepting new streams, **drain** in-flight SSE within a bounded window, then exit—required for Kubernetes rollouts without client resets.
+- **Explicit limits:** max concurrent streams per instance, per-tenant, and per-key; **fair queuing** or backoff when saturated (avoid retry storms).
+- **Capacity planning:** document scaling curves (streams vs CPU vs RAM); optional **chaos** or fault-injection drills for upstream blackout and slowloris-style clients.
+
+### Security and compliance
+
+- **Threat model** doc (see HLD document map): injection, tool abuse, **cache poisoning** (semantic cache), scope elevation, plugin escape hardening.
+- **Secrets:** upstream API keys and OIDC client secrets from env / Vault / K8s Secrets only; never echo in logs or traces without redaction policy.
+- **mTLS** (optional) gateway ↔ sensitive upstreams; **plugin supply chain:** signed Wasm, allowlisted digests, ABI version pinning.
+- **Audit trail:** structured, **intent- and tool-centric** events (who, which agent, which tool, allow/deny/synthetic cache hit); retention and **SIEM** export; policy for **PII in audit logs**.
+- **Compliance hooks:** tenant **data residency** flags, semantic-cache **TTL/eviction** and “forget” semantics where regulations require it; DPIA-friendly description of what leaves the network.
+
+### Multi-tenancy and governance
+
+- **Strong tenant isolation** in config and quotas (routes, backends, TPM, tool allowlists); optional separate upstream credentials per tenant.
+- **Config validation** at load: invalid config **fails closed** or blocks `/ready`; schema versioning for GitOps.
+- **Admin vs data plane:** any future **management API** must be authenticated, authorized, **rate-limited**, and separate from customer-facing ingress where possible.
+
+### Protocol and integration completeness
+
+- **gRPC** ingress/egress (per HLD) when REST-only is no longer enough for internal services.
+- **Webhooks / eventing** (optional): async notify on policy violations or spend thresholds for finance/SOC workflows.
+
+### Operational excellence
+
+- **Runbooks:** upstream down, cache poisoned, JWT clock skew, OOM during soak, Wasm trap storms.
+- **Release safety:** canary or progressive rollout story; **versioned** config migration notes.
+- **SBOM** and dependency audit in CI; **signed** container images (cosign or equivalent).
+
+Treat this section as the **backlog umbrella** for “enterprise finish” after Phase 5; fold items into phased work as customers demand them.

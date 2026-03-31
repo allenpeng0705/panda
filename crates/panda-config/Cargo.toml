@@ -1,0 +1,13 @@
+[package]
+name = "panda-config"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Configuration types and YAML loading for Panda"
+
+[dependencies]
+anyhow = "1"
+http = "1"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
