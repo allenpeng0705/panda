@@ -117,12 +117,35 @@ impl TpmCounters {
         }
         e.1
     }
+
+    /// Seconds until current prompt budget window rolls over (1..=60).
+    pub async fn prompt_budget_retry_after_seconds(&self, bucket: &str) -> u64 {
+        if self.redis.is_some() {
+            let now = unix_seconds();
+            let rem = 60 - (now % 60);
+            return rem.max(1);
+        }
+        let now = std::time::Instant::now();
+        let mut g = self.mem_prompt_window.lock().expect("tpm mutex poisoned");
+        let e = g.entry(bucket.to_string()).or_insert((now, 0));
+        let elapsed = now.duration_since(e.0).as_secs();
+        if elapsed >= 60 {
+            *e = (now, 0);
+            60
+        } else {
+            (60 - elapsed).max(1)
+        }
+    }
 }
 
 fn unix_minute() -> u64 {
+    unix_seconds() / 60
+}
+
+fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() / 60)
+        .map(|d| d.as_secs())
         .unwrap_or(0)
 }
 
@@ -146,5 +169,12 @@ mod tests {
         let (used, remaining) = counters.prompt_budget_snapshot("u2", 100).await;
         assert_eq!(used, 25);
         assert_eq!(remaining, 75);
+    }
+
+    #[tokio::test]
+    async fn in_memory_retry_after_is_positive() {
+        let counters = TpmCounters::connect(None).await.unwrap();
+        let secs = counters.prompt_budget_retry_after_seconds("u3").await;
+        assert!((1..=60).contains(&secs));
     }
 }

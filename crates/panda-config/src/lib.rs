@@ -75,6 +75,9 @@ pub struct TpmConfig {
     /// Max prompt-token estimate per rolling minute per bucket.
     #[serde(default = "default_tpm_budget_tokens_per_minute")]
     pub budget_tokens_per_minute: u64,
+    /// Optional fixed `Retry-After` (seconds) for 429 responses; when unset, derive from window.
+    #[serde(default)]
+    pub retry_after_seconds: Option<u64>,
 }
 
 fn default_tpm_budget_tokens_per_minute() -> u64 {
@@ -87,6 +90,7 @@ impl Default for TpmConfig {
             redis_url: None,
             enforce_budget: false,
             budget_tokens_per_minute: default_tpm_budget_tokens_per_minute(),
+            retry_after_seconds: None,
         }
     }
 }
@@ -371,6 +375,9 @@ impl PandaConfig {
         if self.tpm.enforce_budget && self.tpm.budget_tokens_per_minute == 0 {
             anyhow::bail!("tpm.budget_tokens_per_minute must be > 0 when enforce_budget=true");
         }
+        if self.tpm.retry_after_seconds.is_some_and(|n| n == 0) {
+            anyhow::bail!("tpm.retry_after_seconds must be > 0 when set");
+        }
         if self.identity.require_jwt && self.identity.jwt_hs256_secret_env.trim().is_empty() {
             anyhow::bail!("identity.jwt_hs256_secret_env must be non-empty when require_jwt=true");
         }
@@ -516,6 +523,7 @@ mod tests {
         assert!(cfg.plugins.max_reloads_per_minute > 0);
         assert!(!cfg.tpm.enforce_budget);
         assert!(cfg.tpm.budget_tokens_per_minute > 0);
+        assert!(cfg.tpm.retry_after_seconds.is_none());
         assert!(!cfg.identity.require_jwt);
         assert!(cfg.identity.accepted_issuers.is_empty());
         assert!(cfg.identity.accepted_audiences.is_empty());

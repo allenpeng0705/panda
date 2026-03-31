@@ -24,6 +24,8 @@ upstream: "http://127.0.0.1:11434"
 #   #   x-panda-budget-limit, x-panda-budget-estimate, x-panda-budget-used, x-panda-budget-remaining
 #   enforce_budget: false
 #   budget_tokens_per_minute: 60000
+#   # Optional fixed Retry-After seconds for 429 (default: derived from current minute window).
+#   # retry_after_seconds: 30
 
 # Optional: terminate TLS on `listen` (HTTP plaintext disabled). PEM paths must exist at validate time.
 # If client_ca_pem is set, mTLS is required.

@@ -644,6 +644,7 @@ enum ProxyError {
         estimate: u64,
         used: u64,
         remaining: u64,
+        retry_after_seconds: u64,
     },
     Upstream(anyhow::Error),
 }
@@ -751,11 +752,17 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
         let limit = state.config.tpm.budget_tokens_per_minute;
         if state.tpm.would_exceed_prompt_budget(&bucket, est, limit).await {
             let (used, remaining) = state.tpm.prompt_budget_snapshot(&bucket, limit).await;
+            let retry_after_seconds = if let Some(s) = state.config.tpm.retry_after_seconds {
+                s
+            } else {
+                state.tpm.prompt_budget_retry_after_seconds(&bucket).await
+            };
             return Err(ProxyError::RateLimited {
                 limit,
                 estimate: est,
                 used,
                 remaining,
+                retry_after_seconds,
             });
         }
     }
@@ -942,11 +949,14 @@ fn proxy_error_response(e: ProxyError) -> Response<BoxBody> {
             estimate,
             used,
             remaining,
+            retry_after_seconds,
         } => {
             eprintln!("rate limited: used={used} est={estimate} limit={limit}");
             let mut resp = text_response(StatusCode::TOO_MANY_REQUESTS, "too many requests: token budget exceeded");
             let h = resp.headers_mut();
-            h.insert(HeaderName::from_static("retry-after"), HeaderValue::from_static("60"));
+            if let Ok(v) = HeaderValue::from_str(&retry_after_seconds.to_string()) {
+                h.insert(HeaderName::from_static("retry-after"), v);
+            }
             if let Ok(v) = HeaderValue::from_str(&limit.to_string()) {
                 h.insert(HeaderName::from_static("x-panda-budget-limit"), v);
             }
@@ -1170,9 +1180,10 @@ mod tests {
             estimate: 20,
             used: 90,
             remaining: 10,
+            retry_after_seconds: 17,
         });
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(resp.headers().get("retry-after").and_then(|v| v.to_str().ok()), Some("60"));
+        assert_eq!(resp.headers().get("retry-after").and_then(|v| v.to_str().ok()), Some("17"));
         assert_eq!(resp.headers().get("x-panda-budget-limit").and_then(|v| v.to_str().ok()), Some("100"));
     }
 
