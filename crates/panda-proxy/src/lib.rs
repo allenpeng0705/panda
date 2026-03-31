@@ -289,6 +289,10 @@ struct JwtClaims {
     #[allow(dead_code)]
     sub: Option<String>,
     #[allow(dead_code)]
+    iss: Option<String>,
+    #[allow(dead_code)]
+    aud: Option<serde_json::Value>,
+    #[allow(dead_code)]
     exp: usize,
 }
 
@@ -508,6 +512,12 @@ fn validate_bearer_jwt(headers: &HeaderMap, cfg: &PandaConfig) -> Result<(), &'s
         .map_err(|_| "unauthorized: jwt secret not configured")?;
     let mut validation = Validation::new(Algorithm::HS256);
     validation.validate_exp = true;
+    if !cfg.identity.accepted_issuers.is_empty() {
+        validation.set_issuer(&cfg.identity.accepted_issuers);
+    }
+    if !cfg.identity.accepted_audiences.is_empty() {
+        validation.set_audience(&cfg.identity.accepted_audiences);
+    }
     if decode::<JwtClaims>(token, &DecodingKey::from_secret(secret.as_bytes()), &validation).is_err() {
         return Err("unauthorized: invalid bearer token");
     }
@@ -1007,6 +1017,8 @@ mod tests {
             identity: panda_config::IdentityConfig {
                 require_jwt: true,
                 jwt_hs256_secret_env: "PANDA_TEST_JWT_SECRET".to_string(),
+                accepted_issuers: vec![],
+                accepted_audiences: vec![],
             },
         };
         let headers = HeaderMap::new();
@@ -1019,6 +1031,8 @@ mod tests {
         #[derive(serde::Serialize)]
         struct Claims {
             sub: &'static str,
+            iss: &'static str,
+            aud: &'static str,
             exp: usize,
         }
         let secret_env = "PANDA_TEST_JWT_SECRET_VALID";
@@ -1032,7 +1046,12 @@ mod tests {
             .as_secs() as usize;
         let token = encode(
             &Header::default(),
-            &Claims { sub: "u1", exp },
+            &Claims {
+                sub: "u1",
+                iss: "https://issuer.example",
+                aud: "panda-gateway",
+                exp,
+            },
             &EncodingKey::from_secret("test-secret".as_bytes()),
         )
         .unwrap();
@@ -1053,6 +1072,8 @@ mod tests {
             identity: panda_config::IdentityConfig {
                 require_jwt: true,
                 jwt_hs256_secret_env: secret_env.to_string(),
+                accepted_issuers: vec!["https://issuer.example".to_string()],
+                accepted_audiences: vec!["panda-gateway".to_string()],
             },
         };
 

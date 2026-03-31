@@ -144,6 +144,12 @@ pub struct IdentityConfig {
     /// Env var name containing HS256 secret (default: PANDA_JWT_HS256_SECRET).
     #[serde(default = "default_jwt_hs256_secret_env")]
     pub jwt_hs256_secret_env: String,
+    /// Expected issuer (`iss`) values. Empty means issuer is not checked.
+    #[serde(default)]
+    pub accepted_issuers: Vec<String>,
+    /// Expected audience (`aud`) values. Empty means audience is not checked.
+    #[serde(default)]
+    pub accepted_audiences: Vec<String>,
 }
 
 fn default_jwt_hs256_secret_env() -> String {
@@ -252,6 +258,22 @@ impl PandaConfig {
         if self.identity.require_jwt && self.identity.jwt_hs256_secret_env.trim().is_empty() {
             anyhow::bail!("identity.jwt_hs256_secret_env must be non-empty when require_jwt=true");
         }
+        if self
+            .identity
+            .accepted_issuers
+            .iter()
+            .any(|v| v.trim().is_empty())
+        {
+            anyhow::bail!("identity.accepted_issuers entries must be non-empty");
+        }
+        if self
+            .identity
+            .accepted_audiences
+            .iter()
+            .any(|v| v.trim().is_empty())
+        {
+            anyhow::bail!("identity.accepted_audiences entries must be non-empty");
+        }
         Ok(())
     }
 
@@ -313,5 +335,7 @@ mod tests {
         assert!(cfg.plugins.reload_debounce_ms > 0);
         assert!(cfg.plugins.max_reloads_per_minute > 0);
         assert!(!cfg.identity.require_jwt);
+        assert!(cfg.identity.accepted_issuers.is_empty());
+        assert!(cfg.identity.accepted_audiences.is_empty());
     }
 }

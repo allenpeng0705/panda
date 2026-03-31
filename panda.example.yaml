@@ -55,3 +55,5 @@ upstream: "http://127.0.0.1:11434"
 # identity:
 #   require_jwt: true
 #   jwt_hs256_secret_env: "PANDA_JWT_HS256_SECRET"
+#   accepted_issuers: ["https://issuer.example"]
+#   accepted_audiences: ["panda-gateway"]
