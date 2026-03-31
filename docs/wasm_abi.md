@@ -48,12 +48,22 @@ Host behavior:
 - `plugins.fail_closed = false`
   - host logs and continues request path (fail-open)
 
+Runtime failure reasons are classified into structured buckets for logs/metrics:
+
+- `Trap`
+- `MemoryViolation`
+- `InvalidInput`
+- `HostCallFailure`
+- `Internal`
+
 ## Safety Limits
 
 - `plugins.execution_timeout_ms`: best-effort timeout per hook call.
 - `plugins.max_request_body_bytes`:
   - body hook only runs when request `Content-Length` is present and <= this value
   - body replacement from plugins must also be <= this value
+- `plugins.hot_reload`: if enabled, Panda polls plugin directory and atomically swaps in a newly loaded runtime when files change.
+- `plugins.reload_interval_ms`: poll interval used by hot-reload scans.
 
 ## Memory Rules
 

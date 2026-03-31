@@ -86,6 +86,18 @@ pub struct PluginsConfig {
     /// If true, plugin failures reject request path; if false, fail open and continue.
     #[serde(default)]
     pub fail_closed: bool,
+    /// If true, watch plugin directory and hot-swap runtime on changes.
+    #[serde(default)]
+    pub hot_reload: bool,
+    /// Poll interval for hot-reload scans (milliseconds).
+    #[serde(default = "default_wasm_reload_interval_ms")]
+    pub reload_interval_ms: u64,
+    /// Debounce window for filesystem change storms (milliseconds).
+    #[serde(default = "default_wasm_reload_debounce_ms")]
+    pub reload_debounce_ms: u64,
+    /// Max successful hot reloads allowed per rolling minute.
+    #[serde(default = "default_wasm_max_reloads_per_minute")]
+    pub max_reloads_per_minute: u64,
 }
 
 fn default_wasm_max_request_body_bytes() -> usize {
@@ -96,6 +108,18 @@ fn default_wasm_execution_timeout_ms() -> u64 {
     25
 }
 
+fn default_wasm_reload_interval_ms() -> u64 {
+    2000
+}
+
+fn default_wasm_reload_debounce_ms() -> u64 {
+    500
+}
+
+fn default_wasm_max_reloads_per_minute() -> u64 {
+    30
+}
+
 impl Default for PluginsConfig {
     fn default() -> Self {
         Self {
@@ -103,8 +127,27 @@ impl Default for PluginsConfig {
             max_request_body_bytes: default_wasm_max_request_body_bytes(),
             execution_timeout_ms: default_wasm_execution_timeout_ms(),
             fail_closed: false,
+            hot_reload: false,
+            reload_interval_ms: default_wasm_reload_interval_ms(),
+            reload_debounce_ms: default_wasm_reload_debounce_ms(),
+            max_reloads_per_minute: default_wasm_max_reloads_per_minute(),
         }
     }
+}
+
+/// Optional identity controls for Phase 3 entry.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct IdentityConfig {
+    /// If true, require a bearer JWT on proxied requests.
+    #[serde(default)]
+    pub require_jwt: bool,
+    /// Env var name containing HS256 secret (default: PANDA_JWT_HS256_SECRET).
+    #[serde(default = "default_jwt_hs256_secret_env")]
+    pub jwt_hs256_secret_env: String,
+}
+
+fn default_jwt_hs256_secret_env() -> String {
+    "PANDA_JWT_HS256_SECRET".to_string()
 }
 
 /// Terminate TLS on the **same** `listen` socket (HTTP disabled for that process).
@@ -132,6 +175,8 @@ pub struct PandaConfig {
     pub tls: Option<TlsListenConfig>,
     #[serde(default)]
     pub plugins: PluginsConfig,
+    #[serde(default)]
+    pub identity: IdentityConfig,
 }
 
 impl PandaConfig {
@@ -195,6 +240,18 @@ impl PandaConfig {
         if self.plugins.execution_timeout_ms == 0 {
             anyhow::bail!("plugins.execution_timeout_ms must be > 0");
         }
+        if self.plugins.reload_interval_ms == 0 {
+            anyhow::bail!("plugins.reload_interval_ms must be > 0");
+        }
+        if self.plugins.reload_debounce_ms == 0 {
+            anyhow::bail!("plugins.reload_debounce_ms must be > 0");
+        }
+        if self.plugins.max_reloads_per_minute == 0 {
+            anyhow::bail!("plugins.max_reloads_per_minute must be > 0");
+        }
+        if self.identity.require_jwt && self.identity.jwt_hs256_secret_env.trim().is_empty() {
+            anyhow::bail!("identity.jwt_hs256_secret_env must be non-empty when require_jwt=true");
+        }
         Ok(())
     }
 
@@ -251,5 +308,10 @@ mod tests {
         assert!(cfg.plugins.max_request_body_bytes > 0);
         assert!(cfg.plugins.execution_timeout_ms > 0);
         assert!(!cfg.plugins.fail_closed);
+        assert!(!cfg.plugins.hot_reload);
+        assert!(cfg.plugins.reload_interval_ms > 0);
+        assert!(cfg.plugins.reload_debounce_ms > 0);
+        assert!(cfg.plugins.max_reloads_per_minute > 0);
+        assert!(!cfg.identity.require_jwt);
     }
 }

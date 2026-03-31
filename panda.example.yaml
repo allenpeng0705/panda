@@ -36,8 +36,13 @@ upstream: "http://127.0.0.1:11434"
 #   max_request_body_bytes: 262144
 #   # Best-effort timeout per Wasm hook call; fail behavior controlled by fail_closed.
 #   execution_timeout_ms: 25
-#   # false => fail open (log + continue), true => fail closed (return bad gateway).
+#   # false => fail open (log + continue), true => fail closed (403 for policy reject, 502 for runtime).
 #   fail_closed: false
+#   # Optional hot-reload of plugin directory contents.
+#   hot_reload: false
+#   reload_interval_ms: 2000
+#   reload_debounce_ms: 500
+#   max_reloads_per_minute: 30
 #
 # Wasm plugin return-code semantics (from `panda_on_request*` exports):
 #   0 => allow
@@ -45,3 +50,8 @@ upstream: "http://127.0.0.1:11434"
 #   2 => reject (malformed request) -> HTTP 403 when fail_closed=true
 #   n => reject (plugin-specific)   -> HTTP 403 when fail_closed=true
 # Runtime/trap/timeout/join failures map to HTTP 502 when fail_closed=true.
+
+# Optional: Phase 3 entry point (JWT bearer required before proxy forwarding).
+# identity:
+#   require_jwt: true
+#   jwt_hs256_secret_env: "PANDA_JWT_HS256_SECRET"

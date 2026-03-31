@@ -102,10 +102,12 @@ This plan matches the **Kong-style lesson** you care about: a **thin, native dat
   - runtime/trap/timeout/join failures -> **HTTP 502** when `plugins.fail_closed=true`
   - fail-open mode (`plugins.fail_closed=false`) logs and continues
 - **Return-code contract (v0):** `0=allow`, `1=policy denied`, `2=malformed request`, other non-zero values are plugin-specific rejects.
+- **Hot reload (implemented):** optional `plugins.hot_reload` with interval `plugins.reload_interval_ms`; runtime swaps atomically on directory fingerprint changes and keeps serving with last-good runtime when reload fails.
+- **Observability counters (implemented):** in-process per-plugin/per-hook counters for allow/reject/runtime/timeout outcomes.
 
 ### Refine
 
-- **Hot reload:** detect `.wasm` changes on disk and swap modules **without** a full process restart (with explicit grace period / in-flight drain rules).
+- Add metric export surface (Prometheus / OTel) for plugin counters and reason codes.
 
 ---
 

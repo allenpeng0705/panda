@@ -52,7 +52,20 @@ impl PolicyCode {
 #[derive(Debug)]
 pub enum HookFailure {
     PolicyReject { plugin: String, code: PolicyCode },
-    Runtime(anyhow::Error),
+    Runtime {
+        plugin: String,
+        reason: RuntimeReason,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeReason {
+    Trap,
+    MemoryViolation,
+    InvalidInput,
+    HostCallFailure,
+    Internal,
 }
 
 impl std::fmt::Display for HookFailure {
@@ -61,12 +74,33 @@ impl std::fmt::Display for HookFailure {
             Self::PolicyReject { plugin, code } => {
                 write!(f, "plugin {plugin} rejected request code={code:?}")
             }
-            Self::Runtime(e) => write!(f, "{e:#}"),
+            Self::Runtime {
+                plugin,
+                reason,
+                message,
+            } => write!(f, "plugin {plugin} runtime failure reason={reason:?}: {message}"),
         }
     }
 }
 
 impl std::error::Error for HookFailure {}
+
+fn classify_runtime_reason(msg: &str) -> RuntimeReason {
+    let m = msg.to_ascii_lowercase();
+    if m.contains("trap") {
+        return RuntimeReason::Trap;
+    }
+    if m.contains("out of bounds") || m.contains("negative ptr/len") || m.contains("overflow") {
+        return RuntimeReason::MemoryViolation;
+    }
+    if m.contains("utf-8") || m.contains("invalid header") {
+        return RuntimeReason::InvalidInput;
+    }
+    if m.contains("host") || m.contains("panda_set_") {
+        return RuntimeReason::HostCallFailure;
+    }
+    RuntimeReason::Internal
+}
 
 #[derive(Default)]
 struct HostState {
@@ -284,6 +318,10 @@ impl PluginRuntime {
         self.plugins.len()
     }
 
+    pub fn plugin_names(&self) -> Vec<String> {
+        self.plugins.iter().map(|p| p.name.clone()).collect()
+    }
+
     pub fn apply_request_plugins_strict(&self, headers: &mut HeaderMap) -> Result<usize, HookFailure> {
         let mut total = 0usize;
         for p in &self.plugins {
@@ -293,10 +331,14 @@ impl PluginRuntime {
                         plugin: p.name.clone(),
                         code,
                     },
-                    HookCallError::Runtime(e) => HookFailure::Runtime(anyhow::anyhow!(
-                        "plugin {} request hook failed: {e:#}",
-                        p.name
-                    )),
+                    HookCallError::Runtime(e) => {
+                        let message = format!("plugin {} request hook failed: {e:#}", p.name);
+                        HookFailure::Runtime {
+                            plugin: p.name.clone(),
+                            reason: classify_runtime_reason(&message),
+                            message,
+                        }
+                    }
                 }
             })?;
             total += n;
@@ -315,12 +357,15 @@ impl PluginRuntime {
             match p.apply_request_body(input) {
                 Ok(Some(next)) => {
                     if next.len() > max_output_bytes {
-                        return Err(HookFailure::Runtime(anyhow::anyhow!(
+                        let message = format!(
                             "plugin {} body hook output too large: {} > {}",
-                            p.name,
-                            next.len(),
-                            max_output_bytes
-                        )));
+                            p.name, next.len(), max_output_bytes
+                        );
+                        return Err(HookFailure::Runtime {
+                            plugin: p.name.clone(),
+                            reason: RuntimeReason::InvalidInput,
+                            message,
+                        });
                     }
                     current = Some(next);
                 }
@@ -331,10 +376,14 @@ impl PluginRuntime {
                             plugin: p.name.clone(),
                             code,
                         },
-                        HookCallError::Runtime(e) => HookFailure::Runtime(anyhow::anyhow!(
-                            "plugin {} body hook failed: {e:#}",
-                            p.name
-                        )),
+                        HookCallError::Runtime(e) => {
+                            let message = format!("plugin {} body hook failed: {e:#}", p.name);
+                            HookFailure::Runtime {
+                                plugin: p.name.clone(),
+                                reason: classify_runtime_reason(&message),
+                                message,
+                            }
+                        }
                     });
                 }
             }
@@ -550,7 +599,43 @@ mod tests {
         let err = runtime.apply_request_plugins_strict(&mut headers).unwrap_err();
         match err {
             HookFailure::PolicyReject { code, .. } => assert_eq!(code, PolicyCode::MalformedRequest),
-            HookFailure::Runtime(e) => panic!("unexpected runtime error: {e:#}"),
+            HookFailure::Runtime { message, .. } => panic!("unexpected runtime error: {message}"),
         }
+    }
+
+    #[test]
+    fn missing_abi_export_fails_load() {
+        let wasm = wat::parse_str(
+            r#"(module
+                (memory (export "memory") 1)
+                (func (export "panda_on_request") (result i32) i32.const 0)
+            )"#,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("bad.wasm"), wasm).unwrap();
+        let engine = Engine::default();
+        let err = PluginRuntime::load_from_directory(&engine, dir.path())
+            .err()
+            .expect("missing abi should fail");
+        assert!(err.to_string().contains("missing export panda_abi_version"));
+    }
+
+    #[test]
+    fn abi_mismatch_fails_load() {
+        let wasm = wat::parse_str(
+            r#"(module
+                (memory (export "memory") 1)
+                (func (export "panda_abi_version") (result i32) i32.const 99)
+            )"#,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mismatch.wasm"), wasm).unwrap();
+        let engine = Engine::default();
+        let err = PluginRuntime::load_from_directory(&engine, dir.path())
+            .err()
+            .expect("abi mismatch should fail");
+        assert!(err.to_string().contains("ABI mismatch"));
     }
 }

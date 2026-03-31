@@ -36,3 +36,9 @@ plugins:
 
 - Depending on TinyGo target/toolchain version, you may need to tune build flags to avoid unsupported imports.
 - This sample is a skeleton for ABI parity and rollout testing.
+
+## Validation Script
+
+Use the repository script for a reproducible build + validation pass:
+
+`./scripts/validate_tinygo_plugin.sh`

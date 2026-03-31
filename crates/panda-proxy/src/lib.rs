@@ -11,8 +11,10 @@ mod upstream;
 pub use gateway::RequestContext;
 
 use std::convert::Infallible;
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http_body_util::BodyExt;
@@ -26,9 +28,12 @@ use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use panda_config::PandaConfig;
-use panda_wasm::{HookFailure, PluginRuntime};
+use panda_wasm::{HookFailure, PluginRuntime, RuntimeReason};
+use serde::Deserialize;
 use tokio::net::TcpListener;
+use tokio::sync::RwLock;
 use tokio_rustls::TlsAcceptor;
 use tpm::TpmCounters;
 
@@ -41,9 +46,250 @@ pub struct ProxyState {
     pub client: HttpClient,
     pub tpm: Arc<TpmCounters>,
     pub bpe: Option<Arc<tiktoken_rs::CoreBPE>>,
-    /// Loaded when `plugins.directory` is set; reserved for per-request Wasm hooks.
+    /// Hot-swappable plugin runtime and metrics.
+    plugins: Option<Arc<PluginManager>>,
+}
+
+#[derive(Default)]
+struct PluginMetrics {
+    counts: std::sync::Mutex<HashMap<String, u64>>,
+}
+
+impl PluginMetrics {
+    fn inc(&self, key: String) {
+        if let Ok(mut g) = self.counts.lock() {
+            let n = g.entry(key).or_insert(0);
+            *n += 1;
+        }
+    }
+
+    fn snapshot(&self) -> Vec<(String, u64)> {
+        self.counts
+            .lock()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Default)]
+struct ReloadState {
+    last_success_epoch_ms: Option<u128>,
+    last_error: Option<String>,
+    reload_count: u64,
+    skipped_debounce: u64,
+    skipped_rate_limit: u64,
+    reload_timestamps: VecDeque<SystemTime>,
+}
+
+struct PluginManager {
+    dir: PathBuf,
+    runtime: RwLock<Arc<PluginRuntime>>,
+    fingerprint: std::sync::Mutex<u64>,
+    metrics: PluginMetrics,
+    reload_interval: Duration,
+    reload_debounce: Duration,
+    max_reloads_per_minute: usize,
+    last_change_seen: std::sync::Mutex<Option<SystemTime>>,
+    reload_state: std::sync::Mutex<ReloadState>,
+}
+
+impl PluginManager {
+    fn new(
+        dir: PathBuf,
+        runtime: Arc<PluginRuntime>,
+        reload_interval: Duration,
+        reload_debounce: Duration,
+        max_reloads_per_minute: usize,
+    ) -> anyhow::Result<Self> {
+        let fp = dir_fingerprint(&dir)?;
+        Ok(Self {
+            dir,
+            runtime: RwLock::new(runtime),
+            fingerprint: std::sync::Mutex::new(fp),
+            metrics: PluginMetrics::default(),
+            reload_interval,
+            reload_debounce,
+            max_reloads_per_minute,
+            last_change_seen: std::sync::Mutex::new(None),
+            reload_state: std::sync::Mutex::new(ReloadState::default()),
+        })
+    }
+
+    async fn runtime_snapshot(&self) -> Arc<PluginRuntime> {
+        let g = self.runtime.read().await;
+        Arc::clone(&*g)
+    }
+
+    fn spawn_hot_reload(self: &Arc<Self>) {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(this.reload_interval).await;
+                if let Err(e) = this.reload_if_changed().await {
+                    eprintln!("panda: wasm hot-reload scan failed: {e:#}");
+                }
+            }
+        });
+    }
+
+    async fn reload_if_changed(&self) -> anyhow::Result<()> {
+        let now = dir_fingerprint(&self.dir)?;
+        let current_fp = *self
+            .fingerprint
+            .lock()
+            .map_err(|e| anyhow::anyhow!("plugin fingerprint lock: {e}"))?;
+        if current_fp == now {
+            return Ok(());
+        }
+        let now_time = SystemTime::now();
+        {
+            let mut last = self
+                .last_change_seen
+                .lock()
+                .map_err(|e| anyhow::anyhow!("plugin last_change lock: {e}"))?;
+            if let Some(prev) = *last {
+                if now_time
+                    .duration_since(prev)
+                    .unwrap_or_else(|_| Duration::from_secs(0))
+                    < self.reload_debounce
+                {
+                    if let Ok(mut rs) = self.reload_state.lock() {
+                        rs.skipped_debounce += 1;
+                    }
+                    return Ok(());
+                }
+            }
+            *last = Some(now_time);
+        }
+        {
+            let mut rs = self
+                .reload_state
+                .lock()
+                .map_err(|e| anyhow::anyhow!("plugin reload_state lock: {e}"))?;
+            while let Some(front) = rs.reload_timestamps.front() {
+                if now_time
+                    .duration_since(*front)
+                    .unwrap_or_else(|_| Duration::from_secs(0))
+                    > Duration::from_secs(60)
+                {
+                    rs.reload_timestamps.pop_front();
+                } else {
+                    break;
+                }
+            }
+            if rs.reload_timestamps.len() >= self.max_reloads_per_minute {
+                rs.skipped_rate_limit += 1;
+                rs.last_error = Some("reload throttled: max_reloads_per_minute".to_string());
+                return Ok(());
+            }
+        }
+        let next = PluginRuntime::load_optional(Some(self.dir.as_path()))?
+            .ok_or_else(|| anyhow::anyhow!("plugins directory unexpectedly missing"))?;
+        let next = Arc::new(next);
+        {
+            let mut w = self.runtime.write().await;
+            *w = Arc::clone(&next);
+        }
+        *self
+            .fingerprint
+            .lock()
+            .map_err(|e| anyhow::anyhow!("plugin fingerprint lock: {e}"))? = now;
+        if let Ok(mut rs) = self.reload_state.lock() {
+            rs.reload_count += 1;
+            rs.last_error = None;
+            rs.last_success_epoch_ms = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_millis());
+            rs.reload_timestamps.push_back(now_time);
+        }
+        eprintln!("panda: wasm runtime hot-reloaded (plugins={})", next.plugin_count());
+        Ok(())
+    }
+
+    fn record_allow_all(&self, runtime: &PluginRuntime, hook: &str) {
+        for name in runtime.plugin_names() {
+            self.metrics.inc(format!("{name}|{hook}|allow"));
+        }
+    }
+
+    fn record_policy_reject(&self, plugin: &str, code: &str, hook: &str) {
+        self.metrics.inc(format!("{plugin}|{hook}|reject|{code}"));
+    }
+
+    fn record_runtime(&self, plugin: &str, reason: RuntimeReason, hook: &str) {
+        self.metrics
+            .inc(format!("{plugin}|{hook}|runtime|{reason:?}"));
+    }
+
+    fn record_timeout(&self, hook: &str) {
+        self.metrics.inc(format!("_all|{hook}|timeout"));
+    }
+
+    fn metrics_prometheus_text(&self) -> String {
+        let mut lines = Vec::new();
+        lines.push("# HELP panda_plugin_events_total Plugin hook events by plugin/hook/outcome".to_string());
+        lines.push("# TYPE panda_plugin_events_total counter".to_string());
+        for (k, v) in self.metrics.snapshot() {
+            let parts: Vec<&str> = k.split('|').collect();
+            let plugin = parts.first().copied().unwrap_or("_all");
+            let hook = parts.get(1).copied().unwrap_or("unknown");
+            let outcome = parts.get(2).copied().unwrap_or("unknown");
+            let detail = parts.get(3).copied().unwrap_or("");
+            lines.push(format!(
+                "panda_plugin_events_total{{plugin=\"{}\",hook=\"{}\",outcome=\"{}\",detail=\"{}\"}} {}",
+                plugin, hook, outcome, detail, v
+            ));
+        }
+        if let Ok(rs) = self.reload_state.lock() {
+            lines.push("# HELP panda_plugin_reload_total Successful runtime hot-reloads".to_string());
+            lines.push("# TYPE panda_plugin_reload_total counter".to_string());
+            lines.push(format!("panda_plugin_reload_total {}", rs.reload_count));
+            lines.push("# HELP panda_plugin_reload_skipped_total Skipped reload scans".to_string());
+            lines.push("# TYPE panda_plugin_reload_skipped_total counter".to_string());
+            lines.push(format!(
+                "panda_plugin_reload_skipped_total{{reason=\"debounce\"}} {}",
+                rs.skipped_debounce
+            ));
+            lines.push(format!(
+                "panda_plugin_reload_skipped_total{{reason=\"rate_limit\"}} {}",
+                rs.skipped_rate_limit
+            ));
+        }
+        lines.join("\n")
+    }
+
+    fn status_json(&self) -> serde_json::Value {
+        let (reload_count, skipped_debounce, skipped_rate_limit, last_success_epoch_ms, last_error) =
+            self.reload_state
+                .lock()
+                .map(|r| {
+                    (
+                        r.reload_count,
+                        r.skipped_debounce,
+                        r.skipped_rate_limit,
+                        r.last_success_epoch_ms,
+                        r.last_error.clone(),
+                    )
+                })
+                .unwrap_or((0, 0, 0, None, Some("reload_state_lock_error".to_string())));
+        serde_json::json!({
+            "directory": self.dir.display().to_string(),
+            "reload_count": reload_count,
+            "skipped_debounce": skipped_debounce,
+            "skipped_rate_limit": skipped_rate_limit,
+            "last_success_epoch_ms": last_success_epoch_ms,
+            "last_error": last_error,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct JwtClaims {
     #[allow(dead_code)]
-    pub plugins: Option<Arc<PluginRuntime>>,
+    sub: Option<String>,
+    #[allow(dead_code)]
+    exp: usize,
 }
 
 /// Run until SIGINT (Ctrl+C). Binds per `config.listen` (HTTPS if `config.tls` is set).
@@ -61,17 +307,41 @@ pub async fn run(config: Arc<PandaConfig>) -> anyhow::Result<()> {
     let plugins = PluginRuntime::load_optional(
         config.plugins.directory.as_deref().map(std::path::Path::new),
     )?;
-    if let Some(ref p) = plugins {
+    let plugins = if let Some(p) = plugins {
         p.smoke_test();
         eprintln!("panda: wasm plugins loaded: {}", p.plugin_count());
-    }
+        let dir = PathBuf::from(
+            config
+                .plugins
+                .directory
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("plugins.directory missing"))?,
+        );
+        let mgr = Arc::new(PluginManager::new(
+            dir,
+            Arc::new(p),
+            Duration::from_millis(config.plugins.reload_interval_ms),
+            Duration::from_millis(config.plugins.reload_debounce_ms),
+            config.plugins.max_reloads_per_minute as usize,
+        )?);
+        if config.plugins.hot_reload {
+            mgr.spawn_hot_reload();
+            eprintln!(
+                "panda: wasm hot-reload enabled interval_ms={}",
+                config.plugins.reload_interval_ms
+            );
+        }
+        Some(mgr)
+    } else {
+        None
+    };
 
     let state = Arc::new(ProxyState {
         config: Arc::clone(&config),
         client,
         tpm,
         bpe,
-        plugins: plugins.map(Arc::new),
+        plugins,
     });
 
     if let Some(ref tls_cfg) = config.tls {
@@ -184,11 +454,64 @@ async fn dispatch(req: Request<Incoming>, state: Arc<ProxyState>) -> Result<Resp
     if method == hyper::Method::GET && path == "/ready" {
         return Ok(text_response(StatusCode::OK, "ready"));
     }
+    if method == hyper::Method::GET && path == "/metrics" {
+        let body = state
+            .plugins
+            .as_ref()
+            .map(|p| p.metrics_prometheus_text())
+            .unwrap_or_else(|| "# panda plugins disabled\n".to_string());
+        return Ok(text_with_content_type(
+            StatusCode::OK,
+            body,
+            "text/plain; version=0.0.4; charset=utf-8",
+        ));
+    }
+    if method == hyper::Method::GET && path == "/plugins/status" {
+        let json = state
+            .plugins
+            .as_ref()
+            .map(|p| p.status_json())
+            .unwrap_or_else(|| serde_json::json!({"plugins_enabled": false}));
+        return Ok(json_response(StatusCode::OK, json));
+    }
+
+    if let Err(resp) = enforce_jwt_if_required(&req, &state.config) {
+        return Ok(resp);
+    }
 
     match forward_to_upstream(req, state.as_ref()).await {
         Ok(resp) => Ok(resp),
         Err(e) => Ok(proxy_error_response(e)),
     }
+}
+
+fn enforce_jwt_if_required(req: &Request<Incoming>, cfg: &PandaConfig) -> Result<(), Response<BoxBody>> {
+    if !cfg.identity.require_jwt {
+        return Ok(());
+    }
+    if let Err(msg) = validate_bearer_jwt(req.headers(), cfg) {
+        return Err(text_response(StatusCode::UNAUTHORIZED, msg));
+    }
+    Ok(())
+}
+
+fn validate_bearer_jwt(headers: &HeaderMap, cfg: &PandaConfig) -> Result<(), &'static str> {
+    let auth = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    let token = auth
+        .strip_prefix("Bearer ")
+        .filter(|t| !t.trim().is_empty())
+        .ok_or("unauthorized: missing bearer token")?;
+    let secret = std::env::var(&cfg.identity.jwt_hs256_secret_env)
+        .map_err(|_| "unauthorized: jwt secret not configured")?;
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.validate_exp = true;
+    if decode::<JwtClaims>(token, &DecodingKey::from_secret(secret.as_bytes()), &validation).is_err() {
+        return Err("unauthorized: invalid bearer token");
+    }
+    Ok(())
 }
 
 enum ProxyError {
@@ -235,8 +558,9 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
     let mut headers = HeaderMap::new();
     upstream::filter_request_headers(&parts.headers, &mut headers);
     if let Some(ref plugins) = state.plugins {
+        let runtime = plugins.runtime_snapshot().await;
         match apply_wasm_headers_with_timeout(
-            Arc::clone(plugins),
+            Arc::clone(&runtime),
             headers.clone(),
             state.config.plugins.execution_timeout_ms,
         )
@@ -244,11 +568,13 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
         {
             Ok((next_headers, applied)) => {
                 headers = next_headers;
+                plugins.record_allow_all(runtime.as_ref(), "headers");
                 if applied > 0 {
                     eprintln!("panda: wasm request headers applied: {applied}");
                 }
             }
             Err(e) => {
+                record_wasm_error_metrics(plugins, &e, "headers");
                 if state.config.plugins.fail_closed {
                     return Err(proxy_error_from_wasm(e));
                 }
@@ -278,6 +604,7 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
     parts.headers = headers;
 
     let boxed_req_body: BoxBody = if let Some(ref plugins) = state.plugins {
+        let runtime = plugins.runtime_snapshot().await;
         let content_len_ok = parts
             .headers
             .get(header::CONTENT_LENGTH)
@@ -291,15 +618,19 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
                 .map_err(|e| ProxyError::Upstream(anyhow::anyhow!("collect body: {e}")))?;
             let original = collected.to_bytes();
             let next = match apply_wasm_body_with_timeout(
-                Arc::clone(plugins),
+                Arc::clone(&runtime),
                 original.to_vec(),
                 state.config.plugins.max_request_body_bytes,
                 state.config.plugins.execution_timeout_ms,
             )
             .await
             {
-                Ok(b) => b,
+                Ok(b) => {
+                    plugins.record_allow_all(runtime.as_ref(), "body");
+                    b
+                }
                 Err(e) => {
+                    record_wasm_error_metrics(plugins, &e, "body");
                     if state.config.plugins.fail_closed {
                         return Err(proxy_error_from_wasm(e));
                     }
@@ -362,9 +693,24 @@ fn proxy_error_from_wasm(e: WasmCallError) -> ProxyError {
         WasmCallError::Hook(HookFailure::PolicyReject { plugin, code }) => {
             ProxyError::PolicyReject(format!("plugin={plugin} code={code:?}"))
         }
-        WasmCallError::Hook(HookFailure::Runtime(inner)) => ProxyError::Upstream(inner),
+        WasmCallError::Hook(HookFailure::Runtime { message, .. }) => {
+            ProxyError::Upstream(anyhow::anyhow!("{message}"))
+        }
         WasmCallError::Timeout(msg) => ProxyError::Upstream(anyhow::anyhow!("{msg}")),
         WasmCallError::Join(msg) => ProxyError::Upstream(anyhow::anyhow!("{msg}")),
+    }
+}
+
+fn record_wasm_error_metrics(manager: &PluginManager, e: &WasmCallError, hook: &str) {
+    match e {
+        WasmCallError::Hook(HookFailure::PolicyReject { plugin, code }) => {
+            manager.record_policy_reject(plugin, &format!("{code:?}"), hook);
+        }
+        WasmCallError::Hook(HookFailure::Runtime { plugin, reason, .. }) => {
+            manager.record_runtime(plugin, *reason, hook);
+        }
+        WasmCallError::Timeout(_) => manager.record_timeout(hook),
+        WasmCallError::Join(_) => manager.record_runtime("_all", RuntimeReason::Internal, hook),
     }
 }
 
@@ -420,6 +766,31 @@ enum WasmCallError {
     Join(String),
 }
 
+fn dir_fingerprint(dir: &Path) -> anyhow::Result<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for ent in std::fs::read_dir(dir)? {
+        let ent = ent?;
+        let path = ent.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("wasm") {
+            continue;
+        }
+        let md = ent.metadata()?;
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .hash(&mut hasher);
+        md.len().hash(&mut hasher);
+        if let Ok(m) = md.modified() {
+            if let Ok(d) = m.duration_since(std::time::UNIX_EPOCH) {
+                d.as_secs().hash(&mut hasher);
+                d.subsec_nanos().hash(&mut hasher);
+            }
+        }
+    }
+    Ok(hasher.finish())
+}
+
 fn log_request_context(ctx: &RequestContext) {
     if ctx.correlation_id.is_empty() {
         return;
@@ -435,6 +806,14 @@ fn log_request_context(ctx: &RequestContext) {
 }
 
 fn text_response(status: StatusCode, msg: &str) -> Response<BoxBody> {
+    text_with_content_type(
+        status,
+        msg.to_string(),
+        "text/plain; charset=utf-8",
+    )
+}
+
+fn text_with_content_type(status: StatusCode, msg: String, content_type: &'static str) -> Response<BoxBody> {
     let body = Full::new(bytes::Bytes::copy_from_slice(msg.as_bytes()))
         .map_err(|never: std::convert::Infallible| match never {})
         .boxed_unsync();
@@ -442,10 +821,15 @@ fn text_response(status: StatusCode, msg: &str) -> Response<BoxBody> {
         .status(status)
         .header(
             header::CONTENT_TYPE,
-            http::header::HeaderValue::from_static("text/plain; charset=utf-8"),
+            http::header::HeaderValue::from_static(content_type),
         )
         .body(body)
         .unwrap()
+}
+
+fn json_response(status: StatusCode, value: serde_json::Value) -> Response<BoxBody> {
+    let body = serde_json::to_string(&value).unwrap_or_else(|_| "{\"error\":\"serialization\"}".to_string());
+    text_with_content_type(status, body, "application/json; charset=utf-8")
 }
 
 #[cfg(test)]
@@ -453,10 +837,12 @@ mod tests {
     use super::*;
     use std::sync::Arc as StdArc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration as StdDuration, SystemTime as StdSystemTime, UNIX_EPOCH};
 
     use hyper::body::Incoming as HyperIncoming;
     use hyper::service::service_fn;
     use hyper::Request;
+    use jsonwebtoken::{EncodingKey, Header, encode};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -495,9 +881,11 @@ mod tests {
 
     #[test]
     fn runtime_failure_maps_to_502() {
-        let err = proxy_error_from_wasm(WasmCallError::Hook(HookFailure::Runtime(anyhow::anyhow!(
-            "boom"
-        ))));
+        let err = proxy_error_from_wasm(WasmCallError::Hook(HookFailure::Runtime {
+            plugin: "demo".to_string(),
+            reason: RuntimeReason::Internal,
+            message: "boom".to_string(),
+        }));
         let resp = proxy_error_response(err);
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
@@ -544,19 +932,36 @@ mod tests {
                 max_request_body_bytes: 262_144,
                 execution_timeout_ms: 50,
                 fail_closed: true,
+                hot_reload: false,
+                reload_interval_ms: 2_000,
+                reload_debounce_ms: 500,
+                max_reloads_per_minute: 30,
             },
+            identity: Default::default(),
         });
+
+        let runtime = PluginRuntime::load_optional(
+            cfg.plugins.directory.as_deref().map(std::path::Path::new),
+        )
+        .unwrap()
+        .map(Arc::new)
+        .unwrap();
 
         let state = Arc::new(ProxyState {
             config: Arc::clone(&cfg),
             client: build_http_client().unwrap(),
             tpm: Arc::new(TpmCounters::connect(None).await.unwrap()),
             bpe: None,
-            plugins: PluginRuntime::load_optional(
-                cfg.plugins.directory.as_deref().map(std::path::Path::new),
-            )
-            .unwrap()
-            .map(Arc::new),
+            plugins: Some(Arc::new(
+                PluginManager::new(
+                    PathBuf::from(cfg.plugins.directory.as_deref().unwrap()),
+                    runtime,
+                    Duration::from_millis(cfg.plugins.reload_interval_ms),
+                    Duration::from_millis(cfg.plugins.reload_debounce_ms),
+                    cfg.plugins.max_reloads_per_minute as usize,
+                )
+                .unwrap(),
+            )),
         });
         assert!(state.plugins.is_some());
         assert!(state.config.plugins.fail_closed);
@@ -587,5 +992,70 @@ mod tests {
         panda_task.await.unwrap();
         upstream_task.abort();
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn jwt_validation_rejects_missing_token() {
+        let cfg = PandaConfig {
+            listen: "127.0.0.1:0".to_string(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            trusted_gateway: Default::default(),
+            observability: Default::default(),
+            tpm: Default::default(),
+            tls: None,
+            plugins: Default::default(),
+            identity: panda_config::IdentityConfig {
+                require_jwt: true,
+                jwt_hs256_secret_env: "PANDA_TEST_JWT_SECRET".to_string(),
+            },
+        };
+        let headers = HeaderMap::new();
+        let err = validate_bearer_jwt(&headers, &cfg).unwrap_err();
+        assert!(err.contains("missing bearer token"));
+    }
+
+    #[test]
+    fn jwt_validation_accepts_valid_token() {
+        #[derive(serde::Serialize)]
+        struct Claims {
+            sub: &'static str,
+            exp: usize,
+        }
+        let secret_env = "PANDA_TEST_JWT_SECRET_VALID";
+        // SAFETY: test-only process env setup.
+        unsafe {
+            std::env::set_var(secret_env, "test-secret");
+        }
+        let exp = (StdSystemTime::now() + StdDuration::from_secs(300))
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as usize;
+        let token = encode(
+            &Header::default(),
+            &Claims { sub: "u1", exp },
+            &EncodingKey::from_secret("test-secret".as_bytes()),
+        )
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        let cfg = PandaConfig {
+            listen: "127.0.0.1:0".to_string(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            trusted_gateway: Default::default(),
+            observability: Default::default(),
+            tpm: Default::default(),
+            tls: None,
+            plugins: Default::default(),
+            identity: panda_config::IdentityConfig {
+                require_jwt: true,
+                jwt_hs256_secret_env: secret_env.to_string(),
+            },
+        };
+
+        assert!(validate_bearer_jwt(&headers, &cfg).is_ok());
     }
 }
