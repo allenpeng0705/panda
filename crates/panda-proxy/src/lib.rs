@@ -60,6 +60,7 @@ pub struct ProxyState {
 struct OpsMetrics {
     ops_auth_allowed_counts: std::sync::Mutex<HashMap<String, u64>>,
     ops_auth_denied_counts: std::sync::Mutex<HashMap<String, u64>>,
+    tpm_budget_rejected_counts: std::sync::Mutex<HashMap<String, u64>>,
 }
 
 impl OpsMetrics {
@@ -73,6 +74,13 @@ impl OpsMetrics {
     fn inc_ops_auth_denied(&self, endpoint: &str) {
         if let Ok(mut g) = self.ops_auth_denied_counts.lock() {
             let n = g.entry(endpoint.to_string()).or_insert(0);
+            *n += 1;
+        }
+    }
+
+    fn inc_tpm_budget_rejected(&self, bucket_class: &str) {
+        if let Ok(mut g) = self.tpm_budget_rejected_counts.lock() {
+            let n = g.entry(bucket_class.to_string()).or_insert(0);
             *n += 1;
         }
     }
@@ -119,6 +127,18 @@ impl OpsMetrics {
                 out.push_str(&format!(
                     "panda_ops_auth_deny_ratio{{endpoint=\"{}\"}} {:.6}\n",
                     endpoint, ratio
+                ));
+            }
+        }
+        out.push_str("# HELP panda_tpm_budget_rejected_total Count of requests rejected by TPM budget checks.\n");
+        out.push_str("# TYPE panda_tpm_budget_rejected_total counter\n");
+        if let Ok(g) = self.tpm_budget_rejected_counts.lock() {
+            let mut entries: Vec<(&String, &u64)> = g.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            for (bucket_class, count) in entries {
+                out.push_str(&format!(
+                    "panda_tpm_budget_rejected_total{{bucket_class=\"{}\"}} {}\n",
+                    bucket_class, count
                 ));
             }
         }
@@ -788,6 +808,15 @@ fn tpm_bucket_key(ctx: &RequestContext) -> String {
     }
 }
 
+fn tpm_bucket_class(ctx: &RequestContext) -> &'static str {
+    match (&ctx.subject, &ctx.tenant) {
+        (Some(_), Some(_)) => "subject_tenant",
+        (Some(_), None) => "subject",
+        (None, Some(_)) => "tenant",
+        (None, None) => "anonymous",
+    }
+}
+
 async fn tpm_status_json(state: &ProxyState, req_headers: &HeaderMap) -> serde_json::Value {
     let mut headers = req_headers.clone();
     let secret = gateway::trusted_gateway_secret_from_env();
@@ -936,6 +965,9 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
     if state.config.tpm.enforce_budget {
         let limit = state.config.tpm.budget_tokens_per_minute;
         if state.tpm.would_exceed_prompt_budget(&bucket, est, limit).await {
+            state
+                .ops_metrics
+                .inc_tpm_budget_rejected(tpm_bucket_class(&ctx));
             let (used, remaining) = state.tpm.prompt_budget_snapshot(&bucket, limit).await;
             let retry_after_seconds = if let Some(s) = state.config.tpm.retry_after_seconds {
                 s
@@ -1338,6 +1370,18 @@ mod tests {
     }
 
     #[test]
+    fn tpm_bucket_class_formats() {
+        let mut a = RequestContext::default();
+        assert_eq!(super::tpm_bucket_class(&a), "anonymous");
+        a.subject = Some("u1".into());
+        assert_eq!(super::tpm_bucket_class(&a), "subject");
+        a.tenant = Some("t9".into());
+        assert_eq!(super::tpm_bucket_class(&a), "subject_tenant");
+        a.subject = None;
+        assert_eq!(super::tpm_bucket_class(&a), "tenant");
+    }
+
+    #[test]
     fn policy_reject_maps_to_403() {
         let err = proxy_error_from_wasm(WasmCallError::Hook(HookFailure::PolicyReject {
             plugin: "demo".to_string(),
@@ -1409,12 +1453,15 @@ mod tests {
         m.inc_ops_auth_allowed("/metrics");
         m.inc_ops_auth_denied("/metrics");
         m.inc_ops_auth_denied("/tpm/status");
+        m.inc_tpm_budget_rejected("anonymous");
         let s = m.ops_auth_prometheus_text();
         assert!(s.contains("panda_ops_auth_allowed_total"));
         assert!(s.contains("panda_ops_auth_denied_total"));
         assert!(s.contains("panda_ops_auth_deny_ratio"));
+        assert!(s.contains("panda_tpm_budget_rejected_total"));
         assert!(s.contains("endpoint=\"/metrics\""));
         assert!(s.contains("endpoint=\"/tpm/status\""));
+        assert!(s.contains("bucket_class=\"anonymous\""));
     }
 
     #[tokio::test]

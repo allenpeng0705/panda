@@ -21,6 +21,8 @@ upstream: "http://127.0.0.1:11434"
 #   #   panda_ops_auth_allowed_total{endpoint="..."}
 #   #   panda_ops_auth_denied_total{endpoint="..."}
 #   #   panda_ops_auth_deny_ratio{endpoint="..."}
+#   # TPM rejection telemetry on /metrics:
+#   #   panda_tpm_budget_rejected_total{bucket_class="anonymous|subject|tenant|subject_tenant"}
 #   # Example alert ideas (PromQL):
 #   #   sum by (endpoint) (increase(panda_ops_auth_denied_total[5m])) > 20
 

@@ -62,6 +62,7 @@ This plan matches the **Kong-style lesson** you care about: a **thin, native dat
 - **Ops endpoint protection (starter):** optional shared-secret header guard for `/metrics`, `/plugins/status`, and `/tpm/status` using `observability.admin_auth_header` + `observability.admin_secret_env`.
 - **Ops audit logging (starter):** structured stderr access logs for ops endpoints with allow/deny outcome, endpoint, correlation id, and TPM bucket context (when applicable).
 - **Ops auth telemetry (starter):** `/metrics` exports `panda_ops_auth_allowed_total{endpoint="..."}`, `panda_ops_auth_denied_total{endpoint="..."}`, and `panda_ops_auth_deny_ratio{endpoint="..."}` for ops-endpoint anomaly detection.
+- **TPM rejection telemetry (starter):** `/metrics` exports `panda_tpm_budget_rejected_total{bucket_class="..."}` with low-cardinality bucket classes (`anonymous`, `subject`, `tenant`, `subject_tenant`).
 - **Ops alerting examples (starter):**
   - Denied spike per endpoint (5m): `sum by (endpoint) (increase(panda_ops_auth_denied_total[5m])) > 20`
   - High deny ratio with minimum traffic guard (10m): `(sum by (endpoint) (increase(panda_ops_auth_denied_total[10m])) / clamp_min(sum by (endpoint) (increase(panda_ops_auth_allowed_total[10m]) + increase(panda_ops_auth_denied_total[10m])), 1)) > 0.30 and sum by (endpoint) (increase(panda_ops_auth_allowed_total[10m]) + increase(panda_ops_auth_denied_total[10m])) > 50`
