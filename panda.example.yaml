@@ -26,6 +26,9 @@ upstream: "http://127.0.0.1:11434"
 #   budget_tokens_per_minute: 60000
 #   # Optional fixed Retry-After seconds for 429 (default: derived from current minute window).
 #   # retry_after_seconds: 30
+#
+# Observability: inspect the current request bucket budget snapshot.
+# curl -s http://127.0.0.1:8080/tpm/status
 
 # Optional: terminate TLS on `listen` (HTTP plaintext disabled). PEM paths must exist at validate time.
 # If client_ca_pem is set, mTLS is required.

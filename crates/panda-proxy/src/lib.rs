@@ -496,6 +496,10 @@ async fn dispatch(req: Request<Incoming>, state: Arc<ProxyState>) -> Result<Resp
             .unwrap_or_else(|| serde_json::json!({"plugins_enabled": false}));
         return Ok(json_response(StatusCode::OK, json));
     }
+    if method == hyper::Method::GET && path == "/tpm/status" {
+        let json = tpm_status_json(state.as_ref(), req.headers()).await;
+        return Ok(json_response(StatusCode::OK, json));
+    }
 
     if let Err(resp) = enforce_jwt_if_required(&req, &state.config) {
         return Ok(resp);
@@ -671,6 +675,34 @@ fn tpm_bucket_key(ctx: &RequestContext) -> String {
         (None, Some(t)) => format!("anonymous@tenant:{t}"),
         (None, None) => "anonymous".to_string(),
     }
+}
+
+async fn tpm_status_json(state: &ProxyState, req_headers: &HeaderMap) -> serde_json::Value {
+    let mut headers = req_headers.clone();
+    let secret = gateway::trusted_gateway_secret_from_env();
+    let ctx = gateway::apply_trusted_gateway(&mut headers, &state.config.trusted_gateway, secret.as_deref());
+    let bucket = tpm_bucket_key(&ctx);
+    if !state.config.tpm.enforce_budget {
+        return serde_json::json!({
+            "enforce_budget": false,
+            "bucket": bucket,
+        });
+    }
+    let limit = state.config.tpm.budget_tokens_per_minute;
+    let (used, remaining) = state.tpm.prompt_budget_snapshot(&bucket, limit).await;
+    let retry_after_seconds = state
+        .config
+        .tpm
+        .retry_after_seconds
+        .unwrap_or(state.tpm.prompt_budget_retry_after_seconds(&bucket).await);
+    serde_json::json!({
+        "enforce_budget": true,
+        "bucket": bucket,
+        "limit": limit,
+        "used": used,
+        "remaining": remaining,
+        "retry_after_seconds": retry_after_seconds,
+    })
 }
 
 fn is_sse(headers: &HeaderMap) -> bool {
@@ -1185,6 +1217,44 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(resp.headers().get("retry-after").and_then(|v| v.to_str().ok()), Some("17"));
         assert_eq!(resp.headers().get("x-panda-budget-limit").and_then(|v| v.to_str().ok()), Some("100"));
+    }
+
+    #[tokio::test]
+    async fn tpm_status_json_reports_budget_fields() {
+        let cfg = Arc::new(PandaConfig {
+            listen: "127.0.0.1:0".to_string(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            trusted_gateway: Default::default(),
+            observability: Default::default(),
+            tpm: panda_config::TpmConfig {
+                redis_url: None,
+                enforce_budget: true,
+                budget_tokens_per_minute: 100,
+                retry_after_seconds: Some(9),
+            },
+            tls: None,
+            plugins: Default::default(),
+            identity: Default::default(),
+            prompt_safety: Default::default(),
+            pii: Default::default(),
+        });
+        let tpm = Arc::new(TpmCounters::connect(None).await.unwrap());
+        tpm.add_prompt_tokens("anonymous", 30).await;
+        let state = ProxyState {
+            config: cfg,
+            client: build_http_client().unwrap(),
+            tpm,
+            bpe: None,
+            prompt_safety_matcher: None,
+            plugins: None,
+        };
+        let json = tpm_status_json(&state, &HeaderMap::new()).await;
+        assert_eq!(json.get("enforce_budget").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(json.get("bucket").and_then(|v| v.as_str()), Some("anonymous"));
+        assert_eq!(json.get("limit").and_then(|v| v.as_u64()), Some(100));
+        assert_eq!(json.get("used").and_then(|v| v.as_u64()), Some(30));
+        assert_eq!(json.get("remaining").and_then(|v| v.as_u64()), Some(70));
+        assert_eq!(json.get("retry_after_seconds").and_then(|v| v.as_u64()), Some(9));
     }
 
     #[tokio::test]
