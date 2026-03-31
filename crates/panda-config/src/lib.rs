@@ -153,6 +153,9 @@ pub struct IdentityConfig {
     /// Required scopes (all must be present). Empty means no scope check.
     #[serde(default)]
     pub required_scopes: Vec<String>,
+    /// Route-specific scope requirements (matched by path prefix).
+    #[serde(default)]
+    pub route_scope_rules: Vec<RouteScopeRule>,
     /// If true, mint a scoped agent token and forward in `x-panda-agent-token`.
     #[serde(default)]
     pub enable_token_exchange: bool,
@@ -167,6 +170,13 @@ pub struct IdentityConfig {
     pub agent_token_scopes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct RouteScopeRule {
+    pub path_prefix: String,
+    #[serde(default)]
+    pub required_scopes: Vec<String>,
+}
+
 impl Default for IdentityConfig {
     fn default() -> Self {
         Self {
@@ -175,6 +185,7 @@ impl Default for IdentityConfig {
             accepted_issuers: vec![],
             accepted_audiences: vec![],
             required_scopes: vec![],
+            route_scope_rules: vec![],
             enable_token_exchange: false,
             agent_token_secret_env: default_agent_token_secret_env(),
             agent_token_ttl_seconds: default_agent_token_ttl_seconds(),
@@ -334,6 +345,17 @@ impl PandaConfig {
         {
             anyhow::bail!("identity.required_scopes entries must be non-empty");
         }
+        for r in &self.identity.route_scope_rules {
+            if r.path_prefix.trim().is_empty() {
+                anyhow::bail!("identity.route_scope_rules.path_prefix must be non-empty");
+            }
+            if r.required_scopes.is_empty() {
+                anyhow::bail!("identity.route_scope_rules.required_scopes must not be empty");
+            }
+            if r.required_scopes.iter().any(|v| v.trim().is_empty()) {
+                anyhow::bail!("identity.route_scope_rules.required_scopes entries must be non-empty");
+            }
+        }
         if self.identity.enable_token_exchange {
             if !self.identity.require_jwt {
                 anyhow::bail!("identity.enable_token_exchange requires identity.require_jwt=true");
@@ -428,6 +450,7 @@ mod tests {
         assert!(cfg.identity.accepted_issuers.is_empty());
         assert!(cfg.identity.accepted_audiences.is_empty());
         assert!(cfg.identity.required_scopes.is_empty());
+        assert!(cfg.identity.route_scope_rules.is_empty());
         assert!(!cfg.identity.enable_token_exchange);
         assert_eq!(cfg.identity.agent_token_secret_env, "PANDA_AGENT_TOKEN_HS256_SECRET");
         assert_eq!(cfg.identity.agent_token_ttl_seconds, 300);

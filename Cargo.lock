@@ -1241,6 +1241,7 @@ dependencies = [
 name = "panda-proxy"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "bytes",
  "constant_time_eq",
