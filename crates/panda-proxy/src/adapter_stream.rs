@@ -10,8 +10,10 @@ use hyper::body::{Body, Frame, Incoming};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-pub struct AnthropicToOpenAiSseBody {
-    inner: Incoming,
+use crate::PandaBodyError;
+
+pub struct AnthropicToOpenAiSseBody<B = Incoming> {
+    inner: B,
     buf: BytesMut,
     pending: VecDeque<Bytes>,
     openai_id: String,
@@ -21,8 +23,8 @@ pub struct AnthropicToOpenAiSseBody {
     created: u64,
 }
 
-impl AnthropicToOpenAiSseBody {
-    pub fn new(inner: Incoming, model_hint: Option<String>) -> Self {
+impl<B> AnthropicToOpenAiSseBody<B> {
+    pub fn new(inner: B, model_hint: Option<String>) -> Self {
         let created = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -202,9 +204,12 @@ fn finish_chunk(id: &str, model: &str, created: u64) -> Bytes {
     Bytes::from(s)
 }
 
-impl Body for AnthropicToOpenAiSseBody {
+impl<B> Body for AnthropicToOpenAiSseBody<B>
+where
+    B: Body<Data = Bytes, Error = PandaBodyError> + Unpin,
+{
     type Data = Bytes;
-    type Error = hyper::Error;
+    type Error = PandaBodyError;
 
     fn poll_frame(
         mut self: Pin<&mut Self>,

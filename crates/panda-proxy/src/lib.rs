@@ -5,6 +5,7 @@
 mod gateway;
 pub mod jwks;
 mod route_rps;
+mod brain;
 mod adapter;
 mod adapter_stream;
 mod mcp;
@@ -14,7 +15,13 @@ mod semantic_cache;
 mod sse;
 mod tls;
 mod tpm;
+mod compliance_export;
 mod upstream;
+
+#[cfg(feature = "embedded-console-ui")]
+#[derive(rust_embed::RustEmbed)]
+#[folder = "assets/console-ui/"]
+struct ConsoleUiAssets;
 
 pub use gateway::RequestContext;
 pub use mcp::{McpRuntime, McpToolCallRequest, McpToolCallResult, McpToolDescriptor};
@@ -24,6 +31,7 @@ use std::convert::Infallible;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use std::fs;
@@ -60,11 +68,39 @@ use tpm::TpmCounters;
 use semantic_cache::SemanticCache;
 use tracing::info;
 
-type BoxBody = UnsyncBoxBody<bytes::Bytes, hyper::Error>;
+/// Errors produced when streaming HTTP bodies through Panda (client ↔ upstream ↔ client).
+#[derive(Debug)]
+pub enum PandaBodyError {
+    Hyper(hyper::Error),
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for PandaBodyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PandaBodyError::Hyper(e) => write!(f, "{e}"),
+            PandaBodyError::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for PandaBodyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            PandaBodyError::Hyper(e) => Some(e),
+            PandaBodyError::Io(e) => Some(e),
+        }
+    }
+}
+
+pub(crate) type BoxBody = UnsyncBoxBody<bytes::Bytes, PandaBodyError>;
 type HttpClient = Client<HttpsConnector<HttpConnector>, BoxBody>;
 const AGENT_TOKEN_HEADER: &str = "x-panda-agent-token";
 const DEFAULT_SHUTDOWN_DRAIN_SECONDS: u64 = 30;
-const DEFAULT_UPSTREAM_REQUEST_TIMEOUT_SECONDS: u64 = 120;
+pub(crate) const DEFAULT_UPSTREAM_REQUEST_TIMEOUT_SECONDS: u64 = 120;
+/// After the upstream response headers arrive, cancel if no body bytes are received within this
+/// window (`PANDA_UPSTREAM_FIRST_BYTE_TIMEOUT_MS`; `0` disables).
+const DEFAULT_UPSTREAM_FIRST_BYTE_TIMEOUT_MS: u64 = 90_000;
 const DEFAULT_SEMANTIC_CACHE_TIMEOUT_MS: u64 = 50;
 const DEFAULT_CONSOLE_CHANNEL_CAPACITY: usize = 1024;
 
@@ -94,6 +130,8 @@ pub struct ProxyState {
     rps: Option<Arc<route_rps::RouteRpsLimiters>>,
     /// JWKS-backed RSA JWT verification when `identity.jwks_url` is set.
     pub jwks: Option<Arc<jwks::JwksResolver>>,
+    /// Optional compliance audit sink (local signed JSONL stub).
+    compliance: Option<Arc<compliance_export::ComplianceSinkShared>>,
 }
 
 #[derive(Clone)]
@@ -608,6 +646,87 @@ impl ConsoleEventHub {
     }
 }
 
+/// Throttled fan-out of assistant text from SSE to the developer console (`llm_trace` events).
+struct ConsoleLlmTap {
+    hub: Arc<ConsoleEventHub>,
+    request_id: String,
+    method: String,
+    route: String,
+    acc: Mutex<String>,
+    last_emit: Mutex<Option<Instant>>,
+}
+
+impl ConsoleLlmTap {
+    const EMIT_MIN_INTERVAL: Duration = Duration::from_millis(400);
+    const ACC_MAX_CHARS: usize = 36_000;
+    const TAIL_CHARS: usize = 1_600;
+
+    fn new(
+        hub: Arc<ConsoleEventHub>,
+        request_id: String,
+        method: String,
+        route: String,
+    ) -> Self {
+        Self {
+            hub,
+            request_id,
+            method,
+            route,
+            acc: Mutex::new(String::new()),
+            last_emit: Mutex::new(None),
+        }
+    }
+}
+
+impl sse::LlmStreamTap for ConsoleLlmTap {
+    fn on_assistant_delta(&self, chunk: &str) {
+        if chunk.is_empty() {
+            return;
+        }
+        let total_chars = {
+            let mut acc = self.acc.lock().unwrap_or_else(|e| e.into_inner());
+            acc.push_str(chunk);
+            if acc.len() > Self::ACC_MAX_CHARS {
+                let overflow = acc.len() - Self::ACC_MAX_CHARS;
+                acc.drain(..overflow);
+            }
+            acc.chars().count()
+        };
+        let mut last = self.last_emit.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let should_emit = match *last {
+            None => true,
+            Some(t) => now.duration_since(t) >= Self::EMIT_MIN_INTERVAL,
+        };
+        if !should_emit {
+            return;
+        }
+        *last = Some(now);
+        drop(last);
+        let tail: String = {
+            let acc = self.acc.lock().unwrap_or_else(|e| e.into_inner());
+            let t: String = acc.chars().rev().take(Self::TAIL_CHARS).collect();
+            t.chars().rev().collect::<String>()
+        };
+        self.hub.emit(ConsoleEvent {
+            version: "v1",
+            request_id: self.request_id.clone(),
+            trace_id: None,
+            ts_unix_ms: now_epoch_ms(),
+            stage: "upstream",
+            kind: "llm_trace",
+            method: self.method.clone(),
+            route: self.route.clone(),
+            status: None,
+            elapsed_ms: None,
+            payload: Some(serde_json::json!({
+                "text_tail": tail,
+                "chars_total": total_chars,
+            })),
+        });
+    }
+}
+
 fn now_epoch_ms() -> u128 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -708,7 +827,26 @@ struct AgentClaims {
 /// Run until SIGINT (Ctrl+C). Binds per `config.listen` (HTTPS if `config.tls` is set).
 pub async fn run(config: Arc<PandaConfig>) -> anyhow::Result<()> {
     let client = build_http_client()?;
-    let tpm = Arc::new(TpmCounters::connect(config.effective_redis_url().as_deref()).await?);
+    let tpm = Arc::new(
+        TpmCounters::connect_with_policy(
+            config.effective_redis_url().as_deref(),
+            tpm::TpmPolicy::from_config(&config.tpm),
+        )
+        .await?,
+    );
+    let compliance = match compliance_export::ComplianceSink::try_from_config(
+        &config.observability.compliance_export,
+    ) {
+        Ok(Some(s)) => {
+            eprintln!("panda: compliance_export enabled (local_jsonl stub)");
+            Some(Arc::new(compliance_export::ComplianceSinkShared::new(s)))
+        }
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("panda: compliance_export not started: {e}");
+            None
+        }
+    };
     let bpe = match tiktoken_rs::cl100k_base() {
         Ok(b) => Some(Arc::new(b)),
         Err(e) => {
@@ -811,6 +949,7 @@ pub async fn run(config: Arc<PandaConfig>) -> anyhow::Result<()> {
         console_hub,
         rps,
         jwks,
+        compliance,
     });
 
     if let Some(ref tls_cfg) = config.tls {
@@ -1018,13 +1157,31 @@ async fn dispatch(mut req: Request<Incoming>, state: Arc<ProxyState>) -> Result<
         &state.config.observability.correlation_header,
     )
     .unwrap_or_else(|_| "-".to_string());
-    if method == hyper::Method::GET && (path == "/console" || path == "/console/ws") {
+    let console_get = method == hyper::Method::GET
+        && (path == "/console"
+            || path == "/console/"
+            || path.starts_with("/console/"));
+    if console_get {
         let Some(ref hub) = state.console_hub else {
             return Ok(text_response(
                 StatusCode::NOT_FOUND,
                 "developer console is disabled",
             ));
         };
+        // Public metadata for SPA bootstrap (no secret; does not enable console without hub).
+        if path == "/console/api/meta" {
+            trace_request(
+                &path,
+                &method,
+                &corr,
+                StatusCode::OK,
+                started.elapsed().as_millis(),
+            );
+            return Ok(json_response(
+                StatusCode::OK,
+                console_api_config_json(&state.config),
+            ));
+        }
         if state
             .config
             .observability
@@ -1033,7 +1190,13 @@ async fn dispatch(mut req: Request<Incoming>, state: Arc<ProxyState>) -> Result<
             .is_some_and(|v| !v.trim().is_empty())
         {
             let corr_ops = ops_log_correlation_id(req.headers(), &state.config);
-            if let Err(resp) = enforce_ops_auth_if_configured(req.headers(), &state.config) {
+            let uri_q = req.uri().query();
+            let auth = if path == "/console/ws" {
+                enforce_ops_auth_if_configured_for_console_ws(req.headers(), &state.config, uri_q)
+            } else {
+                enforce_ops_auth_if_configured(req.headers(), &state.config)
+            };
+            if let Err(resp) = auth {
                 state.ops_metrics.inc_ops_auth_denied(&path);
                 log_ops_access(&path, "deny", &corr_ops, None);
                 return Ok(resp);
@@ -1044,14 +1207,30 @@ async fn dispatch(mut req: Request<Incoming>, state: Arc<ProxyState>) -> Result<
         if path == "/console/ws" {
             return Ok(handle_console_ws(req, Arc::clone(hub)).await);
         }
-        trace_request(
-            &path,
-            &method,
-            &corr,
-            StatusCode::OK,
-            started.elapsed().as_millis(),
-        );
-        return Ok(console_html_response());
+        if let Some(resp) = try_serve_embedded_console(&path) {
+            trace_request(
+                &path,
+                &method,
+                &corr,
+                StatusCode::OK,
+                started.elapsed().as_millis(),
+            );
+            return Ok(resp);
+        }
+        if path == "/console" || path == "/console/" {
+            trace_request(
+                &path,
+                &method,
+                &corr,
+                StatusCode::OK,
+                started.elapsed().as_millis(),
+            );
+            return Ok(console_html_response());
+        }
+        return Ok(text_response(
+            StatusCode::NOT_FOUND,
+            "console path not found",
+        ));
     }
     if let Some(ref hub) = state.console_hub {
         if path != "/console" {
@@ -1074,7 +1253,8 @@ async fn dispatch(mut req: Request<Incoming>, state: Arc<ProxyState>) -> Result<
         && (path == "/metrics"
             || path == "/plugins/status"
             || path == "/tpm/status"
-            || path == "/mcp/status");
+            || path == "/mcp/status"
+            || path == "/compliance/status");
 
     if method == hyper::Method::GET && path == "/health" {
         trace_request(&path, &method, &corr, StatusCode::OK, started.elapsed().as_millis());
@@ -1156,6 +1336,11 @@ async fn dispatch(mut req: Request<Incoming>, state: Arc<ProxyState>) -> Result<
     }
     if method == hyper::Method::GET && path == "/mcp/status" {
         let json = mcp_status_json(state.as_ref());
+        trace_request(&path, &method, &corr, StatusCode::OK, started.elapsed().as_millis());
+        return Ok(json_response(StatusCode::OK, json));
+    }
+    if method == hyper::Method::GET && path == "/compliance/status" {
+        let json = compliance_export::status_json(&state.config.observability.compliance_export);
         trace_request(&path, &method, &corr, StatusCode::OK, started.elapsed().as_millis());
         return Ok(json_response(StatusCode::OK, json));
     }
@@ -1243,6 +1428,76 @@ async fn enforce_jwt_if_required(req: &Request<Incoming>, state: &ProxyState) ->
 }
 
 fn enforce_ops_auth_if_configured(headers: &HeaderMap, cfg: &PandaConfig) -> Result<(), Response<BoxBody>> {
+    enforce_ops_auth_if_configured_inner(headers, cfg, None)
+}
+
+/// Like [`enforce_ops_auth_if_configured`], but for `/console/ws` also accepts `?panda_ops_secret=` (dev-only;
+/// browsers cannot set custom headers on WebSocket). Prefer the admin header when possible.
+fn enforce_ops_auth_if_configured_for_console_ws(
+    headers: &HeaderMap,
+    cfg: &PandaConfig,
+    query: Option<&str>,
+) -> Result<(), Response<BoxBody>> {
+    enforce_ops_auth_if_configured_inner(headers, cfg, query)
+}
+
+fn parse_query_panda_ops_secret(query: &str) -> Option<String> {
+    for pair in query.split('&') {
+        let mut it = pair.splitn(2, '=');
+        let k = it.next()?;
+        let v = it.next().unwrap_or("");
+        if k != "panda_ops_secret" {
+            continue;
+        }
+        return Some(
+            percent_decode_form_urlencoded(v).unwrap_or_else(|| v.to_string()),
+        );
+    }
+    None
+}
+
+fn percent_decode_form_urlencoded(input: &str) -> Option<String> {
+    if !input.contains('%') && !input.contains('+') {
+        return Some(input.to_string());
+    }
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    let b = input.as_bytes();
+    while i < b.len() {
+        match b[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < b.len() => {
+                let h1 = from_hex(b[i + 1])?;
+                let h2 = from_hex(b[i + 2])?;
+                out.push((h1 << 4) | h2);
+                i += 3;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn from_hex(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn enforce_ops_auth_if_configured_inner(
+    headers: &HeaderMap,
+    cfg: &PandaConfig,
+    query: Option<&str>,
+) -> Result<(), Response<BoxBody>> {
     let Some(secret_env) = cfg
         .observability
         .admin_secret_env
@@ -1260,10 +1515,16 @@ fn enforce_ops_auth_if_configured(headers: &HeaderMap, cfg: &PandaConfig) -> Res
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
     if got.len() == expected.len() && constant_time_eq(got.as_bytes(), expected.as_bytes()) {
-        Ok(())
-    } else {
-        Err(text_response(StatusCode::UNAUTHORIZED, "unauthorized: invalid ops secret"))
+        return Ok(());
     }
+    if let Some(q) = query {
+        if let Some(v) = parse_query_panda_ops_secret(q) {
+            if v.len() == expected.len() && constant_time_eq(v.as_bytes(), expected.as_bytes()) {
+                return Ok(());
+            }
+        }
+    }
+    Err(text_response(StatusCode::UNAUTHORIZED, "unauthorized: invalid ops secret"))
 }
 
 async fn validate_bearer_jwt(headers: &HeaderMap, path: &str, state: &ProxyState) -> Result<(), &'static str> {
@@ -1407,6 +1668,7 @@ async fn maybe_exchange_agent_token(
     Ok(Some(token))
 }
 
+#[derive(Debug)]
 enum ProxyError {
     PolicyReject(String),
     PayloadTooLarge(&'static str),
@@ -1469,7 +1731,7 @@ async fn merge_jwt_identity_into_context(
     }
 }
 
-async fn collect_body_bounded(body: Incoming, max: usize) -> Result<bytes::Bytes, ProxyError> {
+pub(crate) async fn collect_body_bounded(body: Incoming, max: usize) -> Result<bytes::Bytes, ProxyError> {
     let limited = Limited::new(body, max);
     match limited.collect().await {
         Ok(collected) => Ok(collected.to_bytes()),
@@ -2195,33 +2457,85 @@ async fn wait_for_active_connections(active: &AtomicUsize, timeout: Duration) ->
     }
 }
 
+fn console_blend_price_per_million() -> Option<f64> {
+    std::env::var("PANDA_CONSOLE_BLEND_PRICE_PER_MILLION_TOKENS")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|p| p.is_finite() && *p >= 0.0)
+}
+
+fn tpm_pricing_json(used_window: u64, prompt_total: u64, completion_total: u64) -> Option<serde_json::Value> {
+    let price = console_blend_price_per_million()?;
+    let cumulative_tokens = prompt_total.saturating_add(completion_total);
+    let est_cumulative = (cumulative_tokens as f64 / 1_000_000.0) * price;
+    let est_window = (used_window as f64 / 1_000_000.0) * price;
+    Some(serde_json::json!({
+        "blend_usd_per_million_tokens": price,
+        "estimated_cumulative_usd": est_cumulative,
+        "estimated_current_window_usd": est_window,
+    }))
+}
+
 async fn tpm_status_json(state: &ProxyState, path: &str, req_headers: &HeaderMap) -> serde_json::Value {
     let mut headers = req_headers.clone();
     let secret = gateway::trusted_gateway_secret_from_env();
     let mut ctx = gateway::apply_trusted_gateway(&mut headers, &state.config.trusted_gateway, secret.as_deref());
     merge_jwt_identity_into_context(&mut ctx, &headers, path, state).await;
     let bucket = tpm_bucket_key(&ctx);
+    let configured_limit = state.config.effective_tpm_budget_tokens_per_minute(path);
+    let effective_limit = state.tpm.effective_budget_limit(configured_limit);
+    let redis_budget_degraded = state.tpm.redis_budget_degraded();
+    let (prompt_total, completion_total) = state.tpm.bucket_token_totals(&bucket);
+    let totals = serde_json::json!({
+        "prompt_tokens": prompt_total,
+        "completion_tokens": completion_total,
+    });
     if !state.config.tpm.enforce_budget {
-        return serde_json::json!({
+        let mut v = serde_json::json!({
             "enforce_budget": false,
             "bucket": bucket,
+            "totals": totals,
+            "configured_tokens_per_minute_limit": configured_limit,
+            "effective_tokens_per_minute_limit": effective_limit,
+            "redis_budget_degraded": redis_budget_degraded,
         });
+        if let Some(pricing) = tpm_pricing_json(0, prompt_total, completion_total) {
+            v.as_object_mut()
+                .expect("object")
+                .insert("pricing".to_string(), pricing);
+        }
+        return v;
     }
-    let limit = state.config.tpm.budget_tokens_per_minute;
-    let (used, remaining) = state.tpm.prompt_budget_snapshot(&bucket, limit).await;
+    let (used, remaining) = state
+        .tpm
+        .prompt_budget_snapshot(&bucket, configured_limit)
+        .await;
     let retry_after_seconds = state
         .config
         .tpm
         .retry_after_seconds
         .unwrap_or(state.tpm.prompt_budget_retry_after_seconds(&bucket).await);
-    serde_json::json!({
+    let mut v = serde_json::json!({
         "enforce_budget": true,
         "bucket": bucket,
-        "limit": limit,
+        "limit": configured_limit,
+        "effective_limit": effective_limit,
+        "redis_budget_degraded": redis_budget_degraded,
         "used": used,
         "remaining": remaining,
         "retry_after_seconds": retry_after_seconds,
-    })
+        "totals": totals,
+        "tokens_per_minute": {
+            "prompt_window_used": used,
+            "limit": effective_limit,
+        },
+    });
+    if let Some(pricing) = tpm_pricing_json(used, prompt_total, completion_total) {
+        v.as_object_mut()
+            .expect("object")
+            .insert("pricing".to_string(), pricing);
+    }
+    v
 }
 
 async fn ops_bucket_for_path(path: &str, req_headers: &HeaderMap, state: &ProxyState) -> Option<String> {
@@ -2392,13 +2706,25 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
     let maybe_mcp_followup = advertise_mcp_tools;
     let needs_body_hooks = state.plugins.is_some() || state.config.pii.enabled || state.config.prompt_safety.enabled;
     let tpm_on = state.config.tpm.enforce_budget;
+    let rate_fallback_needs_buffer = state.config.rate_limit_fallback.enabled
+        && parts.method == hyper::Method::POST
+        && path == "/v1/chat/completions"
+        && is_json_request(&parts.headers)
+        && !adapter_anthropic_candidate;
+    let context_mgmt_needs_buffer = state.config.context_management.enabled
+        && parts.method == hyper::Method::POST
+        && path == "/v1/chat/completions"
+        && is_json_request(&parts.headers);
     let need_early_buffer =
         needs_body_hooks
             || advertise_mcp_tools
             || semantic_cache_candidate
             || adapter_anthropic_candidate
-            || (tpm_on && cl.is_none());
+            || (tpm_on && cl.is_none())
+            || rate_fallback_needs_buffer
+            || context_mgmt_needs_buffer;
 
+    let mut openai_chat_snapshot_for_fallback: Option<Vec<u8>> = None;
     let (
         est,
         boxed_req_body,
@@ -2420,6 +2746,15 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
     ) =
         if need_early_buffer {
         let buf = collect_body_bounded(body, max_body).await?.to_vec();
+        if let Some(ref sink) = state.compliance {
+            let h = compliance_export::sha256_hex(&buf);
+            sink.record_ingress(
+                ctx.correlation_id.as_str(),
+                ingress_path.as_str(),
+                parts.method.as_str(),
+                Some(h.as_str()),
+            );
+        }
         let est = tpm_token_estimate(cl, Some(buf.len()));
         if tpm_on {
             let limit = tpm_limit;
@@ -2501,6 +2836,12 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
             next_bytes = maybe_enrich_openai_chat_body(&next_bytes, state.context_enricher.as_ref())
                 .await
                 .map_err(ProxyError::Upstream)?;
+            next_bytes = brain::maybe_summarize_openai_chat_body(
+                &state.client,
+                &state.config.context_management,
+                &next_bytes,
+            )
+            .await?;
         }
 
         let mcp_intent = if maybe_mcp_followup {
@@ -2522,6 +2863,10 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
         };
         if let (Some(ref cache), Some(ref key)) = (state.semantic_cache.as_ref(), semantic_cache_key.as_ref()) {
             if let Some(hit) = semantic_cache_get_with_timeout(cache, key, semantic_cache_timeout_duration()).await {
+                if let Some(ref sink) = state.compliance {
+                    let h = compliance_export::sha256_hex(hit.as_slice());
+                    sink.record_egress(ctx.correlation_id.as_str(), 200, Some(h.as_str()), false);
+                }
                 let mut out = Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", "application/json; charset=utf-8")
@@ -2631,6 +2976,20 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
             };
         }
 
+        openai_chat_snapshot_for_fallback = if state.config.rate_limit_fallback.enabled
+            && matches!(
+                state.config.rate_limit_fallback.provider.as_str(),
+                "anthropic" | "openai_compatible"
+            )
+            && !adapter_anthropic_candidate
+            && path == "/v1/chat/completions"
+            && is_json_request(&parts.headers)
+        {
+            Some(next_bytes.clone())
+        } else {
+            None
+        };
+
         let mcp_streaming_req_json = if maybe_mcp_followup && openai_stream_original && !adapter_anthropic_candidate {
             Some(next_bytes.clone())
         } else {
@@ -2681,7 +3040,24 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
         }
         log_request_context(&ctx);
         parts.headers = headers;
-        (est, body.map_err(|e| e).boxed_unsync(), None, None, None, None, false, None)
+        if let Some(ref sink) = state.compliance {
+            sink.record_ingress(
+                ctx.correlation_id.as_str(),
+                ingress_path.as_str(),
+                parts.method.as_str(),
+                None,
+            );
+        }
+        (
+            est,
+            body.map_err(PandaBodyError::Hyper).boxed_unsync(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
     };
     let mcp_followup_method = parts.method.clone();
     let mcp_followup_uri = parts.uri.clone();
@@ -2697,6 +3073,28 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
     .await?;
     let (mut parts, body) = resp.into_parts();
     let mut body_opt = Some(body);
+    let mut anthropic_to_openai_response = adapter_anthropic_candidate;
+    let mut adapter_anthropic_streaming_resp = adapter_anthropic_streaming;
+    if parts.status == StatusCode::TOO_MANY_REQUESTS {
+        if let Some(ref snap) = openai_chat_snapshot_for_fallback {
+            if brain::rate_limit_fallback_can_attempt(state.config.as_ref(), Some(snap.as_slice())) {
+                if let Some(b) = body_opt.take() {
+                    let _ = collect_body_bounded(b, max_body).await?;
+                }
+                if let Some(f) = brain::try_rate_limit_fallback_chat(state, snap).await? {
+                    let (p, b) = f.into_parts();
+                    parts = p;
+                    body_opt = Some(b);
+                    if state.config.rate_limit_fallback.provider.as_str() == "anthropic" {
+                        anthropic_to_openai_response = true;
+                        let (_, st) = adapter::openai_chat_to_anthropic(snap).map_err(ProxyError::Upstream)?;
+                        adapter_anthropic_streaming_resp = st;
+                    }
+                    eprintln!("panda: rate_limit_fallback completed after upstream 429");
+                }
+            }
+        }
+    }
     let mut semantic_cache_store_value: Option<Vec<u8>> = None;
     let mut body_override: Option<BoxBody> = None;
     let mut mcp_streaming_final_sse_synthetic = false;
@@ -2743,7 +3141,10 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
                                     probed_bytes,
                                     (state.config.mcp.probe_window_seconds as u128) * 1000,
                                 );
-                            body_override = Some(sse::PrefixedBody::new(prefix, rest).map_err(|e| e).boxed_unsync());
+                            body_override = Some(
+                                sse::PrefixedBody::new(prefix, rest.map_err(PandaBodyError::Hyper))
+                                    .boxed_unsync(),
+                            );
                             break 'mcp_followup;
                         }
                         McpStreamProbe::CompleteNoTool(bytes, probed_bytes) => {
@@ -2883,6 +3284,32 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
                             arguments: tc.function_arguments.clone(),
                             correlation_id: ctx.correlation_id.clone(),
                         };
+                        if brain::mcp_hitl_matches(&state.config.mcp.hitl, &tc.function_name, &server_lbl, &tool_lbl) {
+                            match brain::mcp_hitl_approve(
+                                &state.client,
+                                &state.config.mcp.hitl,
+                                &ctx.correlation_id,
+                                &tc.function_name,
+                                &server_lbl,
+                                &tool_lbl,
+                                &tc.function_arguments,
+                            )
+                            .await
+                            {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    if state.config.mcp.hitl.fail_open {
+                                        eprintln!("panda: mcp.hitl fail-open: {e:?}");
+                                    } else {
+                                        hard_error = Some(match e {
+                                            ProxyError::Upstream(a) => a,
+                                            other => anyhow::anyhow!("{other:?}"),
+                                        });
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                         match mcp_runtime.call_tool(call).await {
                             Ok(result) => {
                                 let dur_ms = t_mcp.elapsed().as_millis() as u64;
@@ -2948,6 +3375,16 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
                                 }
                                 if mcp_runtime.fail_open() {
                                     eprintln!("panda: mcp tool call fail-open: {e}");
+                                    let content = if mcp::mcp_call_error_is_timeout(&e) {
+                                        mcp::FAIL_OPEN_TOOL_USER_MESSAGE_TIMEOUT
+                                    } else {
+                                        mcp::FAIL_OPEN_TOOL_USER_MESSAGE_ERROR
+                                    };
+                                    tool_messages.push(serde_json::json!({
+                                        "role": "tool",
+                                        "tool_call_id": tc.id,
+                                        "content": content,
+                                    }));
                                 } else {
                                     hard_error = Some(e);
                                     break;
@@ -3065,7 +3502,7 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
             );
         }
     }
-    if adapter_anthropic_candidate && body_override.is_some() {
+    if anthropic_to_openai_response && body_override.is_some() {
         if let Some(buf) = semantic_cache_store_value.take() {
             let mapped =
                 adapter::anthropic_to_openai_chat(&buf, adapter_model_hint.as_deref()).map_err(ProxyError::Upstream)?;
@@ -3076,8 +3513,8 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
                     .boxed_unsync(),
             );
         }
-    } else if adapter_anthropic_candidate && body_override.is_none() {
-        let skip_buffer_for_streaming_sse = adapter_anthropic_streaming && is_sse(&out_headers);
+    } else if anthropic_to_openai_response && body_override.is_none() {
+        let skip_buffer_for_streaming_sse = adapter_anthropic_streaming_resp && is_sse(&out_headers);
         if !skip_buffer_for_streaming_sse {
             if let Some(body) = body_opt.take() {
                 let collected = collect_body_bounded(body, max_body).await?;
@@ -3092,12 +3529,25 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
             }
         }
     }
+    let sse_llm_tap: Option<Arc<dyn sse::LlmStreamTap>> = if is_sse(&out_headers) {
+        state.console_hub.as_ref().map(|hub| {
+            Arc::new(ConsoleLlmTap::new(
+                Arc::clone(hub),
+                ctx.correlation_id.clone(),
+                mcp_followup_method.to_string(),
+                truncate_route(ingress_path.as_str()),
+            )) as Arc<dyn sse::LlmStreamTap>
+        })
+    } else {
+        None
+    };
     let body_in: BoxBody = if let Some(b) = body_override {
         b
-    } else if adapter_anthropic_candidate && adapter_anthropic_streaming && is_sse(&out_headers) {
+    } else if anthropic_to_openai_response && adapter_anthropic_streaming_resp && is_sse(&out_headers) {
         let body = body_opt
             .take()
             .ok_or_else(|| ProxyError::Upstream(anyhow::anyhow!("missing upstream response body")))?;
+        let body = wrap_upstream_first_byte_and_sse_idle(body.map_err(PandaBodyError::Hyper), true);
         let inner = adapter_stream::AnthropicToOpenAiSseBody::new(body, adapter_model_hint.clone());
         if let Some(ref plugins) = state.plugins {
             let runtime = plugins.runtime_snapshot().await;
@@ -3106,24 +3556,15 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
                 runtime,
                 state.config.plugins.max_request_body_bytes,
             );
-            if let Some(ref bpe) = state.bpe {
-                sse::SseCountingBody::new(hooked, Arc::clone(&state.tpm), bucket, Arc::clone(bpe))
-                    .map_err(|e| e)
-                    .boxed_unsync()
-            } else {
-                hooked.map_err(|e| e).boxed_unsync()
-            }
-        } else if let Some(ref bpe) = state.bpe {
-            sse::SseCountingBody::new(inner, Arc::clone(&state.tpm), bucket, Arc::clone(bpe))
-                .map_err(|e| e)
-                .boxed_unsync()
+            wrap_sse_counting_if_needed(hooked, state, bucket.clone(), sse_llm_tap.clone())
         } else {
-            inner.map_err(|e| e).boxed_unsync()
+            wrap_sse_counting_if_needed(inner, state, bucket.clone(), sse_llm_tap.clone())
         }
     } else if is_sse(&out_headers) {
         let body = body_opt
             .take()
             .ok_or_else(|| ProxyError::Upstream(anyhow::anyhow!("missing upstream response body")))?;
+        let body = wrap_upstream_first_byte_and_sse_idle(body.map_err(PandaBodyError::Hyper), true);
         if let Some(ref plugins) = state.plugins {
             let runtime = plugins.runtime_snapshot().await;
             let hooked = sse::WasmChunkHookBody::new(
@@ -3131,26 +3572,17 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
                 runtime,
                 state.config.plugins.max_request_body_bytes,
             );
-            if let Some(ref bpe) = state.bpe {
-                sse::SseCountingBody::new(hooked, Arc::clone(&state.tpm), bucket, Arc::clone(bpe))
-                    .map_err(|e| e)
-                    .boxed_unsync()
-            } else {
-                hooked.map_err(|e| e).boxed_unsync()
-            }
-        } else if let Some(ref bpe) = state.bpe {
-            sse::SseCountingBody::new(body, Arc::clone(&state.tpm), bucket, Arc::clone(bpe))
-                .map_err(|e| e)
-                .boxed_unsync()
+            wrap_sse_counting_if_needed(hooked, state, bucket.clone(), sse_llm_tap.clone())
         } else {
-            body.map_err(|e| e).boxed_unsync()
+            wrap_sse_counting_if_needed(body, state, bucket.clone(), sse_llm_tap.clone())
         }
     } else {
         let body = body_opt
             .take()
             .ok_or_else(|| ProxyError::Upstream(anyhow::anyhow!("missing upstream response body")))?;
-        body.map_err(|e| e).boxed_unsync()
+        wrap_upstream_first_byte_and_sse_idle(body.map_err(PandaBodyError::Hyper), false).boxed_unsync()
     };
+    let compliance_resp_snapshot = semantic_cache_store_value.clone();
     if should_store_semantic_cache {
         if let (Some(ref cache), Some(key), Some(value)) =
             (state.semantic_cache.as_ref(), semantic_cache_key, semantic_cache_store_value)
@@ -3162,8 +3594,26 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
             );
         }
     }
+    let response_status = parts.status;
+    if let Some(ref sink) = state.compliance {
+        let status_u16 = response_status.as_u16();
+        match compliance_resp_snapshot.as_ref() {
+            Some(bytes) => {
+                let h = compliance_export::sha256_hex(bytes);
+                sink.record_egress(
+                    ctx.correlation_id.as_str(),
+                    status_u16,
+                    Some(h.as_str()),
+                    false,
+                );
+            }
+            None => {
+                sink.record_egress(ctx.correlation_id.as_str(), status_u16, None, true);
+            }
+        }
+    }
     let mut out = Response::builder()
-        .status(parts.status)
+        .status(response_status)
         .body(body_in)
         .map_err(|e| ProxyError::Upstream(anyhow::anyhow!("response build: {e}")))?;
     *out.headers_mut() = out_headers;
@@ -3178,6 +3628,61 @@ fn semantic_cache_timeout_duration() -> Duration {
             .filter(|n| *n > 0)
             .unwrap_or(DEFAULT_SEMANTIC_CACHE_TIMEOUT_MS),
     )
+}
+
+fn upstream_first_byte_timeout() -> Option<Duration> {
+    match std::env::var("PANDA_UPSTREAM_FIRST_BYTE_TIMEOUT_MS") {
+        Ok(s) => {
+            let ms = s.parse::<u64>().ok()?;
+            if ms == 0 {
+                None
+            } else {
+                Some(Duration::from_millis(ms))
+            }
+        }
+        Err(_) => Some(Duration::from_millis(DEFAULT_UPSTREAM_FIRST_BYTE_TIMEOUT_MS)),
+    }
+}
+
+/// Max time without another upstream body chunk after streaming has started (`text/event-stream`).
+/// Default 120s. Set `PANDA_UPSTREAM_SSE_IDLE_TIMEOUT_MS=0` to disable (only first-byte timeout applies).
+fn upstream_sse_idle_timeout() -> Option<Duration> {
+    match std::env::var("PANDA_UPSTREAM_SSE_IDLE_TIMEOUT_MS") {
+        Ok(s) => {
+            let ms = s.parse::<u64>().ok()?;
+            if ms == 0 {
+                None
+            } else {
+                Some(Duration::from_millis(ms))
+            }
+        }
+        Err(_) => Some(Duration::from_millis(120_000)),
+    }
+}
+
+fn wrap_upstream_first_byte_and_sse_idle<B>(body: B, sse: bool) -> sse::UpstreamIdleBetweenChunksBody<sse::FirstUpstreamByteTimeoutBody<B>>
+where
+    B: hyper::body::Body<Data = bytes::Bytes, Error = PandaBodyError> + Unpin,
+{
+    let b = sse::FirstUpstreamByteTimeoutBody::new(body, upstream_first_byte_timeout());
+    let idle = if sse { upstream_sse_idle_timeout() } else { None };
+    sse::UpstreamIdleBetweenChunksBody::new(b, idle)
+}
+
+fn wrap_sse_counting_if_needed<B>(
+    inner: B,
+    state: &ProxyState,
+    bucket: String,
+    llm_tap: Option<Arc<dyn sse::LlmStreamTap>>,
+) -> BoxBody
+where
+    B: hyper::body::Body<Data = bytes::Bytes, Error = PandaBodyError> + Unpin + Send + 'static,
+{
+    let bpe = state.bpe.clone();
+    if bpe.is_none() && llm_tap.is_none() {
+        return inner.boxed_unsync();
+    }
+    sse::SseCountingBody::new(inner, Arc::clone(&state.tpm), bucket, bpe, llm_tap).boxed_unsync()
 }
 
 async fn semantic_cache_get_with_timeout(
@@ -3467,68 +3972,274 @@ fn text_with_content_type(status: StatusCode, msg: String, content_type: &'stati
         .unwrap()
 }
 
+#[cfg(feature = "embedded-console-ui")]
+fn bytes_response(status: StatusCode, data: &[u8], content_type: &'static str) -> Response<BoxBody> {
+    let body = Full::new(bytes::Bytes::copy_from_slice(data))
+        .map_err(|never: std::convert::Infallible| match never {})
+        .boxed_unsync();
+    Response::builder()
+        .status(status)
+        .header(
+            header::CONTENT_TYPE,
+            http::header::HeaderValue::from_static(content_type),
+        )
+        .body(body)
+        .unwrap()
+}
+
+fn console_api_config_json(cfg: &PandaConfig) -> serde_json::Value {
+    serde_json::json!({
+        "admin_auth_required": cfg
+            .observability
+            .admin_secret_env
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty()),
+        "admin_auth_header": cfg.observability.admin_auth_header,
+    })
+}
+
+#[cfg(feature = "embedded-console-ui")]
+fn console_embed_mime(rel: &str) -> &'static str {
+    if rel.ends_with(".js") {
+        "text/javascript; charset=utf-8"
+    } else if rel.ends_with(".css") {
+        "text/css; charset=utf-8"
+    } else if rel.ends_with(".svg") {
+        "image/svg+xml"
+    } else if rel.ends_with(".html") {
+        "text/html; charset=utf-8"
+    } else if rel.ends_with(".json") {
+        "application/json; charset=utf-8"
+    } else if rel.ends_with(".woff2") {
+        "font/woff2"
+    } else if rel.ends_with(".woff") {
+        "font/woff"
+    } else if rel.ends_with(".ttf") {
+        "font/ttf"
+    } else if rel.ends_with(".ico") {
+        "image/x-icon"
+    } else if rel.ends_with(".map") {
+        "application/json; charset=utf-8"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+/// Safe path under `/console/` for static embed (no `..`, no reserved segments).
+#[cfg(feature = "embedded-console-ui")]
+fn console_static_rel_path(path: &str) -> Option<&str> {
+    let rest = if path == "/console" || path == "/console/" {
+        return Some("index.html");
+    } else {
+        path.strip_prefix("/console/")?
+    };
+    if rest.is_empty() {
+        return Some("index.html");
+    }
+    if rest.contains("..") || rest.starts_with('/') {
+        return None;
+    }
+    if rest == "ws" || rest.starts_with("ws/") {
+        return None;
+    }
+    if rest == "api" || rest.starts_with("api/") {
+        // Static embed may ship `assets/` only; API routes are never files.
+        return None;
+    }
+    Some(rest)
+}
+
+#[cfg(feature = "embedded-console-ui")]
+fn try_serve_embedded_console(path: &str) -> Option<Response<BoxBody>> {
+    let rel = console_static_rel_path(path)?;
+    let file = ConsoleUiAssets::get(rel)?;
+    Some(bytes_response(
+        StatusCode::OK,
+        file.data.as_ref(),
+        console_embed_mime(rel),
+    ))
+}
+
+#[cfg(not(feature = "embedded-console-ui"))]
+fn try_serve_embedded_console(_path: &str) -> Option<Response<BoxBody>> {
+    None
+}
+
 fn json_response(status: StatusCode, value: serde_json::Value) -> Response<BoxBody> {
     let body = serde_json::to_string(&value).unwrap_or_else(|_| "{\"error\":\"serialization\"}".to_string());
     text_with_content_type(status, body, "application/json; charset=utf-8")
 }
 
 fn console_html_response() -> Response<BoxBody> {
-    const HTML: &str = r#"<!doctype html>
+    const HTML: &str = r##"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Panda Developer Console</title>
+<title>Panda — Live Trace</title>
 <style>
-  :root { color-scheme: dark; --bg:#0f1115; --fg:#e8eaed; --muted:#9aa0a6; --accent:#7ab4ff; }
-  body { font-family: ui-sans-serif, system-ui, sans-serif; margin:0; background:var(--bg); color:var(--fg); }
-  header { padding:12px 16px; border-bottom:1px solid #2a2f3a; display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
-  h1 { font-size:15px; font-weight:600; margin:0; }
-  .pill { font-size:12px; color:var(--muted); }
-  #status { font-size:12px; color:var(--accent); }
-  #log { margin:0; padding:12px 16px; white-space:pre-wrap; word-break:break-word; font-size:12px; line-height:1.45; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-  .line { border-left:2px solid #2a2f3a; padding-left:8px; margin-bottom:8px; }
-  .kind { color:var(--accent); }
+  :root { color-scheme: dark; --bg:#0b0d10; --panel:#12151c; --fg:#e8eaed; --muted:#8b9299; --accent:#6eb5ff; --ok:#6bcf7f; --warn:#e8c96a; }
+  * { box-sizing: border-box; }
+  body { font-family: ui-sans-serif, system-ui, sans-serif; margin:0; background:var(--bg); color:var(--fg); height:100vh; display:flex; flex-direction:column; }
+  header { padding:10px 14px; border-bottom:1px solid #252a35; display:flex; align-items:center; gap:14px; flex-wrap:wrap; background:var(--panel); }
+  h1 { font-size:14px; font-weight:600; margin:0; letter-spacing:0.02em; }
+  .pill { font-size:11px; color:var(--muted); }
+  #status { font-size:11px; color:var(--accent); }
+  #filter { flex:1; min-width:140px; max-width:280px; background:#1a1f28; border:1px solid #2a3140; color:var(--fg); border-radius:6px; padding:6px 10px; font-size:12px; }
+  main { flex:1; display:grid; grid-template-columns:minmax(200px,280px) 1fr; min-height:0; }
+  #sidebar { border-right:1px solid #252a35; overflow:auto; background:#0e1117; padding:8px 0; }
+  .trace-item { padding:8px 12px; cursor:pointer; font-size:12px; border-left:3px solid transparent; }
+  .trace-item:hover { background:#1a1f28; }
+  .trace-item.active { background:#1c2430; border-left-color:var(--accent); }
+  .trace-item .rid { font-family:ui-monospace,Menlo,monospace; font-size:11px; color:var(--accent); word-break:break-all; }
+  .trace-item .meta { color:var(--muted); font-size:10px; margin-top:2px; }
+  #detail { display:flex; flex-direction:column; min-height:0; overflow:hidden; }
+  #detail-h { padding:10px 14px; border-bottom:1px solid #252a35; font-size:12px; color:var(--muted); }
+  #detail-h strong { color:var(--fg); }
+  .panels { flex:1; display:grid; grid-template-rows:1fr 1fr; min-height:0; }
+  @media (max-width:720px) { main { grid-template-columns:1fr; } #sidebar { max-height:28vh; border-right:none; border-bottom:1px solid #252a35; } }
+  .panel { display:flex; flex-direction:column; min-height:0; border-bottom:1px solid #252a35; }
+  .panel:last-child { border-bottom:none; }
+  .panel h2 { margin:0; padding:8px 14px; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.06em; color:var(--muted); background:#0e1117; }
+  .panel-body { flex:1; overflow:auto; padding:10px 14px; font-size:12px; }
+  #timeline { font-family:ui-monospace,Menlo,monospace; font-size:11px; line-height:1.5; }
+  .tl-row { padding:4px 0; border-left:2px solid #2a3140; padding-left:10px; margin-bottom:4px; }
+  .tl-row.mcp { border-left-color:var(--warn); }
+  .tl-row.llm { border-left-color:var(--ok); }
+  .tl-kind { color:var(--accent); font-weight:500; }
+  #thought { white-space:pre-wrap; word-break:break-word; font-family:ui-serif,Georgia,serif; font-size:13px; line-height:1.55; color:#d8dde4; }
+  .empty { color:var(--muted); font-style:italic; }
+  #raw { font-family:ui-monospace,Menlo,monospace; font-size:10px; color:var(--muted); max-height:120px; overflow:auto; white-space:pre-wrap; }
 </style>
 </head>
 <body>
 <header>
-  <h1>Panda Developer Console</h1>
-  <span class="pill">Live trace (JSON lines)</span>
+  <h1>Panda Live Trace</h1>
+  <span class="pill">Request timeline + streaming assistant preview</span>
+  <input id="filter" type="search" placeholder="Filter by route / id…" autocomplete="off"/>
   <span id="status">connecting…</span>
 </header>
-<pre id="log"></pre>
+<main>
+  <nav id="sidebar"></nav>
+  <section id="detail">
+    <div id="detail-h">Select a <strong>request</strong> to inspect the AI path.</div>
+    <div class="panels">
+      <div class="panel">
+        <h2>Timeline</h2>
+        <div class="panel-body" id="timeline"><span class="empty">No events yet.</span></div>
+      </div>
+      <div class="panel">
+        <h2>Thought stream</h2>
+        <div class="panel-body"><div id="thought"><span class="empty">Streaming assistant deltas appear here (SSE).</span></div></div>
+      </div>
+    </div>
+    <div style="padding:6px 14px;border-top:1px solid #252a35;"><div id="raw"></div></div>
+  </section>
+</main>
 <script>
 (function(){
-  const log = document.getElementById('log');
+  const traces = new Map();
+  let selected = null;
+  const sidebar = document.getElementById('sidebar');
+  const timeline = document.getElementById('timeline');
+  const thought = document.getElementById('thought');
+  const raw = document.getElementById('raw');
+  const detailH = document.getElementById('detail-h');
+  const filterEl = document.getElementById('filter');
   const status = document.getElementById('status');
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const url = proto + '//' + location.host + '/console/ws';
   const ws = new WebSocket(url);
-  ws.onopen = function(){ status.textContent = 'connected: ' + url; };
+
+  function ensure(id) {
+    if (!traces.has(id)) traces.set(id, { events: [], thought: '', route: '', method: '' });
+    return traces.get(id);
+  }
+  function renderSidebar() {
+    const q = (filterEl.value || '').toLowerCase();
+    sidebar.textContent = '';
+    const ids = [...traces.keys()].filter(function(id) {
+      const t = traces.get(id);
+      if (!q) return true;
+      return id.toLowerCase().indexOf(q) >= 0 || (t.route && t.route.toLowerCase().indexOf(q) >= 0);
+    }).slice(-80).reverse();
+    ids.forEach(function(id) {
+      const t = traces.get(id);
+      const div = document.createElement('div');
+      div.className = 'trace-item' + (id === selected ? ' active' : '');
+      div.onclick = function() { select(id); };
+      const rid = document.createElement('div');
+      rid.className = 'rid';
+      rid.textContent = id.slice(0, 36) + (id.length > 36 ? '…' : '');
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      meta.textContent = (t.method || '') + ' ' + (t.route || '') + ' · ' + t.events.length + ' ev';
+      div.appendChild(rid);
+      div.appendChild(meta);
+      sidebar.appendChild(div);
+    });
+  }
+  function fmtPayload(o) {
+    try { return JSON.stringify(o.payload || {}, null, 2); } catch(e) { return ''; }
+  }
+  function select(id) {
+    selected = id;
+    const t = traces.get(id);
+    if (!t) return;
+    detailH.innerHTML = '<strong>' + escapeHtml(id) + '</strong> · ' + escapeHtml(t.method + ' ' + t.route);
+    timeline.textContent = '';
+    if (!t.events.length) {
+      timeline.innerHTML = '<span class="empty">No events.</span>';
+    } else {
+      t.events.forEach(function(ev) {
+        const row = document.createElement('div');
+        var cls = 'tl-row';
+        if (ev.kind === 'mcp_call') cls += ' mcp';
+        if (ev.kind === 'llm_trace') cls += ' llm';
+        row.className = cls;
+        var line = '[' + (ev.ts_unix_ms || 0) + '] ';
+        line += '<span class="tl-kind">' + escapeHtml(ev.kind || '') + '</span>';
+        if (ev.status) line += ' HTTP ' + ev.status;
+        if (ev.elapsed_ms != null) line += ' ' + ev.elapsed_ms + 'ms';
+        if (ev.payload && ev.kind === 'mcp_call') {
+          line += '<br/>' + escapeHtml(fmtPayload(ev).slice(0, 600));
+        }
+        row.innerHTML = line;
+        timeline.appendChild(row);
+      });
+    }
+    thought.innerHTML = t.thought ? escapeHtml(t.thought) : '<span class="empty">No streaming text for this request.</span>';
+    raw.textContent = t.events.length ? JSON.stringify(t.events[t.events.length - 1], null, 2) : '';
+    renderSidebar();
+  }
+  function escapeHtml(s) {
+    if (!s) return '';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  filterEl.oninput = renderSidebar;
+  ws.onopen = function(){ status.textContent = 'connected'; };
   ws.onclose = function(){ status.textContent = 'disconnected'; };
   ws.onerror = function(){ status.textContent = 'websocket error'; };
   ws.onmessage = function(ev){
-    const line = document.createElement('div');
-    line.className = 'line';
-    var k = '(event)';
-    try {
-      const o = JSON.parse(ev.data);
-      k = o.kind || k;
-    } catch(e) {}
-    const kindSpan = document.createElement('span');
-    kindSpan.className = 'kind';
-    kindSpan.textContent = k;
-    line.appendChild(kindSpan);
-    line.appendChild(document.createTextNode(' '));
-    line.appendChild(document.createTextNode(String(ev.data)));
-    log.appendChild(line);
-    log.scrollTop = log.scrollHeight;
+    var o;
+    try { o = JSON.parse(ev.data); } catch(e) { return; }
+    var id = o.request_id || 'unknown';
+    var t = ensure(id);
+    if (o.route) t.route = o.route;
+    if (o.method) t.method = o.method;
+    t.events.push(o);
+    if (o.kind === 'llm_trace' && o.payload && o.payload.text_tail) {
+      t.thought = o.payload.text_tail;
+    }
+    if (!selected) selected = id;
+    if (id === selected) select(id);
+    else renderSidebar();
   };
 })();
 </script>
 </body>
-</html>"#;
+</html>"##;
     text_with_content_type(StatusCode::OK, HTML.to_string(), "text/html; charset=utf-8")
 }
 
@@ -3567,6 +4278,7 @@ mod tests {
             console_hub: None,
             rps: None,
             jwks: None,
+            compliance: None,
         }
     }
 
@@ -3689,6 +4401,8 @@ mod tests {
             semantic_cache: Default::default(),
             auth: Default::default(),
             adapter: Default::default(),
+            rate_limit_fallback: Default::default(),
+            context_management: Default::default(),
         });
         let state = test_proxy_state(Arc::clone(&cfg)).await;
         let mut ctx = RequestContext::default();
@@ -3764,6 +4478,8 @@ mod tests {
             semantic_cache: Default::default(),
             auth: Default::default(),
             adapter: Default::default(),
+            rate_limit_fallback: Default::default(),
+            context_management: Default::default(),
         });
         let state = test_proxy_state(Arc::clone(&cfg)).await;
         let mut ctx = RequestContext {
@@ -3830,6 +4546,7 @@ mod tests {
                 correlation_header: "x-request-id".to_string(),
                 admin_auth_header: "x-panda-admin-secret".to_string(),
                 admin_secret_env: Some("PANDA_TEST_OPS_SECRET".to_string()),
+                compliance_export: Default::default(),
             },
             tpm: Default::default(),
             tls: None,
@@ -3841,6 +4558,8 @@ mod tests {
             semantic_cache: Default::default(),
             auth: Default::default(),
             adapter: Default::default(),
+            rate_limit_fallback: Default::default(),
+            context_management: Default::default(),
         };
         let mut headers = HeaderMap::new();
         std::env::set_var("PANDA_TEST_OPS_SECRET", "s3cr3t");
@@ -3868,6 +4587,7 @@ mod tests {
                 correlation_header: "x-request-id".to_string(),
                 admin_auth_header: "x-panda-admin-secret".to_string(),
                 admin_secret_env: Some(SECRET_ENV.to_string()),
+                compliance_export: Default::default(),
             },
             tpm: Default::default(),
             tls: None,
@@ -3879,6 +4599,8 @@ mod tests {
             semantic_cache: Default::default(),
             auth: Default::default(),
             adapter: Default::default(),
+            rate_limit_fallback: Default::default(),
+            context_management: Default::default(),
         });
         let hub = Arc::new(ConsoleEventHub::new(DEFAULT_CONSOLE_CHANNEL_CAPACITY));
         let state = Arc::new(ProxyState {
@@ -3897,12 +4619,13 @@ mod tests {
             console_hub: Some(Arc::clone(&hub)),
             rps: None,
             jwks: None,
+            compliance: None,
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let st = Arc::clone(&state);
         let server = tokio::spawn(async move {
-            for _ in 0..3 {
+            for _ in 0..4 {
                 let (stream, _) = listener.accept().await.unwrap();
                 let io = TokioIo::new(stream);
                 let st2 = Arc::clone(&st);
@@ -3937,7 +4660,7 @@ mod tests {
         let r2 = String::from_utf8_lossy(&b2);
         assert!(r2.contains("200 OK"), "expected 200 with valid secret: {r2}");
         assert!(r2.contains("text/html"), "{r2}");
-        assert!(r2.contains("Panda Developer Console"), "{r2}");
+        assert!(r2.contains("Live Trace"), "expected Live Trace in console HTML: {r2}");
 
         let mut c3 = TcpStream::connect(addr).await.unwrap();
         c3.write_all(b"GET /console/ws HTTP/1.1\r\nHost: panda\r\nConnection: close\r\n\r\n")
@@ -3947,6 +4670,117 @@ mod tests {
         c3.read_to_end(&mut b3).await.unwrap();
         let r3 = String::from_utf8_lossy(&b3);
         assert!(r3.contains("401"), "expected 401 for /console/ws without secret: {r3}");
+
+        let mut c4 = TcpStream::connect(addr).await.unwrap();
+        c4.write_all(
+            b"GET /console/ws?panda_ops_secret=console-secret-ops HTTP/1.1\r\nHost: panda\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut buf4 = [0u8; 512];
+        let n = c4.read(&mut buf4).await.unwrap();
+        let r4 = String::from_utf8_lossy(&buf4[..n]);
+        assert!(
+            r4.contains("101") || r4.contains("Switching Protocols"),
+            "expected ws upgrade with query secret, got: {r4}"
+        );
+        drop(c4);
+
+        server.await.ok();
+        std::env::remove_var(SECRET_ENV);
+    }
+
+    #[tokio::test]
+    async fn compliance_status_requires_ops_secret_when_configured() {
+        const SECRET_ENV: &str = "PANDA_TEST_COMPLIANCE_STATUS_OPS_SECRET";
+        std::env::set_var(SECRET_ENV, "compliance-status-secret");
+        let cfg = Arc::new(PandaConfig {
+            listen: "127.0.0.1:0".to_string(),
+            server: None,
+            upstream: "http://127.0.0.1:1".to_string(),
+            routes: vec![],
+            trusted_gateway: Default::default(),
+            observability: panda_config::ObservabilityConfig {
+                correlation_header: "x-request-id".to_string(),
+                admin_auth_header: "x-panda-admin-secret".to_string(),
+                admin_secret_env: Some(SECRET_ENV.to_string()),
+                compliance_export: Default::default(),
+            },
+            tpm: Default::default(),
+            tls: None,
+            plugins: Default::default(),
+            identity: Default::default(),
+            prompt_safety: Default::default(),
+            pii: Default::default(),
+            mcp: Default::default(),
+            semantic_cache: Default::default(),
+            auth: Default::default(),
+            adapter: Default::default(),
+            rate_limit_fallback: Default::default(),
+            context_management: Default::default(),
+        });
+        let state = Arc::new(ProxyState {
+            config: Arc::clone(&cfg),
+            client: build_http_client().unwrap(),
+            tpm: Arc::new(TpmCounters::connect(None).await.unwrap()),
+            bpe: None,
+            prompt_safety_matcher: None,
+            ops_metrics: OpsMetrics::default(),
+            plugins: None,
+            mcp: None,
+            semantic_cache: None,
+            context_enricher: None,
+            draining: AtomicBool::new(false),
+            active_connections: AtomicUsize::new(0),
+            console_hub: None,
+            rps: None,
+            jwks: None,
+            compliance: None,
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let st = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let io = TokioIo::new(stream);
+                let st2 = Arc::clone(&st);
+                let svc = service_fn(move |req| {
+                    let s = Arc::clone(&st2);
+                    dispatch(req, s)
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(io, svc)
+                    .with_upgrades()
+                    .await;
+            }
+        });
+
+        let mut c1 = TcpStream::connect(addr).await.unwrap();
+        c1.write_all(
+            b"GET /compliance/status HTTP/1.1\r\nHost: panda\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut b1 = Vec::new();
+        c1.read_to_end(&mut b1).await.unwrap();
+        let r1 = String::from_utf8_lossy(&b1);
+        assert!(r1.contains("401"), "expected 401 without secret: {r1}");
+
+        let mut c2 = TcpStream::connect(addr).await.unwrap();
+        c2.write_all(
+            b"GET /compliance/status HTTP/1.1\r\nHost: panda\r\nConnection: close\r\nx-panda-admin-secret: compliance-status-secret\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut b2 = Vec::new();
+        c2.read_to_end(&mut b2).await.unwrap();
+        let r2 = String::from_utf8_lossy(&b2);
+        assert!(r2.contains("200 OK"), "expected 200 with secret: {r2}");
+        assert!(
+            r2.contains("\"enabled\"") && r2.contains("compliance_export.md"),
+            "expected compliance status JSON: {r2}"
+        );
 
         server.await.ok();
         std::env::remove_var(SECRET_ENV);
@@ -3993,6 +4827,7 @@ mod tests {
                 enforce_budget: true,
                 budget_tokens_per_minute: 100,
                 retry_after_seconds: Some(9),
+                ..Default::default()
             },
             tls: None,
             plugins: Default::default(),
@@ -4003,6 +4838,8 @@ mod tests {
             semantic_cache: Default::default(),
             auth: Default::default(),
             adapter: Default::default(),
+            rate_limit_fallback: Default::default(),
+            context_management: Default::default(),
         });
         let tpm = Arc::new(TpmCounters::connect(None).await.unwrap());
         tpm.add_prompt_tokens("anonymous", 30).await;
@@ -4022,14 +4859,23 @@ mod tests {
             console_hub: None,
             rps: None,
             jwks: None,
+            compliance: None,
         };
         let json = tpm_status_json(&state, "/tpm/status", &HeaderMap::new()).await;
         assert_eq!(json.get("enforce_budget").and_then(|v| v.as_bool()), Some(true));
         assert_eq!(json.get("bucket").and_then(|v| v.as_str()), Some("anonymous"));
         assert_eq!(json.get("limit").and_then(|v| v.as_u64()), Some(100));
+        assert_eq!(json.get("effective_limit").and_then(|v| v.as_u64()), Some(100));
+        assert_eq!(
+            json.get("redis_budget_degraded").and_then(|v| v.as_bool()),
+            Some(false)
+        );
         assert_eq!(json.get("used").and_then(|v| v.as_u64()), Some(30));
         assert_eq!(json.get("remaining").and_then(|v| v.as_u64()), Some(70));
         assert_eq!(json.get("retry_after_seconds").and_then(|v| v.as_u64()), Some(9));
+        let totals = json.get("totals").expect("totals");
+        assert_eq!(totals.get("prompt_tokens").and_then(|v| v.as_u64()), Some(30));
+        assert_eq!(totals.get("completion_tokens").and_then(|v| v.as_u64()), Some(0));
     }
 
     #[tokio::test]
@@ -4054,6 +4900,8 @@ mod tests {
             semantic_cache: Default::default(),
             auth: Default::default(),
             adapter: Default::default(),
+            rate_limit_fallback: Default::default(),
+            context_management: Default::default(),
         });
         let state = ProxyState {
             config: cfg,
@@ -4071,6 +4919,7 @@ mod tests {
             console_hub: None,
             rps: None,
             jwks: None,
+            compliance: None,
         };
         state
             .ops_metrics
@@ -4186,6 +5035,8 @@ mod tests {
             semantic_cache: Default::default(),
             auth: Default::default(),
             adapter: Default::default(),
+            rate_limit_fallback: Default::default(),
+            context_management: Default::default(),
         });
         let state = ProxyState {
             config: cfg,
@@ -4203,6 +5054,7 @@ mod tests {
             console_hub: None,
             rps: None,
             jwks: None,
+            compliance: None,
         };
         let json = tpm_status_json(&state, "/tpm/status", &headers).await;
         assert_eq!(json.get("bucket").and_then(|v| v.as_str()), Some("status-user"));
@@ -4231,6 +5083,8 @@ mod tests {
             semantic_cache: Default::default(),
             auth: Default::default(),
             adapter: Default::default(),
+            rate_limit_fallback: Default::default(),
+            context_management: Default::default(),
         });
         let state = ProxyState {
             config: cfg,
@@ -4248,6 +5102,7 @@ mod tests {
             console_hub: None,
             rps: None,
             jwks: None,
+            compliance: None,
         };
         let (status, body) = readiness_status(&state);
         assert_eq!(status, StatusCode::OK);
@@ -4277,6 +5132,8 @@ mod tests {
             semantic_cache: Default::default(),
             auth: Default::default(),
             adapter: Default::default(),
+            rate_limit_fallback: Default::default(),
+            context_management: Default::default(),
         });
         let state = ProxyState {
             config: cfg,
@@ -4294,6 +5151,7 @@ mod tests {
             console_hub: None,
             rps: None,
             jwks: None,
+            compliance: None,
         };
         let (status, body) = readiness_status(&state);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -4325,6 +5183,8 @@ mod tests {
             semantic_cache: Default::default(),
             auth: Default::default(),
             adapter: Default::default(),
+            rate_limit_fallback: Default::default(),
+            context_management: Default::default(),
         });
         let state = ProxyState {
             config: cfg,
@@ -4342,6 +5202,7 @@ mod tests {
             console_hub: None,
             rps: None,
             jwks: None,
+            compliance: None,
         };
         let (status, body) = readiness_status(&state);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -4463,6 +5324,8 @@ mod tests {
             semantic_cache: Default::default(),
             auth: Default::default(),
             adapter: Default::default(),
+            rate_limit_fallback: Default::default(),
+            context_management: Default::default(),
         });
 
         let runtime = PluginRuntime::load_optional(
@@ -4497,6 +5360,7 @@ mod tests {
             console_hub: None,
             rps: None,
             jwks: None,
+            compliance: None,
         });
         assert!(state.plugins.is_some());
         assert!(state.config.plugins.fail_closed);
@@ -4625,6 +5489,7 @@ mcp:
             console_hub: None,
             rps: None,
             jwks: None,
+            compliance: None,
         });
 
         let panda_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4769,6 +5634,7 @@ mcp:
             console_hub: None,
             rps: None,
             jwks: None,
+            compliance: None,
         });
 
         let panda_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4916,6 +5782,7 @@ mcp:
             console_hub: None,
             rps: None,
             jwks: None,
+            compliance: None,
         });
 
         let panda_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4985,6 +5852,8 @@ mcp:
             semantic_cache: Default::default(),
             auth: Default::default(),
             adapter: Default::default(),
+            rate_limit_fallback: Default::default(),
+            context_management: Default::default(),
         });
         let state = test_proxy_state(Arc::clone(&cfg)).await;
         let headers = HeaderMap::new();
@@ -5061,6 +5930,8 @@ mcp:
             semantic_cache: Default::default(),
             auth: Default::default(),
             adapter: Default::default(),
+            rate_limit_fallback: Default::default(),
+            context_management: Default::default(),
         });
         let state = test_proxy_state(Arc::clone(&cfg)).await;
 
@@ -5133,6 +6004,8 @@ mcp:
             semantic_cache: Default::default(),
             auth: Default::default(),
             adapter: Default::default(),
+            rate_limit_fallback: Default::default(),
+            context_management: Default::default(),
         });
         let state = test_proxy_state(Arc::clone(&cfg)).await;
         let err = validate_bearer_jwt(&headers, "/v1/chat", &state)
@@ -5209,6 +6082,8 @@ mcp:
             semantic_cache: Default::default(),
             auth: Default::default(),
             adapter: Default::default(),
+            rate_limit_fallback: Default::default(),
+            context_management: Default::default(),
         });
         let state = test_proxy_state(Arc::clone(&cfg)).await;
         let exchanged = maybe_exchange_agent_token(&headers, &state)
@@ -5448,6 +6323,8 @@ data: [DONE]
             semantic_cache: Default::default(),
             auth: Default::default(),
             adapter: Default::default(),
+            rate_limit_fallback: Default::default(),
+            context_management: Default::default(),
         });
         let state = test_proxy_state(Arc::clone(&cfg)).await;
         let err = validate_bearer_jwt(&headers, "/v1/admin/users", &state)

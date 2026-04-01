@@ -53,7 +53,9 @@ curl -i http://127.0.0.1:8080/console \
 
 ## 3) What the console shows
 
-Current event coverage:
+The `/console` page is a **Live Trace** UI: a sidebar of recent `request_id`s, a **timeline** of events for the selected request, and a **thought stream** panel that shows the latest rolling excerpt from streaming assistant output (`llm_trace` events during SSE).
+
+Event coverage:
 
 - Request lifecycle:
   - `request_started`
@@ -61,6 +63,8 @@ Current event coverage:
   - `request_failed`
 - MCP tool calls:
   - `mcp_call` with `payload.phase = "start"` and `payload.phase = "finish"`
+- Streaming assistant preview (SSE only, throttled):
+  - `llm_trace` with `payload.text_tail` and `payload.chars_total`
 
 Core event fields:
 

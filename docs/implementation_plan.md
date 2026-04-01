@@ -103,7 +103,7 @@ This plan matches the **Kong-style lesson** you care about: a **thin, native dat
 - **`panda-proxy`:** loads plugins when `plugins.directory` is set; keeps `Arc<PluginRuntime>` for upcoming per-request hooks.
 - **Sample Rust guest (`wasm-plugin-sample`):** minimal `panda_abi_version` + `add` for smoke tests; build with `wasm32-unknown-unknown`.
 - **ABI spec doc:** `docs/wasm_abi.md` now defines v0 exports/imports, return codes, limits, and compatibility.
-- **TinyGo sample skeleton:** `samples/tinygo-plugin/` added for cross-toolchain parity and rollout validation.
+- **TinyGo sample skeleton:** `examples/tinygo-plugin/` added for cross-toolchain parity and rollout validation.
 - **Next:** trap isolation hardening per request, TinyGo build matrix validation, optional hot reload.
 
 ### Review
@@ -245,6 +245,8 @@ This plan can be revised as benchmarks and security reviews land; keep the **Pla
 ## Enterprise final targets (north star)
 
 The phases above deliver a **credible MVP through production-ready core**. For **final** enterprise positioning—competing with mature API gateways on operability and trust—track the items below (not all need to ship on day one; prioritize by tenant and industry).
+
+For a **revenue-oriented** breakdown (SSO for the Developer Console, **hierarchical USD budgets**, **model parity / failover**), see [`enterprise_track.md`](./enterprise_track.md).
 
 ### Reliability and performance
 

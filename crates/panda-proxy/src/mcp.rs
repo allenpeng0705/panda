@@ -9,6 +9,20 @@ use panda_config::{McpConfig, McpServerConfig, PandaConfig};
 
 use crate::mcp_stdio::StdioMcpClient;
 
+/// Embedded in timeout errors from [`McpRuntime::call_tool`] so callers can classify failures.
+pub const MCP_TOOL_CALL_TIMEOUT_MARKER: &str = "PANDA_MCP_TOOL_CALL_TIMEOUT";
+
+/// Stable, LLM-facing tool `content` when `mcp.fail_open` is true and the host times out.
+pub const FAIL_OPEN_TOOL_USER_MESSAGE_TIMEOUT: &str = "PANDA_TOOL_UNAVAILABLE: The tool did not respond before the gateway timeout. Proceed without this tool's output, or retry once the tool may be responsive again.";
+
+/// Stable, LLM-facing tool `content` when `mcp.fail_open` is true and the call fails for other reasons.
+pub const FAIL_OPEN_TOOL_USER_MESSAGE_ERROR: &str = "PANDA_TOOL_UNAVAILABLE: The tool could not be executed (gateway or MCP host error). Proceed without this tool's output.";
+
+pub fn mcp_call_error_is_timeout(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| c.to_string().contains(MCP_TOOL_CALL_TIMEOUT_MARKER))
+}
+
 /// One tool exposed by an MCP server (model-facing name is derived in `mcp_openai`).
 #[derive(Debug, Clone)]
 pub struct McpToolDescriptor {
@@ -135,7 +149,12 @@ impl McpRuntime {
             client.call_tool(req),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("MCP tool call timed out"))?
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "{}: MCP tool call timed out",
+                MCP_TOOL_CALL_TIMEOUT_MARKER
+            )
+        })?
     }
 }
 
@@ -272,6 +291,17 @@ mcp:
 "#,
         )
         .expect("yaml")
+    }
+
+    #[test]
+    fn mcp_call_error_is_timeout_detects_marker() {
+        let e = anyhow::anyhow!(
+            "{}: MCP tool call timed out",
+            MCP_TOOL_CALL_TIMEOUT_MARKER
+        );
+        assert!(mcp_call_error_is_timeout(&e));
+        let e2 = anyhow::anyhow!("unknown MCP server");
+        assert!(!mcp_call_error_is_timeout(&e2));
     }
 
     #[tokio::test]

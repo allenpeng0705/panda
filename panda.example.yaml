@@ -41,7 +41,13 @@ upstream: "http://127.0.0.1:11434"
 # Falls back to W3C traceparent trace id, then UUID.
 # observability:
 #   correlation_header: "x-request-id"
-#   # Optional ops endpoint auth for /metrics, /plugins/status, /tpm/status, /mcp/status, /console, /console/ws
+#   # Optional ops endpoint auth for /metrics, /plugins/status, /tpm/status, /mcp/status, /compliance/status, /console, /console/ws
+#   # compliance_export: local signed JSONL stub (see docs/compliance_export.md); S3/GCS pipeline is design-only for now.
+#   # compliance_export:
+#   #   enabled: false
+#   #   mode: local_jsonl
+#   #   local_path: /var/lib/panda/compliance
+#   #   signing_secret_env: PANDA_COMPLIANCE_HMAC_SECRET
 #   admin_auth_header: "x-panda-admin-secret"
 #   admin_secret_env: "PANDA_ADMIN_STATUS_SECRET"
 #   # Ops auth telemetry on /metrics:
@@ -65,6 +71,10 @@ upstream: "http://127.0.0.1:11434"
 #   budget_tokens_per_minute: 60000
 #   # Optional fixed Retry-After seconds for 429 (default: derived from current minute window).
 #   # retry_after_seconds: 30
+#   # When Redis is down or TPM Redis commands fail, optional “degraded” mode tightens the effective per-minute cap (default ratio 0.5).
+#   # redis_unavailable_degraded_limits: true
+#   # redis_command_error_degraded_limits: true
+#   # redis_degraded_limit_ratio: 0.5
 #
 # Observability: inspect the current request bucket budget snapshot.
 # curl -s http://127.0.0.1:8080/tpm/status
@@ -187,5 +197,41 @@ upstream: "http://127.0.0.1:11434"
 #     - name: demo
 #       enabled: true
 #       # Optional: real MCP over stdio (JSON-RPC, one JSON object per line). When omitted, server is a stub.
+#       # Repo sample (Python, ping + echo_message): command "python3", args:
+#       #   ["examples/mcp_stdio_minimal/server.py"]
 #       # command: "npx"
 #       # args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+#
+#   # Human-in-the-loop: POST JSON to approval_url before running listed tools (requires mcp.enabled).
+#   # Approval body: { correlation_id, openai_function_name, server, tool, arguments }
+#   # Response: { "approved": true } or { "status": "approved" }
+#   # hitl:
+#   #   enabled: true
+#   #   approval_url: "https://control-plane.internal/mcp/approve"
+#   #   timeout_ms: 120000
+#   #   bearer_token_env: "PANDA_HITL_APPROVAL_TOKEN"
+#   #   fail_open: false
+#   #   tools: ["corp_sql.delete_database", "corp_sql.drop_table"]
+
+# Advanced: when the primary OpenAI-compatible upstream returns HTTP 429, retry once via a fallback.
+# Anthropic: set ANTHROPIC_API_KEY (or rate_limit_fallback.api_key_env). OpenAI-shaped body is mapped to /v1/messages.
+# openai_compatible: POST the same JSON to the full URL in `upstream` (e.g. Azure deployment); use use_api_key_header for Azure.
+# rate_limit_fallback:
+#   enabled: true
+#   provider: "anthropic"
+#   upstream: "https://api.anthropic.com"
+#   api_key_env: "ANTHROPIC_API_KEY"
+#   # use_api_key_header: true   # for openai_compatible + Azure-style hosts
+
+# Advanced: auto-summarize long chat histories before forwarding (OpenAI /v1/chat/completions JSON only).
+# Set PANDA_SUMMARIZER_API_KEY (or summarizer_api_key_env) to a key valid for summarizer_upstream.
+# context_management:
+#   enabled: true
+#   max_messages: 48
+#   keep_recent_messages: 16
+#   summarizer_upstream: "https://api.openai.com"
+#   summarizer_model: "gpt-4o-mini"
+#   summarizer_api_key_env: "PANDA_SUMMARIZER_API_KEY"
+#   request_timeout_ms: 60000
+#   summarization_max_tokens: 2048
+#   system_prompt: "Summarize the following chat messages concisely for context continuation."

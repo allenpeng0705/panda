@@ -16,8 +16,9 @@ mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 anyhow = "1"
+clap = { version = "4", features = ["derive", "wrap_help"] }
 panda-config = { path = "../panda-config" }
-panda-proxy = { path = "../panda-proxy" }
+panda-proxy = { path = "../panda-proxy", features = ["embedded-console-ui"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }

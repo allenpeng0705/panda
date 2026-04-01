@@ -53,6 +53,37 @@ impl TrustedGatewayConfig {
     }
 }
 
+/// EU AI Act–style audit export (stub: local signed JSONL; S3/GCS in `docs/compliance_export.md`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ComplianceExportConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// `off` | `local_jsonl`. Object-store modes are design-only until wired.
+    #[serde(default = "default_compliance_export_mode")]
+    pub mode: String,
+    /// Directory for `local_jsonl` daily files (`panda-compliance-YYYYMMDD.jsonl`).
+    #[serde(default)]
+    pub local_path: String,
+    /// Optional env var holding shared secret for HMAC-SHA256 over each record (hex in output).
+    #[serde(default)]
+    pub signing_secret_env: Option<String>,
+}
+
+fn default_compliance_export_mode() -> String {
+    "off".to_string()
+}
+
+impl Default for ComplianceExportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: default_compliance_export_mode(),
+            local_path: String::new(),
+            signing_secret_env: None,
+        }
+    }
+}
+
 /// W3C `traceparent` and generated IDs (see `ensure_correlation_id` in proxy).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ObservabilityConfig {
@@ -64,6 +95,8 @@ pub struct ObservabilityConfig {
     /// Optional env var name for shared secret protecting ops endpoints.
     #[serde(default)]
     pub admin_secret_env: Option<String>,
+    #[serde(default)]
+    pub compliance_export: ComplianceExportConfig,
 }
 
 fn default_correlation_header() -> String {
@@ -80,6 +113,7 @@ impl Default for ObservabilityConfig {
             correlation_header: default_correlation_header(),
             admin_auth_header: default_admin_auth_header(),
             admin_secret_env: None,
+            compliance_export: ComplianceExportConfig::default(),
         }
     }
 }
@@ -98,10 +132,27 @@ pub struct TpmConfig {
     /// Optional fixed `Retry-After` (seconds) for 429 responses; when unset, derive from window.
     #[serde(default)]
     pub retry_after_seconds: Option<u64>,
+    /// When Redis is configured but unreachable at startup, treat TPM as **degraded** (stricter cap).
+    #[serde(default = "default_true")]
+    pub redis_unavailable_degraded_limits: bool,
+    /// When a Redis TPM command fails at runtime, enter degraded mode until a command succeeds again.
+    #[serde(default = "default_true")]
+    pub redis_command_error_degraded_limits: bool,
+    /// Effective budget multiplier while degraded (e.g. `0.5` ≈ 50% “safe mode”).
+    #[serde(default = "default_tpm_degraded_limit_ratio")]
+    pub redis_degraded_limit_ratio: f64,
 }
 
 fn default_tpm_budget_tokens_per_minute() -> u64 {
     60_000
+}
+
+fn default_tpm_degraded_limit_ratio() -> f64 {
+    0.5
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for TpmConfig {
@@ -111,6 +162,9 @@ impl Default for TpmConfig {
             enforce_budget: false,
             budget_tokens_per_minute: default_tpm_budget_tokens_per_minute(),
             retry_after_seconds: None,
+            redis_unavailable_degraded_limits: true,
+            redis_command_error_degraded_limits: true,
+            redis_degraded_limit_ratio: default_tpm_degraded_limit_ratio(),
         }
     }
 }
@@ -437,6 +491,47 @@ pub struct McpConfig {
     pub intent_tool_policies: Vec<McpIntentToolPolicy>,
     #[serde(default)]
     pub servers: Vec<McpServerConfig>,
+    /// Optional human-in-the-loop gate before selected MCP tools run (HTTP approval callback).
+    #[serde(default)]
+    pub hitl: McpHitlConfig,
+}
+
+/// Pause high-risk MCP tool calls until an external approval endpoint returns success.
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpHitlConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// HTTPS URL that accepts POST JSON and returns `{"approved": true}` or `{"status":"approved"}`.
+    #[serde(default)]
+    pub approval_url: String,
+    #[serde(default = "default_mcp_hitl_timeout_ms")]
+    pub timeout_ms: u64,
+    /// When set, send `Authorization: Bearer $TOKEN` using this env var (optional).
+    #[serde(default)]
+    pub bearer_token_env: Option<String>,
+    /// Tool keys to gate: OpenAI function name (`server_tool`) and/or `server.tool`.
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// If true, proceed with the tool when the approval call fails or times out.
+    #[serde(default)]
+    pub fail_open: bool,
+}
+
+fn default_mcp_hitl_timeout_ms() -> u64 {
+    120_000
+}
+
+impl Default for McpHitlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            approval_url: String::new(),
+            timeout_ms: default_mcp_hitl_timeout_ms(),
+            bearer_token_env: None,
+            tools: vec![],
+            fail_open: false,
+        }
+    }
 }
 
 fn default_mcp_fail_open() -> bool {
@@ -481,6 +576,7 @@ impl Default for McpConfig {
             proof_of_intent_mode: default_mcp_proof_of_intent_mode(),
             intent_tool_policies: vec![],
             servers: vec![],
+            hitl: McpHitlConfig::default(),
         }
     }
 }
@@ -574,6 +670,113 @@ pub struct RouteConfig {
     pub methods: Vec<String>,
 }
 
+/// On upstream HTTP 429, retry the same logical chat request against a secondary provider.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RateLimitFallbackConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Base URL for `anthropic` (e.g. `https://api.anthropic.com`) or full request URL for `openai_compatible`.
+    #[serde(default)]
+    pub upstream: String,
+    /// `anthropic`: map OpenAI chat JSON → Anthropic Messages API. `openai_compatible`: POST the same JSON to `upstream`.
+    #[serde(default = "default_rate_limit_fallback_provider")]
+    pub provider: String,
+    /// Env var for the fallback API key (`ANTHROPIC_API_KEY`, Azure `api-key`, etc.).
+    #[serde(default = "default_rate_limit_fallback_api_key_env")]
+    pub api_key_env: String,
+    /// For `openai_compatible` on Azure-style hosts: send `api-key` instead of `Authorization: Bearer`.
+    #[serde(default)]
+    pub use_api_key_header: bool,
+}
+
+fn default_rate_limit_fallback_provider() -> String {
+    "anthropic".to_string()
+}
+
+fn default_rate_limit_fallback_api_key_env() -> String {
+    "ANTHROPIC_API_KEY".to_string()
+}
+
+impl Default for RateLimitFallbackConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            upstream: String::new(),
+            provider: default_rate_limit_fallback_provider(),
+            api_key_env: default_rate_limit_fallback_api_key_env(),
+            use_api_key_header: false,
+        }
+    }
+}
+
+/// Compress long OpenAI-style chat histories via a summarizer model before forwarding upstream.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContextManagementConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// When `messages` length exceeds this, run summarization (after keeping a tail).
+    #[serde(default = "default_context_max_messages")]
+    pub max_messages: usize,
+    /// Recent turns to keep verbatim after summarizing the prefix.
+    #[serde(default = "default_context_keep_recent_messages")]
+    pub keep_recent_messages: usize,
+    /// OpenAI-compatible base URL for the summarizer (e.g. `https://api.openai.com`).
+    #[serde(default)]
+    pub summarizer_upstream: String,
+    #[serde(default)]
+    pub summarizer_model: String,
+    /// Env var holding the bearer token for `summarizer_upstream`.
+    #[serde(default = "default_context_summarizer_api_key_env")]
+    pub summarizer_api_key_env: String,
+    #[serde(default = "default_context_summarizer_timeout_ms")]
+    pub request_timeout_ms: u64,
+    #[serde(default = "default_context_summary_system_prompt")]
+    pub system_prompt: String,
+    #[serde(default = "default_context_summarization_max_tokens")]
+    pub summarization_max_tokens: u32,
+}
+
+fn default_context_max_messages() -> usize {
+    48
+}
+
+fn default_context_keep_recent_messages() -> usize {
+    16
+}
+
+fn default_context_summarizer_api_key_env() -> String {
+    "PANDA_SUMMARIZER_API_KEY".to_string()
+}
+
+fn default_context_summarizer_timeout_ms() -> u64 {
+    60_000
+}
+
+fn default_context_summary_system_prompt() -> String {
+    "Summarize the following chat messages into a concise factual summary for continuing the conversation. Preserve important entities, decisions, constraints, and open tasks. Do not invent details."
+        .to_string()
+}
+
+fn default_context_summarization_max_tokens() -> u32 {
+    2048
+}
+
+impl Default for ContextManagementConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_messages: default_context_max_messages(),
+            keep_recent_messages: default_context_keep_recent_messages(),
+            summarizer_upstream: String::new(),
+            summarizer_model: String::new(),
+            summarizer_api_key_env: default_context_summarizer_api_key_env(),
+            request_timeout_ms: default_context_summarizer_timeout_ms(),
+            system_prompt: default_context_summary_system_prompt(),
+            summarization_max_tokens: default_context_summarization_max_tokens(),
+        }
+    }
+}
+
 /// Top-level config as loaded from disk (e.g. `panda.yaml`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct PandaConfig {
@@ -611,6 +814,10 @@ pub struct PandaConfig {
     pub semantic_cache: SemanticCacheConfig,
     #[serde(default)]
     pub adapter: AdapterConfig,
+    #[serde(default)]
+    pub rate_limit_fallback: RateLimitFallbackConfig,
+    #[serde(default)]
+    pub context_management: ContextManagementConfig,
 }
 
 impl PandaConfig {
@@ -694,6 +901,14 @@ impl PandaConfig {
     }
 
     pub fn listen_addr(&self) -> anyhow::Result<std::net::SocketAddr> {
+        if let Ok(override_listen) = std::env::var("PANDA_LISTEN_OVERRIDE") {
+            let t = override_listen.trim();
+            if !t.is_empty() {
+                return t.parse().map_err(|e| {
+                    anyhow::anyhow!("invalid PANDA_LISTEN_OVERRIDE (expected host:port): {e}")
+                });
+            }
+        }
         Ok(self.listen.parse()?)
     }
 
@@ -770,6 +985,28 @@ impl PandaConfig {
         }
         if self.tpm.retry_after_seconds.is_some_and(|n| n == 0) {
             anyhow::bail!("tpm.retry_after_seconds must be > 0 when set");
+        }
+        if !(self.tpm.redis_degraded_limit_ratio > 0.0 && self.tpm.redis_degraded_limit_ratio <= 1.0) {
+            anyhow::bail!("tpm.redis_degraded_limit_ratio must be in (0, 1]");
+        }
+        let ce = &self.observability.compliance_export;
+        if ce.enabled {
+            let m = ce.mode.to_ascii_lowercase();
+            if m != "local_jsonl" {
+                anyhow::bail!(
+                    "observability.compliance_export.mode must be \"local_jsonl\" when enabled (object-store modes are documented only)"
+                );
+            }
+            if ce.local_path.trim().is_empty() {
+                anyhow::bail!("observability.compliance_export.local_path is required when enabled");
+            }
+        }
+        if ce
+            .signing_secret_env
+            .as_ref()
+            .is_some_and(|s| s.trim().is_empty())
+        {
+            anyhow::bail!("observability.compliance_export.signing_secret_env must be non-empty when set");
         }
         if self.identity.require_jwt {
             let has_hs256 = !self.identity.jwt_hs256_secret_env.trim().is_empty();
@@ -924,6 +1161,125 @@ impl PandaConfig {
                 if p.allowed_tools.iter().any(|t| t.trim().is_empty()) {
                     anyhow::bail!("mcp.intent_tool_policies.allowed_tools entries must be non-empty");
                 }
+            }
+            if self.mcp.hitl.enabled {
+                if self.mcp.hitl.approval_url.trim().is_empty() {
+                    anyhow::bail!("mcp.hitl.approval_url must be set when mcp.hitl.enabled=true");
+                }
+                let u: http::Uri = self
+                    .mcp
+                    .hitl
+                    .approval_url
+                    .trim()
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("mcp.hitl.approval_url invalid URI: {e}"))?;
+                if u.scheme_str() != Some("http") && u.scheme_str() != Some("https") {
+                    anyhow::bail!("mcp.hitl.approval_url must use http or https");
+                }
+                if self.mcp.hitl.timeout_ms == 0 {
+                    anyhow::bail!("mcp.hitl.timeout_ms must be > 0 when mcp.hitl.enabled=true");
+                }
+                if self.mcp.hitl.tools.is_empty() {
+                    anyhow::bail!("mcp.hitl.tools must not be empty when mcp.hitl.enabled=true");
+                }
+                if self.mcp.hitl.tools.iter().any(|t| t.trim().is_empty()) {
+                    anyhow::bail!("mcp.hitl.tools entries must be non-empty");
+                }
+                if self
+                    .mcp
+                    .hitl
+                    .bearer_token_env
+                    .as_ref()
+                    .is_some_and(|v| v.trim().is_empty())
+                {
+                    anyhow::bail!("mcp.hitl.bearer_token_env must be non-empty when set");
+                }
+            }
+        } else if self.mcp.hitl.enabled {
+            anyhow::bail!("mcp.hitl.enabled requires mcp.enabled=true");
+        }
+        if self.rate_limit_fallback.enabled {
+            if self.rate_limit_fallback.upstream.trim().is_empty() {
+                anyhow::bail!("rate_limit_fallback.upstream must be set when rate_limit_fallback.enabled=true");
+            }
+            if self.rate_limit_fallback.api_key_env.trim().is_empty() {
+                anyhow::bail!("rate_limit_fallback.api_key_env must be non-empty when rate_limit_fallback.enabled=true");
+            }
+            match self.rate_limit_fallback.provider.as_str() {
+                "anthropic" => {
+                    let u: http::Uri = self
+                        .rate_limit_fallback
+                        .upstream
+                        .trim()
+                        .parse()
+                        .map_err(|e| anyhow::anyhow!("rate_limit_fallback.upstream invalid URI: {e}"))?;
+                    if u.scheme_str() != Some("http") && u.scheme_str() != Some("https") {
+                        anyhow::bail!("rate_limit_fallback.upstream must use http or https");
+                    }
+                }
+                "openai_compatible" => {
+                    let u: http::Uri = self
+                        .rate_limit_fallback
+                        .upstream
+                        .trim()
+                        .parse()
+                        .map_err(|e| anyhow::anyhow!("rate_limit_fallback.upstream invalid URI: {e}"))?;
+                    if u.scheme_str() != Some("http") && u.scheme_str() != Some("https") {
+                        anyhow::bail!("rate_limit_fallback.upstream must use http or https");
+                    }
+                }
+                _ => anyhow::bail!(
+                    "rate_limit_fallback.provider must be one of: anthropic, openai_compatible"
+                ),
+            }
+        }
+        if self.context_management.enabled {
+            if self.context_management.max_messages == 0 {
+                anyhow::bail!("context_management.max_messages must be > 0 when context_management.enabled=true");
+            }
+            if self.context_management.keep_recent_messages == 0 {
+                anyhow::bail!(
+                    "context_management.keep_recent_messages must be > 0 when context_management.enabled=true"
+                );
+            }
+            if self.context_management.keep_recent_messages >= self.context_management.max_messages {
+                anyhow::bail!(
+                    "context_management.keep_recent_messages must be < context_management.max_messages"
+                );
+            }
+            if self.context_management.summarizer_upstream.trim().is_empty() {
+                anyhow::bail!(
+                    "context_management.summarizer_upstream must be set when context_management.enabled=true"
+                );
+            }
+            let _: http::Uri = self
+                .context_management
+                .summarizer_upstream
+                .trim()
+                .parse()
+                .map_err(|e| anyhow::anyhow!("context_management.summarizer_upstream invalid URI: {e}"))?;
+            if self.context_management.summarizer_model.trim().is_empty() {
+                anyhow::bail!(
+                    "context_management.summarizer_model must be set when context_management.enabled=true"
+                );
+            }
+            if self.context_management.summarizer_api_key_env.trim().is_empty() {
+                anyhow::bail!(
+                    "context_management.summarizer_api_key_env must be non-empty when context_management.enabled=true"
+                );
+            }
+            if self.context_management.request_timeout_ms == 0 {
+                anyhow::bail!(
+                    "context_management.request_timeout_ms must be > 0 when context_management.enabled=true"
+                );
+            }
+            if self.context_management.summarization_max_tokens == 0 {
+                anyhow::bail!(
+                    "context_management.summarization_max_tokens must be > 0 when context_management.enabled=true"
+                );
+            }
+            if self.context_management.system_prompt.trim().is_empty() {
+                anyhow::bail!("context_management.system_prompt must be non-empty when context_management.enabled=true");
             }
         }
         if self.semantic_cache.enabled {
@@ -1140,6 +1496,10 @@ impl PandaConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serialize tests that mutate process environment variables.
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn rejects_empty_listen() {
@@ -1155,6 +1515,23 @@ mod tests {
         )
         .unwrap();
         assert!(cfg.listen_addr().is_ok());
+    }
+
+    #[test]
+    fn listen_addr_honors_panda_listen_override() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let cfg = PandaConfig::from_yaml_str(
+            "listen: '127.0.0.1:9'\nupstream: 'http://127.0.0.1:11434'\n",
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("PANDA_LISTEN_OVERRIDE", "127.0.0.1:8088");
+        }
+        let a = cfg.listen_addr().unwrap();
+        assert_eq!(a.port(), 8088);
+        unsafe {
+            std::env::remove_var("PANDA_LISTEN_OVERRIDE");
+        }
     }
 
     #[test]
@@ -1183,6 +1560,11 @@ mod tests {
         assert!(!cfg.tpm.enforce_budget);
         assert!(cfg.tpm.budget_tokens_per_minute > 0);
         assert!(cfg.tpm.retry_after_seconds.is_none());
+        assert!(cfg.tpm.redis_unavailable_degraded_limits);
+        assert!(cfg.tpm.redis_command_error_degraded_limits);
+        assert_eq!(cfg.tpm.redis_degraded_limit_ratio, 0.5);
+        assert!(!cfg.observability.compliance_export.enabled);
+        assert_eq!(cfg.observability.compliance_export.mode, "off");
         assert_eq!(cfg.observability.admin_auth_header, "x-panda-admin-secret");
         assert!(cfg.observability.admin_secret_env.is_none());
         assert!(!cfg.identity.require_jwt);
@@ -1214,6 +1596,9 @@ mod tests {
         assert_eq!(cfg.mcp.proof_of_intent_mode, "off");
         assert!(cfg.mcp.intent_tool_policies.is_empty());
         assert!(cfg.mcp.servers.is_empty());
+        assert!(!cfg.mcp.hitl.enabled);
+        assert!(!cfg.rate_limit_fallback.enabled);
+        assert!(!cfg.context_management.enabled);
         assert!(!cfg.semantic_cache.enabled);
         assert_eq!(cfg.semantic_cache.backend, "memory");
         assert!(cfg.semantic_cache.redis_url.is_none());
@@ -1246,6 +1631,47 @@ mod tests {
         assert!(cfg.mcp.enabled);
         assert_eq!(cfg.mcp.servers.len(), 1);
         assert_eq!(cfg.mcp.servers[0].name, "demo");
+    }
+
+    #[test]
+    fn rejects_mcp_hitl_without_mcp_enabled() {
+        let err = PandaConfig::from_yaml_str(
+            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+             mcp:\n  hitl:\n    enabled: true\n    approval_url: 'https://a.example/ok'\n    tools: ['x.y']\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("mcp.hitl.enabled requires mcp.enabled"));
+    }
+
+    #[test]
+    fn accepts_mcp_hitl_when_mcp_enabled() {
+        let cfg = PandaConfig::from_yaml_str(
+            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+             mcp:\n  enabled: true\n  servers:\n    - name: demo\n  hitl:\n    enabled: true\n    approval_url: 'https://a.example/approve'\n    tools: ['demo.drop']\n",
+        )
+        .unwrap();
+        assert!(cfg.mcp.hitl.enabled);
+        assert_eq!(cfg.mcp.hitl.tools, vec!["demo.drop".to_string()]);
+    }
+
+    #[test]
+    fn rejects_rate_limit_fallback_bad_provider() {
+        let err = PandaConfig::from_yaml_str(
+            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+             rate_limit_fallback:\n  enabled: true\n  provider: acme\n  upstream: 'https://api.example'\n  api_key_env: 'K'\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("rate_limit_fallback.provider"));
+    }
+
+    #[test]
+    fn rejects_context_management_keep_recent_too_large() {
+        let err = PandaConfig::from_yaml_str(
+            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+             context_management:\n  enabled: true\n  max_messages: 10\n  keep_recent_messages: 10\n  summarizer_upstream: 'https://api.openai.com'\n  summarizer_model: 'gpt-4o-mini'\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("keep_recent_messages"));
     }
 
     #[test]

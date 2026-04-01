@@ -2,6 +2,41 @@
 
 Panda is a Rust AI gateway for agent-era traffic. It sits between your client and model providers, and adds policy, security, observability, MCP tool orchestration, and production-ready operations.
 
+Traditional gateways optimize the **network envelope** (TLS, routing, who opened the TCP connection). Panda is aimed at the **semantic data plane**: what the AI workload is doing—tokens, tools, cache hits, and safety around prompts and bodies—so an OpenAI-shaped API can run like an enterprise service.
+
+## Why Panda? (unified vision)
+
+Panda is built around one idea: **treat AI traffic as a first-class operational domain**, not as “yet another HTTP microservice behind the same edge.”
+
+- **One surface for humans and agents** — Clients keep using an **OpenAI-compatible** API while Panda handles identity, budgets, safety, and tool orchestration in one place.
+- **Semantic + financial + security together** — Token budgets, semantic cache, prompt/PII policy, Wasm plugins, and MCP tool loops share the same request context, so you can reason about *cost, risk, and behavior* without bolting on five sidecars.
+- **Stream-native and stateless by default** — Long-lived SSE streams, graceful handling of slow or stuck model workers, and horizontal scale without a bespoke session cluster.
+- **Plays well with the edge you already have** — Run standalone or **alongside Kong** (or similar): the edge keeps TLS and coarse routing; Panda specializes the AI paths with a clear trust model for identity headers.
+- **Extensible without forking the binary** — **Wasm** for custom guards, **MCP** for tools, **GitOps YAML** for config—so platform teams can evolve policy faster than upstream gateway releases.
+
+In short: Panda is the **unified AI gateway layer**—one place to observe “what the model and tools are doing,” enforce policy, and keep operators in control as agents become normal production traffic.
+
+## Four layers (what Panda adds on top of “just proxying”)
+
+| Layer | Role in Panda |
+|-------|----------------|
+| **Financial control** | TPM-style token budgets, semantic cache to cut repeat spend, ops endpoints for budget visibility. |
+| **Security & privacy** | JWT / JWKS and identity rules, prompt-safety and PII controls, Wasm plugins for extra policy (e.g. body guards). |
+| **Agentic intelligence** | MCP host: intercept tool calls, route to your servers, optional proof-of-intent and streaming tool loops. |
+| **Performance & ops** | Rust + rustls, long-lived **SSE** streaming, `/health` / `/ready`, metrics, optional OTLP traces, graceful drain. |
+
+Details and limits of each feature live in `docs/` and `panda.example.yaml`; treat the table as a map, not a guarantee of every edge case.
+
+## Where Panda sits (with or without Kong)
+
+- **Behind Kong (coexistence)** — Kong stays on the public edge (TLS, OAuth, WAF, thousand legacy routes). You route AI paths (e.g. `/v1/chat/*`) to Panda as a specialized hop. Panda adds TPM, MCP, cache, and AI-centric policy **without** migrating everything off Kong. Identity from the edge can flow in via the trusted-gateway / “Kong handshake” model (`docs/kong_handshake.md`, `docs/deployment.md`).
+- **Standalone (unified edge)** — Panda terminates TLS and fronts both model providers and your own HTTP services from one `panda.yaml` (no Kong DB; GitOps-friendly config). JWT/JWKS, routes, and AI features live in one place (`docs/deployment.md#standalone-no-kong`, `docs/integration_and_evolution.md`).
+- **With third-party observability** — Wire OTLP (and existing metrics/log patterns) into your stack (Prometheus, Jaeger, Honeycomb, etc.); see `docs/deployment.md` and the QuickStart env vars for OTLP.
+
+**Rule of thumb:** smaller teams often start **standalone** for simplicity; larger orgs often keep **Kong at the edge** and use Panda for AI paths first.
+
+**Design highlights:** Memory-safe Rust (including TLS via rustls); **Wasm** plugins for custom request/body/stream checks without rebuilding the gateway; **MCP** as a first-class tool path; **OpenAI-shaped ingress** with an adapter layer for other providers (see config and `docs/high_level_design.md`).
+
 ## What Panda Gives You
 
 - OpenAI-compatible ingress for chat/streaming traffic.
@@ -62,6 +97,9 @@ Optional structured logs:
   - `PANDA_OTEL_SERVICE_NAME=panda-gateway`
   - `PANDA_OTEL_TRACE_SAMPLING_RATIO=0.2` (0.0 to 1.0, parent-based ratio sampler)
   - When set, the gateway also exports OpenTelemetry **trace spans** to that endpoint (HTTP/protobuf); structured JSON logs still go to stdout.
+- Upstream streaming timeouts (see **Slow upstreams and streaming** below):
+  - `PANDA_UPSTREAM_FIRST_BYTE_TIMEOUT_MS` (default 90000; `0` disables)
+  - `PANDA_UPSTREAM_SSE_IDLE_TIMEOUT_MS` (default 120000 for SSE inter-chunk idle; `0` disables)
 - Semantic cache backend override (when `semantic_cache.enabled=true`):
   - `PANDA_SEMANTIC_CACHE_REDIS_URL=redis://127.0.0.1:6379`
   - `semantic_cache.backend: "redis"` in `panda.yaml` (Redis-compatible; Dragonfly works too)
@@ -84,6 +122,10 @@ docker run --rm -p 8080:8080 \
 ```
 
 By default, the Docker build enables `mimalloc` (`PANDA_BUILD_FEATURES=mimalloc`).
+
+**MCP + Postgres lab (Compose):** `deploy/mcp-starters/` builds an image with Node/npm so `npx @modelcontextprotocol/*` servers can run as stdio children. From the repo root: `docker compose -f deploy/mcp-starters/docker-compose.yml up --build` (see `deploy/mcp-starters/README.md`).
+
+**Community Wasm plugins:** examples and contribution notes live in [`community-plugins/README.md`](community-plugins/README.md).
 
 ### 3) Kubernetes
 
@@ -120,6 +162,19 @@ kubectl rollout status deployment/panda
 - `/ready` reports real readiness (config/runtime checks) and turns not-ready during shutdown drain.
 - On `SIGTERM`/`SIGINT`, Panda stops accepting new work and drains active connections up to `PANDA_SHUTDOWN_DRAIN_SECONDS` (default `30`).
 
+### Slow upstreams and streaming (“slow-think” guard)
+
+Async model workers sometimes **accept the TCP connection** and return `200` with `text/event-stream`, then stall before sending meaningful chunks—tying up clients and load balancers.
+
+Panda applies two timeouts on the upstream response body:
+
+| Guard | Env var | Default | Meaning |
+|-------|---------|---------|--------|
+| **First byte** | `PANDA_UPSTREAM_FIRST_BYTE_TIMEOUT_MS` | `90000` (90s); `0` disables | After response headers, fail if **no body bytes** arrive in time. |
+| **Between chunks (SSE)** | `PANDA_UPSTREAM_SSE_IDLE_TIMEOUT_MS` | `120000` (120s); `0` disables | After the **first** body chunk on SSE responses, fail if the upstream stays idle **before the next chunk** for this long—catches hung streams after they started. |
+
+Non-SSE responses only use the first-byte wrapper (plus the overall upstream request timeout for the initial round-trip).
+
 ## Developer Console
 
 The Developer Console is an optional live debug surface for request flow and MCP tool activity.
@@ -147,12 +202,12 @@ When `observability.admin_secret_env` is set, both `/console` and `/console/ws` 
 
 ### What You See
 
-- `request_started` / `request_finished` / `request_failed` events.
-- `mcp_call` events with `payload.phase`:
-  - `start`: round, server, tool, redacted argument preview.
-  - `finish`: status (`success`/`error`) and duration.
-- Core event fields:
-  - `request_id`, `ts_unix_ms`, `stage`, `kind`, `method`, `route`, `status`, `elapsed_ms`.
+- **Live Trace** UI (`/console`): pick a request in the sidebar, then read the **timeline** (lifecycle + MCP) and the **thought stream** (throttled excerpts from streaming assistant `delta.content` when SSE is proxied).
+- Event kinds on the wire:
+  - `request_started` / `request_finished` / `request_failed`
+  - `mcp_call` with `payload.phase` `start` / `finish` (round, server, tool, redacted args, duration)
+  - `llm_trace` with `payload.text_tail` and `chars_total` (developer console only; sampled ~every 400ms during SSE)
+- Core fields: `request_id`, `ts_unix_ms`, `stage`, `kind`, `method`, `route`, `status`, `elapsed_ms`.
 
 ### Quick Verify
 
@@ -211,10 +266,10 @@ Enable only after load/soak evidence in your environment.
   - `panda_on_request_body`
   - `panda_on_response_chunk` (streaming chunk hook)
 - Rust plugin authors should use `crates/panda-pdk`.
-- **Minimal samples**: `crates/wasm-plugin-sample` (Rust), `samples/tinygo-plugin/` (TinyGo).
+- **Minimal samples**: `crates/wasm-plugin-sample` (Rust), `examples/tinygo-plugin/` (TinyGo).
 - **Useful examples**:
   - **Rust** — `crates/wasm-plugin-ssrf-guard`: block private URLs / dangerous schemes in request bodies (SSRF-style guard).
-  - **TinyGo** — `samples/tinygo-plugin-pci-guard`: block bodies with long runs of ASCII digits (PAN-style paste guard).
+  - **TinyGo** — `examples/tinygo-plugin-pci-guard`: block bodies with long runs of ASCII digits (PAN-style paste guard).
 
 ## Documentation Map
 

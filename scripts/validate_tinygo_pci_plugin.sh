@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SAMPLE_DIR="$ROOT_DIR/samples/tinygo-plugin-pci-guard"
+SAMPLE_DIR="$ROOT_DIR/examples/tinygo-plugin-pci-guard"
 OUT_DIR="$ROOT_DIR/target/tinygo"
 OUT_WASM="$OUT_DIR/pci_guard.wasm"
 

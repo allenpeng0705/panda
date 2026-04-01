@@ -91,3 +91,4 @@ You can be **implementation-complete** on core AI gateway features while still i
 - [Kong handshake](./kong_handshake.md)
 - [Deployment](./deployment.md)
 - [High-level design](./high_level_design.md)
+- [Enterprise track (SSO, hierarchical budgets, model failover)](./enterprise_track.md)

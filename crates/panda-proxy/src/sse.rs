@@ -1,8 +1,10 @@
 //! Stream `text/event-stream` responses; count completion tokens (tiktoken + optional `usage`).
 
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use hyper::body::{Body, Frame, Incoming};
@@ -10,7 +12,151 @@ use panda_wasm::PluginRuntime;
 use serde_json::Value;
 use tiktoken_rs::CoreBPE;
 
+use crate::PandaBodyError;
 use crate::tpm::TpmCounters;
+
+/// Optional tap for assistant-visible text extracted from OpenAI-style SSE `data:` lines.
+pub trait LlmStreamTap: Send + Sync {
+    fn on_assistant_delta(&self, chunk: &str);
+}
+
+/// After the first response body chunk, fail if the upstream stays `Pending` longer than `idle`
+/// before sending the next chunk (async workers that accept the connection but stall mid-stream).
+/// When `idle` is `None`, forwards to `inner` unchanged.
+pub struct UpstreamIdleBetweenChunksBody<B> {
+    inner: B,
+    idle: Option<Duration>,
+    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// True after we have observed at least one `Ready` from `inner` (any frame kind).
+    saw_progress: bool,
+}
+
+impl<B> UpstreamIdleBetweenChunksBody<B> {
+    pub fn new(inner: B, idle: Option<Duration>) -> Self {
+        Self {
+            inner,
+            idle,
+            sleep: None,
+            saw_progress: false,
+        }
+    }
+}
+
+impl<B> Body for UpstreamIdleBetweenChunksBody<B>
+where
+    B: Body<Data = Bytes, Error = PandaBodyError> + Unpin,
+{
+    type Data = Bytes;
+    type Error = PandaBodyError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.as_mut().get_mut();
+        if this.idle.is_none() {
+            return Pin::new(&mut this.inner).poll_frame(cx);
+        }
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(item) => {
+                this.saw_progress = true;
+                this.sleep = None;
+                Poll::Ready(item)
+            }
+            Poll::Pending => {
+                if !this.saw_progress {
+                    return Poll::Pending;
+                }
+                if this.sleep.is_none() {
+                    let dur = *this.idle.as_ref().unwrap();
+                    this.sleep = Some(Box::pin(tokio::time::sleep(dur)));
+                }
+                match this.sleep.as_mut().unwrap().as_mut().poll(cx) {
+                    Poll::Ready(()) => Poll::Ready(Some(Err(PandaBodyError::Io(
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "upstream SSE idle timeout (no further chunks)",
+                        ),
+                    )))),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    }
+}
+
+/// After response headers, fail the body stream if the upstream sends no bytes before `limit`
+/// elapses. When `limit` is `None`, forwards `poll_frame` to `inner` unchanged.
+pub struct FirstUpstreamByteTimeoutBody<B> {
+    inner: B,
+    limit: Option<Duration>,
+    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+    passed_first: bool,
+}
+
+impl<B> FirstUpstreamByteTimeoutBody<B> {
+    pub fn new(inner: B, limit: Option<Duration>) -> Self {
+        Self {
+            inner,
+            limit,
+            sleep: None,
+            passed_first: false,
+        }
+    }
+}
+
+impl<B> Body for FirstUpstreamByteTimeoutBody<B>
+where
+    B: Body<Data = Bytes, Error = PandaBodyError> + Unpin,
+{
+    type Data = Bytes;
+    type Error = PandaBodyError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.as_mut().get_mut();
+        if this.limit.is_none() {
+            return Pin::new(&mut this.inner).poll_frame(cx);
+        }
+        if this.passed_first {
+            return Pin::new(&mut this.inner).poll_frame(cx);
+        }
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                this.passed_first = true;
+                this.sleep = None;
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                this.passed_first = true;
+                this.sleep = None;
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(None) => {
+                this.passed_first = true;
+                this.sleep = None;
+                Poll::Ready(None)
+            }
+            Poll::Pending => {
+                if this.sleep.is_none() {
+                    let dur = *this.limit.as_ref().unwrap();
+                    this.sleep = Some(Box::pin(tokio::time::sleep(dur)));
+                }
+                match this.sleep.as_mut().unwrap().as_mut().poll(cx) {
+                    Poll::Ready(()) => Poll::Ready(Some(Err(PandaBodyError::Io(
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "upstream first response byte timeout",
+                        ),
+                    )))),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    }
+}
 
 pub struct PrefixedBody<B = Incoming> {
     prefix: Option<Bytes>,
@@ -19,7 +165,7 @@ pub struct PrefixedBody<B = Incoming> {
 
 impl<B> PrefixedBody<B>
 where
-    B: Body<Data = Bytes, Error = hyper::Error> + Unpin,
+    B: Body<Data = Bytes, Error = PandaBodyError> + Unpin,
 {
     pub fn new(prefix: Bytes, inner: B) -> Self {
         Self {
@@ -34,7 +180,8 @@ pub struct SseCountingBody<B = Incoming> {
     buf: BytesMut,
     bucket: String,
     tpm: Arc<TpmCounters>,
-    bpe: Arc<CoreBPE>,
+    bpe: Option<Arc<CoreBPE>>,
+    llm_tap: Option<Arc<dyn LlmStreamTap>>,
     usage_completion: Option<u64>,
     delta_tokens: u64,
     finished: bool,
@@ -48,15 +195,22 @@ pub struct WasmChunkHookBody<B = Incoming> {
 
 impl<B> SseCountingBody<B>
 where
-    B: Body<Data = Bytes, Error = hyper::Error> + Unpin,
+    B: Body<Data = Bytes, Error = PandaBodyError> + Unpin,
 {
-    pub fn new(inner: B, tpm: Arc<TpmCounters>, bucket: String, bpe: Arc<CoreBPE>) -> Self {
+    pub fn new(
+        inner: B,
+        tpm: Arc<TpmCounters>,
+        bucket: String,
+        bpe: Option<Arc<CoreBPE>>,
+        llm_tap: Option<Arc<dyn LlmStreamTap>>,
+    ) -> Self {
         Self {
             inner,
             buf: BytesMut::new(),
             bucket,
             tpm,
             bpe,
+            llm_tap,
             usage_completion: None,
             delta_tokens: 0,
             finished: false,
@@ -105,8 +259,15 @@ where
                     .and_then(|d| d.get("content"))
                     .and_then(|c| c.as_str())
                 {
-                    let n = self.bpe.encode_with_special_tokens(s).len() as u64;
+                    let n = self
+                        .bpe
+                        .as_ref()
+                        .map(|b| b.encode_with_special_tokens(s).len() as u64)
+                        .unwrap_or_else(|| s.len() as u64);
                     self.delta_tokens = self.delta_tokens.saturating_add(n);
+                    if let Some(tap) = &self.llm_tap {
+                        tap.on_assistant_delta(s);
+                    }
                 }
             }
         }
@@ -130,7 +291,7 @@ where
 
 impl<B> WasmChunkHookBody<B>
 where
-    B: Body<Data = Bytes, Error = hyper::Error> + Unpin,
+    B: Body<Data = Bytes, Error = PandaBodyError> + Unpin,
 {
     pub fn new(inner: B, runtime: Arc<PluginRuntime>, max_output_bytes: usize) -> Self {
         Self {
@@ -154,10 +315,10 @@ fn trim_bytes(b: &[u8]) -> &[u8] {
 
 impl<B> Body for SseCountingBody<B>
 where
-    B: Body<Data = Bytes, Error = hyper::Error> + Unpin,
+    B: Body<Data = Bytes, Error = PandaBodyError> + Unpin,
 {
     type Data = Bytes;
-    type Error = hyper::Error;
+    type Error = PandaBodyError;
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
@@ -200,10 +361,10 @@ where
 
 impl<B> Body for PrefixedBody<B>
 where
-    B: Body<Data = Bytes, Error = hyper::Error> + Unpin,
+    B: Body<Data = Bytes, Error = PandaBodyError> + Unpin,
 {
     type Data = Bytes;
-    type Error = hyper::Error;
+    type Error = PandaBodyError;
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
@@ -219,10 +380,10 @@ where
 
 impl<B> Body for WasmChunkHookBody<B>
 where
-    B: Body<Data = Bytes, Error = hyper::Error> + Unpin,
+    B: Body<Data = Bytes, Error = PandaBodyError> + Unpin,
 {
     type Data = Bytes;
-    type Error = hyper::Error;
+    type Error = PandaBodyError;
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
@@ -256,12 +417,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::BodyExt;
 
     struct NoopBody;
 
     impl Body for NoopBody {
         type Data = Bytes;
-        type Error = hyper::Error;
+        type Error = PandaBodyError;
 
         fn poll_frame(
             self: Pin<&mut Self>,
@@ -272,11 +434,72 @@ mod tests {
         }
     }
 
+    struct HangingBody;
+
+    impl Body for HangingBody {
+        type Data = Bytes;
+        type Error = PandaBodyError;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            let _ = self;
+            Poll::Pending
+        }
+    }
+
+    struct OneThenHangBody {
+        sent: bool,
+    }
+
+    impl Body for OneThenHangBody {
+        type Data = Bytes;
+        type Error = PandaBodyError;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            let this = self.as_mut().get_mut();
+            if !this.sent {
+                this.sent = true;
+                Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"x")))))
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_between_chunks_times_out_after_first_frame() {
+        let inner = FirstUpstreamByteTimeoutBody::new(OneThenHangBody { sent: false }, None);
+        let mut body = UpstreamIdleBetweenChunksBody::new(inner, Some(Duration::from_millis(30)));
+        assert!(body.frame().await.unwrap().is_ok());
+        match body.frame().await {
+            Some(Err(PandaBodyError::Io(e))) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
+            }
+            other => panic!("expected idle Io timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn first_upstream_byte_timeout_returns_timed_out_io() {
+        let mut body = FirstUpstreamByteTimeoutBody::new(HangingBody, Some(Duration::from_millis(25)));
+        match body.frame().await {
+            Some(Err(PandaBodyError::Io(e))) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
+            }
+            other => panic!("expected Io timeout error, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn sse_counting_buffers_fragmented_data_lines() {
         let tpm = Arc::new(TpmCounters::connect(None).await.unwrap());
         let bpe = Arc::new(tiktoken_rs::cl100k_base().unwrap());
-        let mut body = SseCountingBody::new(NoopBody, tpm, "b1".to_string(), bpe);
+        let mut body = SseCountingBody::new(NoopBody, tpm, "b1".to_string(), Some(bpe), None);
 
         body.buf.put_slice(br#"data: {"choices":[{"delta":{"content":"hel"#);
         body.process_buffer();
@@ -293,7 +516,7 @@ mod tests {
     async fn sse_counting_handles_utf8_multibyte_split_across_chunks() {
         let tpm = Arc::new(TpmCounters::connect(None).await.unwrap());
         let bpe = Arc::new(tiktoken_rs::cl100k_base().unwrap());
-        let mut body = SseCountingBody::new(NoopBody, tpm, "b2".to_string(), bpe);
+        let mut body = SseCountingBody::new(NoopBody, tpm, "b2".to_string(), Some(bpe), None);
 
         let mut part1 = br#"data: {"choices":[{"delta":{"content":""#.to_vec();
         part1.extend_from_slice(&[0xF0]); // first byte of 😀

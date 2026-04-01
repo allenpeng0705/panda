@@ -37,7 +37,7 @@ plugins:
 
 - Depending on TinyGo target/toolchain version, you may need to tune build flags to avoid unsupported imports.
 - This sample is a skeleton for ABI parity and rollout testing.
-- A second TinyGo plugin with a **real policy** (digit-run / PAN guard) lives in `samples/tinygo-plugin-pci-guard/`.
+- A second TinyGo plugin with a **real policy** (digit-run / PAN guard) lives in `examples/tinygo-plugin-pci-guard/`.
 
 ## Validation Script
 
