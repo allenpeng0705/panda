@@ -4,6 +4,7 @@ set -euo pipefail
 # Staging readiness gate helper.
 # Usage:
 #   PANDA_BASE_URL=http://127.0.0.1:8080 ./scripts/staging_readiness_gate.sh
+#   READINESS_AUTH_HEADER='x-panda-admin-secret: <secret>' PANDA_BASE_URL=http://127.0.0.1:8080 ./scripts/staging_readiness_gate.sh
 # Optional load check:
 #   READINESS_LOAD_PAYLOAD=./payload.json READINESS_LOAD_REQUESTS=100 READINESS_LOAD_CONCURRENCY=10 ./scripts/staging_readiness_gate.sh
 
@@ -28,9 +29,15 @@ echo "[1/4] Running core test suites"
 
 echo
 echo "[2/4] Checking liveness/readiness"
-health_code="$(curl -sS -o /dev/null -w "%{http_code}" "${BASE_URL}/health" || true)"
-ready_code="$(curl -sS -o /dev/null -w "%{http_code}" "${BASE_URL}/ready" || true)"
-mcp_code="$(curl -sS -o /dev/null -w "%{http_code}" "${BASE_URL}/mcp/status" || true)"
+if [[ -n "${AUTH_HEADER}" ]]; then
+  health_code="$(curl -sS -o /dev/null -w "%{http_code}" -H "${AUTH_HEADER}" "${BASE_URL}/health" || true)"
+  ready_code="$(curl -sS -o /dev/null -w "%{http_code}" -H "${AUTH_HEADER}" "${BASE_URL}/ready" || true)"
+  mcp_code="$(curl -sS -o /dev/null -w "%{http_code}" -H "${AUTH_HEADER}" "${BASE_URL}/mcp/status" || true)"
+else
+  health_code="$(curl -sS -o /dev/null -w "%{http_code}" "${BASE_URL}/health" || true)"
+  ready_code="$(curl -sS -o /dev/null -w "%{http_code}" "${BASE_URL}/ready" || true)"
+  mcp_code="$(curl -sS -o /dev/null -w "%{http_code}" "${BASE_URL}/mcp/status" || true)"
+fi
 echo "health: ${health_code}"
 echo "ready:  ${ready_code}"
 echo "mcp:    ${mcp_code}"
@@ -41,10 +48,17 @@ fi
 
 echo
 echo "[3/4] Capturing status snapshot"
-curl -sS "${BASE_URL}/ready"
-echo
-curl -sS "${BASE_URL}/mcp/status"
-echo
+if [[ -n "${AUTH_HEADER}" ]]; then
+  curl -sS -H "${AUTH_HEADER}" "${BASE_URL}/ready"
+  echo
+  curl -sS -H "${AUTH_HEADER}" "${BASE_URL}/mcp/status"
+  echo
+else
+  curl -sS "${BASE_URL}/ready"
+  echo
+  curl -sS "${BASE_URL}/mcp/status"
+  echo
+fi
 
 echo
 echo "[4/4] Optional short load probe"

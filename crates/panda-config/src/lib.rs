@@ -811,6 +811,15 @@ pub struct ConsoleOidcConfig {
     /// If non-empty, require at least one of these role strings in `roles_claim`.
     #[serde(default)]
     pub required_roles: Vec<String>,
+    /// Require PKCE S256 in OIDC login/callback flow (recommended for public/confidential clients).
+    #[serde(default = "default_console_oidc_require_pkce")]
+    pub require_pkce: bool,
+    /// Include and validate OIDC nonce claim in `id_token`.
+    #[serde(default = "default_console_oidc_require_nonce")]
+    pub require_nonce: bool,
+    /// Force `Secure` session cookie attribute. When false, HTTPS `redirect_base_url` still enables Secure.
+    #[serde(default)]
+    pub force_secure_cookie: bool,
 }
 
 fn default_console_oidc_redirect_path() -> String {
@@ -837,6 +846,14 @@ fn default_console_oidc_signing_secret_env() -> String {
     "PANDA_CONSOLE_SESSION_SECRET".to_string()
 }
 
+fn default_console_oidc_require_pkce() -> bool {
+    true
+}
+
+fn default_console_oidc_require_nonce() -> bool {
+    true
+}
+
 impl Default for ConsoleOidcConfig {
     fn default() -> Self {
         Self {
@@ -852,6 +869,9 @@ impl Default for ConsoleOidcConfig {
             signing_secret_env: default_console_oidc_signing_secret_env(),
             roles_claim: String::new(),
             required_roles: vec![],
+            require_pkce: default_console_oidc_require_pkce(),
+            require_nonce: default_console_oidc_require_nonce(),
+            force_secure_cookie: false,
         }
     }
 }
@@ -879,6 +899,9 @@ pub struct BudgetHierarchyConfig {
     /// Override Redis URL; defaults to `tpm.redis_url` / `PANDA_REDIS_URL` when unset.
     #[serde(default)]
     pub redis_url: Option<String>,
+    /// If true, Redis evaluation failures allow traffic (fail-open). Defaults to fail-closed.
+    #[serde(default)]
+    pub fail_open: bool,
 }
 
 fn default_budget_hierarchy_jwt_claim() -> String {
@@ -893,6 +916,7 @@ impl Default for BudgetHierarchyConfig {
             org_prompt_tokens_per_minute: None,
             departments: vec![],
             redis_url: None,
+            fail_open: false,
         }
     }
 }

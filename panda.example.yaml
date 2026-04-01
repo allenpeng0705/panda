@@ -145,6 +145,10 @@ upstream: "http://127.0.0.1:11434"
 #   cookie_name: "panda_console_session"
 #   session_ttl_seconds: 86400
 #   signing_secret_env: "PANDA_CONSOLE_SESSION_SECRET"
+#   require_pkce: true
+#   require_nonce: true
+#   # Force Secure cookie even if redirect_base_url is not https.
+#   force_secure_cookie: false
 #   # Optional RBAC claim + required roles.
 #   roles_claim: "groups"
 #   required_roles: ["panda.console.admin"]
@@ -163,6 +167,8 @@ upstream: "http://127.0.0.1:11434"
 #       prompt_tokens_per_minute: 80000
 #   # Optional override; otherwise uses tpm.redis_url / PANDA_REDIS_URL.
 #   redis_url: "redis://127.0.0.1:6379"
+#   # Safer default is fail-closed when Redis is unavailable.
+#   fail_open: false
 
 # Enterprise (optional): model parity map + ordered failover chain.
 # For matching requests, Panda retries the next backend on 5xx/429/timeouts.

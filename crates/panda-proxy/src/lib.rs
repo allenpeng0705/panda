@@ -1303,17 +1303,7 @@ async fn dispatch(mut req: Request<Incoming>, state: Arc<ProxyState>) -> Result<
             || state.config.console_oidc.enabled;
         if need_console_auth {
             let corr_ops = ops_log_correlation_id(req.headers(), &state.config);
-            let uri_q = req.uri().query();
-            let auth = if path == "/console/ws" {
-                enforce_console_access(
-                    req.headers(),
-                    &state.config,
-                    uri_q,
-                    state.console_oidc.as_ref(),
-                )
-            } else {
-                enforce_console_access(req.headers(), &state.config, None, state.console_oidc.as_ref())
-            };
+            let auth = enforce_console_access(req.headers(), &state.config, state.console_oidc.as_ref());
             if let Err(resp) = auth {
                 state.ops_metrics.inc_ops_auth_denied(&path);
                 log_ops_access(&path, "deny", &corr_ops, None);
@@ -1546,65 +1536,12 @@ async fn enforce_jwt_if_required(req: &Request<Incoming>, state: &ProxyState) ->
 }
 
 fn enforce_ops_auth_if_configured(headers: &HeaderMap, cfg: &PandaConfig) -> Result<(), Response<BoxBody>> {
-    enforce_ops_auth_if_configured_inner(headers, cfg, None)
-}
-
-fn parse_query_panda_ops_secret(query: &str) -> Option<String> {
-    for pair in query.split('&') {
-        let mut it = pair.splitn(2, '=');
-        let k = it.next()?;
-        let v = it.next().unwrap_or("");
-        if k != "panda_ops_secret" {
-            continue;
-        }
-        return Some(
-            percent_decode_form_urlencoded(v).unwrap_or_else(|| v.to_string()),
-        );
-    }
-    None
-}
-
-fn percent_decode_form_urlencoded(input: &str) -> Option<String> {
-    if !input.contains('%') && !input.contains('+') {
-        return Some(input.to_string());
-    }
-    let mut out = Vec::with_capacity(input.len());
-    let mut i = 0;
-    let b = input.as_bytes();
-    while i < b.len() {
-        match b[i] {
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b'%' if i + 2 < b.len() => {
-                let h1 = from_hex(b[i + 1])?;
-                let h2 = from_hex(b[i + 2])?;
-                out.push((h1 << 4) | h2);
-                i += 3;
-            }
-            c => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8(out).ok()
-}
-
-fn from_hex(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
+    enforce_ops_auth_if_configured_inner(headers, cfg)
 }
 
 fn enforce_ops_auth_if_configured_inner(
     headers: &HeaderMap,
     cfg: &PandaConfig,
-    query: Option<&str>,
 ) -> Result<(), Response<BoxBody>> {
     let Some(secret_env) = cfg
         .observability
@@ -1625,13 +1562,6 @@ fn enforce_ops_auth_if_configured_inner(
     if got.len() == expected.len() && constant_time_eq(got.as_bytes(), expected.as_bytes()) {
         return Ok(());
     }
-    if let Some(q) = query {
-        if let Some(v) = parse_query_panda_ops_secret(q) {
-            if v.len() == expected.len() && constant_time_eq(v.as_bytes(), expected.as_bytes()) {
-                return Ok(());
-            }
-        }
-    }
     Err(text_response(StatusCode::UNAUTHORIZED, "unauthorized: invalid ops secret"))
 }
 
@@ -1639,7 +1569,6 @@ fn enforce_ops_auth_if_configured_inner(
 fn enforce_console_access(
     headers: &HeaderMap,
     cfg: &PandaConfig,
-    query: Option<&str>,
     oidc: Option<&Arc<console_oidc::ConsoleOidcRuntime>>,
 ) -> Result<(), Response<BoxBody>> {
     let has_admin = cfg
@@ -1647,7 +1576,7 @@ fn enforce_console_access(
         .admin_secret_env
         .as_ref()
         .is_some_and(|v| !v.trim().is_empty());
-    if has_admin && enforce_ops_auth_if_configured_inner(headers, cfg, query).is_ok() {
+    if has_admin && enforce_ops_auth_if_configured_inner(headers, cfg).is_ok() {
         return Ok(());
     }
     if cfg.console_oidc.enabled {
@@ -2561,7 +2490,7 @@ fn mcp_status_json(state: &ProxyState) -> serde_json::Value {
 fn readiness_status(state: &ProxyState) -> (StatusCode, serde_json::Value) {
     let draining = state.draining.load(Ordering::SeqCst);
     let upstream_ok = state.config.all_upstream_uris_valid();
-    let mcp_ok = !state.config.mcp.enabled || state.mcp.is_some() || state.config.mcp.fail_open;
+    let mcp_ok = !state.config.mcp.enabled || state.mcp.is_some();
     let context_enrichment_ok = if let Ok(path) = std::env::var("PANDA_CONTEXT_ENRICHMENT_FILE") {
         let t = path.trim();
         t.is_empty() || std::path::Path::new(t).exists()
@@ -5098,7 +5027,7 @@ mod tests {
 
         let mut c4 = TcpStream::connect(addr).await.unwrap();
         c4.write_all(
-            b"GET /console/ws?panda_ops_secret=console-secret-ops HTTP/1.1\r\nHost: panda\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+            b"GET /console/ws HTTP/1.1\r\nHost: panda\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nx-panda-admin-secret: console-secret-ops\r\n\r\n",
         )
         .await
         .unwrap();
@@ -5107,7 +5036,7 @@ mod tests {
         let r4 = String::from_utf8_lossy(&buf4[..n]);
         assert!(
             r4.contains("101") || r4.contains("Switching Protocols"),
-            "expected ws upgrade with query secret, got: {r4}"
+            "expected ws upgrade with header secret, got: {r4}"
         );
         drop(c4);
 

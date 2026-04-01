@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use http::header::{self, HeaderMap, HeaderValue};
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::Request;
@@ -11,6 +12,7 @@ use hyper::Response;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header as JwtHeader, Validation, decode, encode};
 use panda_config::ConsoleOidcConfig;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::HttpClient;
 use crate::jwks::JwksResolver;
@@ -27,7 +29,14 @@ pub struct ConsoleOidcRuntime {
     cfg: std::sync::Arc<ConsoleOidcConfig>,
     pub discovery: OpenIdDiscovery,
     pub jwks: std::sync::Arc<JwksResolver>,
-    pending: Mutex<HashMap<String, Instant>>,
+    pending: Mutex<HashMap<String, PendingAuth>>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingAuth {
+    created_at: Instant,
+    code_verifier: Option<String>,
+    nonce: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -140,17 +149,59 @@ impl ConsoleOidcRuntime {
         let redirect_uri = self.redirect_uri_public()?;
         let state = uuid::Uuid::new_v4().to_string();
         if let Ok(mut g) = self.pending.lock() {
-            g.retain(|_, t| t.elapsed() < Duration::from_secs(600));
-            g.insert(state.clone(), Instant::now());
+            g.retain(|_, t| t.created_at.elapsed() < Duration::from_secs(600));
+            let code_verifier = if self.cfg.require_pkce {
+                Some(generate_pkce_verifier())
+            } else {
+                None
+            };
+            let nonce = if self.cfg.require_nonce {
+                Some(uuid::Uuid::new_v4().as_simple().to_string())
+            } else {
+                None
+            };
+            g.insert(
+                state.clone(),
+                PendingAuth {
+                    created_at: Instant::now(),
+                    code_verifier,
+                    nonce,
+                },
+            );
         }
         let scope = self.cfg.scopes.join(" ");
+        let (pkce_query, nonce_query) = {
+            let g = self.pending.lock().map_err(|_| anyhow::anyhow!("pending lock"))?;
+            let p = g
+                .get(&state)
+                .ok_or_else(|| anyhow::anyhow!("pending oauth state missing"))?;
+            let pkce = p
+                .code_verifier
+                .as_ref()
+                .map(|v| {
+                    let challenge = pkce_s256_challenge(v);
+                    format!(
+                        "&code_challenge={}&code_challenge_method=S256",
+                        urlencoding::encode(&challenge)
+                    )
+                })
+                .unwrap_or_default();
+            let nonce = p
+                .nonce
+                .as_ref()
+                .map(|n| format!("&nonce={}", urlencoding::encode(n)))
+                .unwrap_or_default();
+            (pkce, nonce)
+        };
         let url = format!(
-            "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}",
+            "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}{}{}",
             self.discovery.authorization_endpoint,
             urlencoding::encode(self.cfg.client_id.trim()),
             urlencoding::encode(redirect_uri.trim()),
             urlencoding::encode(&scope),
             urlencoding::encode(&state),
+            pkce_query,
+            nonce_query,
         );
         let mut resp = Response::builder()
             .status(StatusCode::FOUND)
@@ -188,23 +239,28 @@ impl ConsoleOidcRuntime {
         }
         let code = code.ok_or_else(|| anyhow::anyhow!("missing code"))?;
         let state = state.ok_or_else(|| anyhow::anyhow!("missing state"))?;
-        {
+        let pending = {
             let mut g = self.pending.lock().map_err(|_| anyhow::anyhow!("pending lock"))?;
-            if g.remove(&state).is_none() {
+            let Some(p) = g.remove(&state) else {
                 anyhow::bail!("invalid or expired oauth state");
-            }
-        }
+            };
+            p
+        };
         let redirect_uri = self.redirect_uri_public()?;
         let secret = std::env::var(&self.cfg.client_secret_env)
             .map_err(|_| anyhow::anyhow!("client secret env not set"))?;
         let token_uri: hyper::Uri = self.discovery.token_endpoint.parse()?;
-        let form = format!(
+        let mut form = format!(
             "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&client_secret={}",
             urlencoding::encode(&code),
             urlencoding::encode(redirect_uri.trim()),
             urlencoding::encode(self.cfg.client_id.trim()),
             urlencoding::encode(&secret),
         );
+        if let Some(ref verifier) = pending.code_verifier {
+            form.push_str("&code_verifier=");
+            form.push_str(&urlencoding::encode(verifier));
+        }
         let traw = http_post_form(client, token_uri, form).await?;
         let tv: serde_json::Value = serde_json::from_str(&traw)?;
         let id_token = tv
@@ -230,6 +286,12 @@ impl ConsoleOidcRuntime {
         }
         .map_err(|e| anyhow::anyhow!("id_token invalid: {e}"))?;
         let claims = data.claims;
+        if let Some(expected_nonce) = pending.nonce.as_ref() {
+            let got_nonce = claims.get("nonce").and_then(|x| x.as_str()).unwrap_or_default();
+            if got_nonce != expected_nonce {
+                anyhow::bail!("id_token nonce mismatch");
+            }
+        }
         let sub = claims
             .get("sub")
             .and_then(|x| x.as_str())
@@ -269,11 +331,19 @@ impl ConsoleOidcRuntime {
         )
         .map_err(|e| anyhow::anyhow!("session jwt: {e}"))?;
 
+        let secure_cookie = self.cfg.force_secure_cookie
+            || self
+                .cfg
+                .redirect_base_url
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("https://");
         let cookie_val = format!(
-            "{}={}; Path=/console; HttpOnly; SameSite=Lax; Max-Age={}",
+            "{}={}; Path=/console; HttpOnly; SameSite=Lax; Max-Age={}{}",
             self.cfg.cookie_name.trim(),
             token,
-            self.cfg.session_ttl_seconds
+            self.cfg.session_ttl_seconds,
+            if secure_cookie { "; Secure" } else { "" },
         );
         let resp = Response::builder()
             .status(StatusCode::FOUND)
@@ -327,6 +397,18 @@ fn validate_session_cookie_for_cfg(cfg: &ConsoleOidcConfig, headers: &HeaderMap)
         }
     }
     false
+}
+
+fn generate_pkce_verifier() -> String {
+    // 64 chars from UUID hex is valid and within PKCE verifier size constraints.
+    let a = uuid::Uuid::new_v4().as_simple().to_string();
+    let b = uuid::Uuid::new_v4().as_simple().to_string();
+    format!("{a}{b}")
+}
+
+fn pkce_s256_challenge(verifier: &str) -> String {
+    let digest = Sha256::digest(verifier.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
 }
 
 #[cfg(test)]

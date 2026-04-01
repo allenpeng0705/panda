@@ -1500,6 +1500,7 @@ dependencies = [
  "aho-corasick",
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "constant_time_eq",
  "futures-util",

@@ -207,6 +207,7 @@ Small teams and single-region deployments can run Panda **without** Kong or anot
 - **Do not** expose the Developer Console publicly: keep `PANDA_DEV_CONSOLE_ENABLED` off in production unless debugging.
 - **Protect ops endpoints** when exposing `/metrics` or the Developer Console:
   - Set `observability.admin_secret_env` and pass the secret via the header name in `observability.admin_auth_header`.
+  - Staging script tip: `READINESS_AUTH_HEADER='x-panda-admin-secret: <secret>' ./scripts/staging_readiness_gate.sh`
 - **Secrets only from env** (JWT secret, upstream keys, Redis, ops secret)—not committed to git.
 
 ---

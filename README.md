@@ -1,5 +1,7 @@
 # Panda
 
+![Panda Logo](panda_site/assets/images/panda-logo.svg)
+
 **Panda is a Rust AI gateway** that sits between your clients (apps, agents, SDKs) and model providers. It speaks an **OpenAI-compatible HTTP API** on the front, and forwards to your chosen upstream—while adding **policy, identity, budgets, MCP tools, caching, safety, and observability** in one place.
 
 ---
@@ -258,6 +260,8 @@ docker run --rm -p 8080:8080 \
   panda:latest /app/panda.yaml
 ```
 
+Container images default `PANDA_LISTEN_OVERRIDE=0.0.0.0:8080` so host port publishing works out of the box.
+
 By default, the Docker build enables `mimalloc` (`PANDA_BUILD_FEATURES=mimalloc`).
 
 **MCP + Postgres lab:** `docker compose -f deploy/mcp-starters/docker-compose.yml up --build` (see `deploy/mcp-starters/README.md`).
@@ -269,6 +273,8 @@ By default, the Docker build enables `mimalloc` (`PANDA_BUILD_FEATURES=mimalloc`
 ## Kubernetes
 
 Starter manifests: `k8s/configmap.yaml`, `deployment.yaml`, `service.yaml`, `pdb.yaml`, `hpa.yaml`, `secret.example.yaml`.
+
+Before applying, set a real upstream in `k8s/configmap.yaml` (`replace-me-upstream` is a placeholder).
 
 ```bash
 kubectl apply -f k8s/configmap.yaml
@@ -324,6 +330,7 @@ Protect with `observability.admin_secret_env` + `observability.admin_auth_header
 ## Validation and performance scripts
 
 - `PANDA_BASE_URL=http://127.0.0.1:8080 ./scripts/staging_readiness_gate.sh`
+- Auth-protected status checks: `READINESS_AUTH_HEADER='x-panda-admin-secret: <secret>' PANDA_BASE_URL=http://127.0.0.1:8080 ./scripts/staging_readiness_gate.sh`
 - `PANDA_BASE_URL=http://127.0.0.1:8080 LOAD_PAYLOAD=./payload.json LOAD_REQUESTS=500 LOAD_CONCURRENCY=50 ./scripts/load_profile_chat.sh`
 - SSE soak: `PANDA_BASE_URL=... SOAK_PAYLOAD=./payload_stream.json ... ./scripts/soak_guard_sse.sh`
 - OTLP smoke: `./scripts/otlp_smoke.sh`

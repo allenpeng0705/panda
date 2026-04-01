@@ -16,7 +16,7 @@ mcp:
       enabled: true
       command: "npx"
       args:
-        - "-y"
+        - "--no-install"
         - "@modelcontextprotocol/server-filesystem"
         - "/workspace"
 
@@ -24,14 +24,14 @@ mcp:
     - name: github
       enabled: true
       command: "npx"
-      args: ["-y", "@modelcontextprotocol/server-github"]
+      args: ["--no-install", "@modelcontextprotocol/server-github"]
 
     # 3) Postgres — hostname `postgres` from compose network
     - name: postgres
       enabled: true
       command: "npx"
       args:
-        - "-y"
+        - "--no-install"
         - "@modelcontextprotocol/server-postgres"
         - "postgresql://panda:panda@postgres:5432/panda"
 
@@ -39,19 +39,19 @@ mcp:
     - name: memory
       enabled: true
       command: "npx"
-      args: ["-y", "@modelcontextprotocol/server-memory"]
+      args: ["--no-install", "@modelcontextprotocol/server-memory"]
 
     # 5) Fetch URLs as markdown — replace with Google Drive when OAuth is configured (see README).
     - name: fetch
       enabled: true
       command: "npx"
-      args: ["-y", "@modelcontextprotocol/server-fetch"]
+      args: ["--no-install", "@modelcontextprotocol/server-fetch"]
 
     # Optional: Google Drive (enable after mounting gcp-oauth.keys.json — see deploy/mcp-starters/README.md)
     # - name: gdrive
     #   enabled: false
     #   command: "npx"
-    #   args: ["-y", "@modelcontextprotocol/server-gdrive", "/secrets/gcp-oauth.keys.json"]
+    #   args: ["--no-install", "@modelcontextprotocol/server-gdrive", "/secrets/gcp-oauth.keys.json"]
 
 plugins:
   directory: null

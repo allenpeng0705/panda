@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Features - Panda AI Gateway</title>
+    <link rel="stylesheet" href="styles.css">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="script.js"></script>
+</head>
+<body>
+    <!-- Navigation -->
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark fixed-top">
+        <div class="container">
+            <a class="navbar-brand" href="index.html">
+                <img src="assets/images/panda-logo.svg" alt="Panda Logo" width="30" height="30" class="d-inline-block align-top me-2">
+                Panda AI Gateway
+            </a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav ms-auto">
+                    <li class="nav-item"><a class="nav-link" href="index.html">Home</a></li>
+                    <li class="nav-item"><a class="nav-link" href="quickstart.html">QuickStart</a></li>
+                    <li class="nav-item"><a class="nav-link" href="architecture.html">Architecture</a></li>
+                    <li class="nav-item"><a class="nav-link" href="deployment.html">Deployment</a></li>
+                    <li class="nav-item"><a class="nav-link active" href="features.html">Features</a></li>
+                    <li class="nav-item"><a class="nav-link" href="extensibility.html">Extensibility</a></li>
+                    <li class="nav-item"><a class="nav-link" href="observability.html">Observability</a></li>
+                    <li class="nav-item"><a class="nav-link" href="mcp.html">MCP</a></li>
+                    <li class="nav-item"><a class="nav-link" href="security.html">Security</a></li>
+                    <li class="nav-item"><a class="nav-link" href="roadmap.html">Roadmap</a></li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="https://github.com/allenpeng0705/panda" target="_blank">
+                            <i class="bi bi-github"></i> GitHub
+                        </a>
+                    </li>
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Hero Section -->
+    <header class="hero-section">
+        <div class="container">
+            <div class="row">
+                <div class="col-md-12 text-center">
+                    <h1 class="display-4">Features</h1>
+                    <p class="lead">Comprehensive capabilities for AI traffic management</p>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- Core Features -->
+    <section class="core-features py-12">
+        <div class="container">
+            <h2 class="mb-8">Core Features</h2>
+            
+            <div class="row">
+                <div class="col-md-6 mb-6">
+                    <div class="card h-100">
+                        <div class="card-body">
+                            <h3 class="card-title">OpenAI-Compatible API</h3>
+                            <p class="card-text">Panda presents an OpenAI-compatible HTTP API to clients, making it easy to integrate with existing applications and SDKs.</p>
+                            <ul class="list-unstyled mt-4">
+                                <li class="mb-2">• Chat completions endpoint (/v1/chat/completions)</li>
+                                <li class="mb-2">• Streaming support via Server-Sent Events (SSE)</li>
+                                <li class="mb-2">• Compatible with OpenAI SDKs and clients</li>
+                                <li class="mb-2">• Adapter path for other provider protocols</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6 mb-6">
+                    <div class="card h-100">
+                        <div class="card-body">
+                            <h3 class="card-title">Token-Based Budgeting (TPM)</h3>
+                            <p class="card-text">Control costs with token-per-minute (TPM) budgeting and limits.</p>
+                            <ul class="list-unstyled mt-4">
+                                <li class="mb-2">• Per-subject token budgets</li>
+                                <li class="mb-2">• Optional Redis integration for shared counters</li>
+                                <li class="mb-2">• /tpm/status endpoint for budget visibility</li>
+                                <li class="mb-2">• Configurable enforcement policies</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6 mb-6">
+                    <div class="card h-100">
+                        <div class="card-body">
+                            <h3 class="card-title">Semantic Cache</h3>
+                            <p class="card-text">Reduce costs and latency with vector similarity-based caching.</p>
+                            <ul class="list-unstyled mt-4">
+                                <li class="mb-2">• Vector similarity over prompts</li>
+                                <li class="mb-2">• Memory or Redis backend options</li>
+                                <li class="mb-2">• Configurable similarity threshold</li>
+                                <li class="mb-2">• Cache hit/miss metrics</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6 mb-6">
+                    <div class="card h-100">
+                        <div class="card-body">
+                            <h3 class="card-title">MCP Orchestration</h3>
+                            <p class="card-text">Model Context Protocol for tool orchestration and agent capabilities.</p>
+                            <ul class="list-unstyled mt-4">
+                                <li class="mb-2">• Tool call interception and execution</li>
+                                <li class="mb-2">• Multi-round follow-ups</li>
+                                <li class="mb-2">• Streaming tool responses</li>
+                                <li class="mb-2">• Unified tool surface for LLMs</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6 mb-6">
+                    <div class="card h-100">
+                        <div class="card-body">
+                            <h3 class="card-title">Security & Safety</h3>
+                            <p class="card-text">Comprehensive security features to protect your AI systems.</p>
+                            <ul class="list-unstyled mt-4">
+                                <li class="mb-2">• JWT/JWKS authentication</li>
+                                <li class="mb-2">• Prompt safety and injection protection</li>
+                                <li class="mb-2">• PII detection and redaction</li>
+                                <li class="mb-2">• Wasm plugins for custom security policies</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6 mb-6">
+                    <div class="card h-100">
+                        <div class="card-body">
+                            <h3 class="card-title">Observability</h3>
+                            <p class="card-text">Detailed metrics, logs, and traces for operational visibility.</p>
+                            <ul class="list-unstyled mt-4">
+                                <li class="mb-2">• Prometheus metrics endpoint</li>
+                                <li class="mb-2">• OpenTelemetry tracing</li>
+                                <li class="mb-2">• Structured JSON logs</li>
+                                <li class="mb-2">• Health and readiness endpoints</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Enterprise Features -->
+    <section class="enterprise-features py-12 bg-light">
+        <div class="container">
+            <h2 class="text-center mb-8">Enterprise Features</h2>
+            <p class="text-center mb-8">Optional enterprise-grade capabilities for larger organizations.</p>
+            
+            <div class="row">
+                <div class="col-md-4 mb-6">
+                    <div class="card h-100">
+                        <div class="card-body">
+                            <h3 class="card-title">SSO Integration</h3>
+                            <p class="card-text">Single Sign-On for the developer console using enterprise identity providers.</p>
+                            <ul class="list-unstyled mt-4">
+                                <li class="mb-2">• Okta integration</li>
+                                <li class="mb-2">• Microsoft Entra integration</li>
+                                <li class="mb-2">• OIDC compliance</li>
+                                <li class="mb-2">• Role-based access control</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-4 mb-6">
+                    <div class="card h-100">
+                        <div class="card-body">
+                            <h3 class="card-title">Hierarchical Budgets</h3>
+                            <p class="card-text">Multi-level budget hierarchies for teams and departments.</p>
+                            <ul class="list-unstyled mt-4">
+                                <li class="mb-2">• Department-level budgets</li>
+                                <li class="mb-2">• Team-level allocations</li>
+                                <li class="mb-2">• User-level limits</li>
+                                <li class="mb-2">• Budget rollup reporting</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-4 mb-6">
+                    <div class="card h-100">
+                        <div class="card-body">
+                            <h3 class="card-title">Model Failover</h3>
+                            <p class="card-text">Automatic failover between model providers for reliability.</p>
+                            <ul class="list-unstyled mt-4">
+                                <li class="mb-2">• Ordered failover chain</li>
+                                <li class="mb-2">• Health checks</li>
+                                <li class="mb-2">• Error-based failover</li>
+                                <li class="mb-2">• Load balancing across providers</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Performance Features -->
+    <section class="performance-features py-12">
+        <div class="container">
+            <h2 class="mb-8">Performance Features</h2>
+            
+            <div class="row">
+                <div class="col-md-6 mb-6">
+                    <h3>Stream Optimization</h3>
+                    <p>Panda is built for efficient streaming of LLM responses:</p>
+                    <ul class="list-unstyled">
+                        <li class="mb-2">• SSE (Server-Sent Events) support</li>
+                        <li class="mb-2">• Minimal copying of stream data</li>
+                        <li class="mb-2">• Stream timeouts and guards</li>
+                        <li class="mb-2">• Backpressure handling</li>
+                    </ul>
+                </div>
+                <div class="col-md-6 mb-6">
+                    <h3>Scalability</h3>
+                    <p>Designed for horizontal scaling:</p>
+                    <ul class="list-unstyled">
+                        <li class="mb-2">• Stateless core design</li>
+                        <li class="mb-2">• Optional shared state via Redis</li>
+                        <li class="mb-2">• Kubernetes-ready</li>
+                        <li class="mb-2">• Connection-based scaling</li>
+                    </ul>
+                </div>
+            </div>
+            
+            <div class="row mt-8">
+                <div class="col-md-6 mb-6">
+                    <h3>Runtime Performance</h3>
+                    <ul class="list-unstyled">
+                        <li class="mb-2">• Rust-based implementation</li>
+                        <li class="mb-2">• Async I/O with Tokio</li>
+                        <li class="mb-2">• Optional mimalloc for long-lived workloads</li>
+                        <li class="mb-2">• rustls for TLS termination</li>
+                    </ul>
+                </div>
+                <div class="col-md-6 mb-6">
+                    <h3>Resource Efficiency</h3>
+                    <ul class="list-unstyled">
+                        <li class="mb-2">• Low memory footprint</li>
+                        <li class="mb-2">• CPU-efficient streaming</li>
+                        <li class="mb-2">• Wasm instance pooling</li>
+                        <li class="mb-2">• Configurable resource limits</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Developer Experience -->
+    <section class="developer-experience py-12 bg-light">
+        <div class="container">
+            <h2 class="text-center mb-8">Developer Experience</h2>
+            
+            <div class="row">
+                <div class="col-md-4 mb-6">
+                    <div class="card h-100">
+                        <div class="card-body">
+                            <h3 class="card-title">Developer Console</h3>
+                            <p class="card-text">Live debug UI for request flow and MCP activity.</p>
+                            <ul class="list-unstyled mt-4">
+                                <li class="mb-2">• Real-time request monitoring</li>
+                                <li class="mb-2">• MCP tool activity</li>
+                                <li class="mb-2">• Token usage visualization</li>
+                                <li class="mb-2">• Configurable access control</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-4 mb-6">
+                    <div class="card h-100">
+                        <div class="card-body">
+                            <h3 class="card-title">Configuration</h3>
+                            <p class="card-text">GitOps-friendly YAML configuration.</p>
+                            <ul class="list-unstyled mt-4">
+                                <li class="mb-2">• Single YAML config file</li>
+                                <li class="mb-2">• Environment variable overrides</li>
+                                <li class="mb-2">• Hot reload for plugins</li>
+                                <li class="mb-2">• Clear schema documentation</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-4 mb-6">
+                    <div class="card h-100">
+                        <div class="card-body">
+                            <h3 class="card-title">API Documentation</h3>
+                            <p class="card-text">Comprehensive API documentation and examples.</p>
+                            <ul class="list-unstyled mt-4">
+                                <li class="mb-2">• OpenAPI specification</li>
+                                <li class="mb-2">• Example requests</li>
+                                <li class="mb-2">• SDK integration guides</li>
+                                <li class="mb-2">• Troubleshooting documentation</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Feature Comparison -->
+    <section class="feature-comparison py-12">
+        <div class="container">
+            <h2 class="text-center mb-8">Feature Comparison</h2>
+            <p class="text-center mb-8">How Panda compares to generic API gateways</p>
+            
+            <table class="table table-bordered">
+                <thead>
+                    <tr>
+                        <th>Feature</th>
+                        <th>Panda</th>
+                        <th>Generic API Gateway</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>AI-specific protocols</td>
+                        <td>✓ OpenAI-compatible, SSE streaming</td>
+                        <td>✗ Limited support</td>
+                    </tr>
+                    <tr>
+                        <td>Token-based budgeting</td>
+                        <td>✓ TPM with Redis integration</td>
+                        <td>✗ Usually RPS-only</td>
+                    </tr>
+                    <tr>
+                        <td>Semantic cache</td>
+                        <td>✓ Vector similarity-based</td>
+                        <td>✗ Not available</td>
+                    </tr>
+                    <tr>
+                        <td>MCP tool orchestration</td>
+                        <td>✓ Built-in</td>
+                        <td>✗ Not available</td>
+                    </tr>
+                    <tr>
+                        <td>Prompt safety</td>
+                        <td>✓ Built-in protection</td>
+                        <td>✗ Not available</td>
+                    </tr>
+                    <tr>
+                        <td>PII scrubbing</td>
+                        <td>✓ Built-in</td>
+                        <td>✗ Limited or plugin-only</td>
+                    </tr>
+                    <tr>
+                        <td>Wasm plugins</td>
+                        <td>✓ Rust and Go support</td>
+                        <td>✗ Often Lua-only</td>
+                    </tr>
+                    <tr>
+                        <td>Intent-aware routing</td>
+                        <td>✓ Based on prompt content</td>
+                        <td>✗ Path-based only</td>
+                    </tr>
+                    <tr>
+                        <td>Stream optimization</td>
+                        <td>✓ Purpose-built for SSE</td>
+                        <td>✗ Generic HTTP handling</td>
+                    </tr>
+                    <tr>
+                        <td>Stateless design</td>
+                        <td>✓ No mandatory database</td>
+                        <td>✗ Often requires control plane DB</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="footer bg-dark text-white py-8">
+        <div class="container">
+            <div class="row">
+                <div class="col-md-3">
+                    <h4>Panda AI Gateway</h4>
+                    <p>A high-performance, stateless, intent-aware gateway for LLMs and AI services.</p>
+                </div>
+                <div class="col-md-3">
+                    <h4>Quick Links</h4>
+                    <ul class="list-unstyled">
+                        <li><a href="quickstart.html" class="text-light">QuickStart</a></li>
+                        <li><a href="architecture.html" class="text-light">Architecture</a></li>
+                        <li><a href="deployment.html" class="text-light">Deployment</a></li>
+                        <li><a href="features.html" class="text-light">Features</a></li>
+                    </ul>
+                </div>
+                <div class="col-md-3">
+                    <h4>Resources</h4>
+                    <ul class="list-unstyled">
+                        <li><a href="https://github.com/allenpeng0705/panda" class="text-light">GitHub</a></li>
+                        <li><a href="https://discord.gg/panda" class="text-light">Discord Community</a></li>
+                        <li><a href="https://docs.panda.dev" class="text-light">Documentation</a></li>
+                    </ul>
+                </div>
+                <div class="col-md-3">
+                    <h4>Contact</h4>
+                    <ul class="list-unstyled">
+                        <li><a href="mailto:shileipeng@gmail.com" class="text-light">shileipeng@gmail.com</a></li>
+                        <li><a href="mailto:shilei.peng@qq.com" class="text-light">shilei.peng@qq.com</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="border-top border-gray mt-6 pt-6 text-center">
+                <p>&copy; 2026 Panda AI Gateway. All rights reserved.</p>
+            </div>
+        </div>
+    </footer>
+</body>
+</html>

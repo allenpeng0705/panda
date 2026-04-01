@@ -1,6 +1,6 @@
 # MCP starter stack (Docker Compose)
 
-Runs **Panda** with **Node.js** inside the image so `npx @modelcontextprotocol/*` MCP servers can be spawned as **stdio** children (same model as local `panda.yaml`).
+Runs **Panda** with **Node.js** inside the image so `npx @modelcontextprotocol/*` MCP servers can be spawned as **stdio** children (same model as local `panda.yaml`). MCP packages are preinstalled at image build, and runtime uses `npx --no-install`.
 
 ## What you get
 
@@ -59,7 +59,7 @@ services:
 
 - `server-fetch` can retrieve arbitrary URLs; use only in trusted environments or disable in `panda.mcp-starter.yaml`.  
 - GitHub and OpenAI tokens are **secrets**; do not commit `.env`.  
-- First `npx` runs download packages; images can be large and startup may be slow on cold cache.
+- MCP packages are installed during image build; runtime avoids ad-hoc package fetches (`npx --no-install`).
 
 ## See also
 

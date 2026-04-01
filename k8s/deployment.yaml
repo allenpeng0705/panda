@@ -16,11 +16,23 @@ spec:
         app.kubernetes.io/name: panda
     spec:
       terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: panda
-          image: panda:latest
+          image: panda:0.1.0
           imagePullPolicy: IfNotPresent
           args: ["/etc/panda/panda.yaml"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           ports:
             - name: http
               containerPort: 8080
@@ -66,7 +78,11 @@ spec:
             - name: panda-config
               mountPath: /etc/panda
               readOnly: true
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: panda-config
           configMap:
             name: panda-config
+        - name: tmp
+          emptyDir: {}

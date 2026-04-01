@@ -117,7 +117,7 @@ impl BudgetHierarchyCounters {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("panda budget_hierarchy: redis EVAL failed: {e}");
-                return true;
+                return self.cfg.fail_open;
             }
         };
         r == 1
