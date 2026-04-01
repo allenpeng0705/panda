@@ -777,6 +777,248 @@ impl Default for ContextManagementConfig {
     }
 }
 
+/// OIDC login for the Developer Console (Okta, Entra, etc.). Off by default (Core track).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConsoleOidcConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Issuer base URL (e.g. `https://login.microsoftonline.com/{tenant}/v2.0`).
+    #[serde(default)]
+    pub issuer_url: String,
+    #[serde(default)]
+    pub client_id: String,
+    /// Env var holding the OIDC client secret (confidential client).
+    #[serde(default)]
+    pub client_secret_env: String,
+    /// Browser redirect URI path on this host (must match IdP app registration).
+    #[serde(default = "default_console_oidc_redirect_path")]
+    pub redirect_path: String,
+    /// Public base URL for redirects (e.g. `https://panda.example.com`). If empty, derived from request `Host` (dev only).
+    #[serde(default)]
+    pub redirect_base_url: String,
+    #[serde(default = "default_console_oidc_scopes")]
+    pub scopes: Vec<String>,
+    #[serde(default = "default_console_oidc_cookie_name")]
+    pub cookie_name: String,
+    #[serde(default = "default_console_oidc_session_ttl_seconds")]
+    pub session_ttl_seconds: u64,
+    /// Env var with secret bytes for signing console session cookies (HS256).
+    #[serde(default = "default_console_oidc_signing_secret_env")]
+    pub signing_secret_env: String,
+    /// Optional JWT claim name on the IdP `id_token` for RBAC (string or array of strings).
+    #[serde(default)]
+    pub roles_claim: String,
+    /// If non-empty, require at least one of these role strings in `roles_claim`.
+    #[serde(default)]
+    pub required_roles: Vec<String>,
+}
+
+fn default_console_oidc_redirect_path() -> String {
+    "/console/oauth/callback".to_string()
+}
+
+fn default_console_oidc_scopes() -> Vec<String> {
+    vec![
+        "openid".to_string(),
+        "profile".to_string(),
+        "email".to_string(),
+    ]
+}
+
+fn default_console_oidc_cookie_name() -> String {
+    "panda_console_session".to_string()
+}
+
+fn default_console_oidc_session_ttl_seconds() -> u64 {
+    86400
+}
+
+fn default_console_oidc_signing_secret_env() -> String {
+    "PANDA_CONSOLE_SESSION_SECRET".to_string()
+}
+
+impl Default for ConsoleOidcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            issuer_url: String::new(),
+            client_id: String::new(),
+            client_secret_env: String::new(),
+            redirect_path: default_console_oidc_redirect_path(),
+            redirect_base_url: String::new(),
+            scopes: default_console_oidc_scopes(),
+            cookie_name: default_console_oidc_cookie_name(),
+            session_ttl_seconds: default_console_oidc_session_ttl_seconds(),
+            signing_secret_env: default_console_oidc_signing_secret_env(),
+            roles_claim: String::new(),
+            required_roles: vec![],
+        }
+    }
+}
+
+/// Per-department prompt-token budget (rolling minute), plus optional org-wide cap (Enterprise).
+#[derive(Debug, Clone, Deserialize)]
+pub struct BudgetHierarchyDepartmentLimit {
+    pub department: String,
+    pub prompt_tokens_per_minute: u64,
+}
+
+/// Hierarchical token budgets keyed by a JWT claim (e.g. `department`). Requires Redis.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BudgetHierarchyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Top-level claim name on the JWT payload (e.g. `department` or `cost_center`).
+    #[serde(default = "default_budget_hierarchy_jwt_claim")]
+    pub jwt_claim: String,
+    /// Optional org-wide prompt budget per rolling minute (all departments share this cap).
+    #[serde(default)]
+    pub org_prompt_tokens_per_minute: Option<u64>,
+    #[serde(default)]
+    pub departments: Vec<BudgetHierarchyDepartmentLimit>,
+    /// Override Redis URL; defaults to `tpm.redis_url` / `PANDA_REDIS_URL` when unset.
+    #[serde(default)]
+    pub redis_url: Option<String>,
+}
+
+fn default_budget_hierarchy_jwt_claim() -> String {
+    "department".to_string()
+}
+
+impl Default for BudgetHierarchyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            jwt_claim: default_budget_hierarchy_jwt_claim(),
+            org_prompt_tokens_per_minute: None,
+            departments: vec![],
+            redis_url: None,
+        }
+    }
+}
+
+/// Wire protocol for a failover hop (ingress remains OpenAI-shaped unless transformed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelFailoverProtocol {
+    /// OpenAI Chat Completions, Embeddings, Responses, etc. (same JSON/path as client).
+    #[serde(alias = "openai")]
+    OpenaiCompatible,
+    /// Anthropic Messages API — Panda maps OpenAI chat JSON → `/v1/messages` for this hop only.
+    Anthropic,
+}
+
+impl Default for ModelFailoverProtocol {
+    fn default() -> Self {
+        Self::OpenaiCompatible
+    }
+}
+
+/// Which logical API this backend accepts for failover (empty `supports` = defaults for [`ModelFailoverProtocol`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelFailoverOperation {
+    ChatCompletions,
+    Embeddings,
+    Responses,
+    Images,
+    Audio,
+}
+
+/// One physical backend in a model parity / failover chain.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelFailoverBackend {
+    pub upstream: String,
+    /// When set, replace `Authorization` (or `api-key`) for this hop only.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub use_api_key_header: bool,
+    #[serde(default)]
+    pub protocol: ModelFailoverProtocol,
+    /// Empty: infer from `protocol` (OpenAI: chat + embeddings + responses; Anthropic: chat only).
+    #[serde(default)]
+    pub supports: Vec<ModelFailoverOperation>,
+    /// When `false`, this backend is skipped for streaming chat requests. Default: accept streaming.
+    #[serde(default)]
+    pub supports_streaming: Option<bool>,
+}
+
+/// Map request `model` names to an ordered list of backends (model parity / failover).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelFailoverGroup {
+    /// If empty, matches any `model` on the chat path.
+    #[serde(default)]
+    pub match_models: Vec<String>,
+    #[serde(default)]
+    pub backends: Vec<ModelFailoverBackend>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelFailoverConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Prefix for OpenAI-style chat (e.g. `/v1/chat` matches `/v1/chat/completions`).
+    #[serde(default = "default_model_failover_path_prefix")]
+    pub path_prefix: String,
+    /// Optional prefix for `/v1/embeddings` (or compatible) failover. When unset, embeddings are not in the failover map.
+    #[serde(default)]
+    pub embeddings_path_prefix: Option<String>,
+    /// Optional prefix for OpenAI Responses API failover (`/v1/responses`). Pass-through only (no Anthropic mapping).
+    #[serde(default)]
+    pub responses_path_prefix: Option<String>,
+    /// Optional prefix for OpenAI Images API failover (`/v1/images`).
+    #[serde(default)]
+    pub images_path_prefix: Option<String>,
+    /// Optional prefix for OpenAI Audio API failover (`/v1/audio`).
+    #[serde(default)]
+    pub audio_path_prefix: Option<String>,
+    /// When `false` (default), once a hop returns `200` with an SSE body, Panda does not fail over to the next backend on mid-stream errors (safe default).
+    #[serde(default)]
+    pub allow_failover_after_first_byte: bool,
+    /// Enable local in-process failover circuit breaker.
+    #[serde(default)]
+    pub circuit_breaker_enabled: bool,
+    /// Open circuit after this many consecutive retryable failures per backend.
+    #[serde(default = "default_model_failover_cb_failure_threshold")]
+    pub circuit_breaker_failure_threshold: u32,
+    /// Keep circuit open for this many seconds.
+    #[serde(default = "default_model_failover_cb_open_seconds")]
+    pub circuit_breaker_open_seconds: u64,
+    #[serde(default)]
+    pub groups: Vec<ModelFailoverGroup>,
+}
+
+fn default_model_failover_path_prefix() -> String {
+    "/v1/chat".to_string()
+}
+
+fn default_model_failover_cb_failure_threshold() -> u32 {
+    3
+}
+
+fn default_model_failover_cb_open_seconds() -> u64 {
+    30
+}
+
+impl Default for ModelFailoverConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path_prefix: default_model_failover_path_prefix(),
+            embeddings_path_prefix: None,
+            responses_path_prefix: None,
+            images_path_prefix: None,
+            audio_path_prefix: None,
+            allow_failover_after_first_byte: false,
+            circuit_breaker_enabled: false,
+            circuit_breaker_failure_threshold: default_model_failover_cb_failure_threshold(),
+            circuit_breaker_open_seconds: default_model_failover_cb_open_seconds(),
+            groups: vec![],
+        }
+    }
+}
+
 /// Top-level config as loaded from disk (e.g. `panda.yaml`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct PandaConfig {
@@ -818,6 +1060,12 @@ pub struct PandaConfig {
     pub rate_limit_fallback: RateLimitFallbackConfig,
     #[serde(default)]
     pub context_management: ContextManagementConfig,
+    #[serde(default)]
+    pub console_oidc: ConsoleOidcConfig,
+    #[serde(default)]
+    pub budget_hierarchy: BudgetHierarchyConfig,
+    #[serde(default)]
+    pub model_failover: ModelFailoverConfig,
 }
 
 impl PandaConfig {
@@ -1282,6 +1530,169 @@ impl PandaConfig {
                 anyhow::bail!("context_management.system_prompt must be non-empty when context_management.enabled=true");
             }
         }
+        if self.console_oidc.enabled {
+            if self.console_oidc.issuer_url.trim().is_empty() {
+                anyhow::bail!("console_oidc.issuer_url is required when console_oidc.enabled=true");
+            }
+            let iu: http::Uri = self
+                .console_oidc
+                .issuer_url
+                .trim()
+                .parse()
+                .map_err(|e| anyhow::anyhow!("console_oidc.issuer_url invalid URI: {e}"))?;
+            if iu.scheme_str() != Some("https") && iu.scheme_str() != Some("http") {
+                anyhow::bail!("console_oidc.issuer_url must use http or https");
+            }
+            if self.console_oidc.client_id.trim().is_empty() {
+                anyhow::bail!("console_oidc.client_id is required when console_oidc.enabled=true");
+            }
+            if self.console_oidc.client_secret_env.trim().is_empty() {
+                anyhow::bail!("console_oidc.client_secret_env is required when console_oidc.enabled=true");
+            }
+            if self.console_oidc.signing_secret_env.trim().is_empty() {
+                anyhow::bail!("console_oidc.signing_secret_env is required when console_oidc.enabled=true");
+            }
+            if self.console_oidc.redirect_path.trim().is_empty()
+                || !self.console_oidc.redirect_path.starts_with('/')
+            {
+                anyhow::bail!("console_oidc.redirect_path must be a non-empty absolute path");
+            }
+            if self.console_oidc.session_ttl_seconds == 0 {
+                anyhow::bail!("console_oidc.session_ttl_seconds must be > 0 when console_oidc.enabled=true");
+            }
+            if self.console_oidc.cookie_name.trim().is_empty() {
+                anyhow::bail!("console_oidc.cookie_name must be non-empty when console_oidc.enabled=true");
+            }
+            if self.console_oidc.scopes.is_empty() {
+                anyhow::bail!("console_oidc.scopes must not be empty when console_oidc.enabled=true");
+            }
+            for r in &self.console_oidc.required_roles {
+                if r.trim().is_empty() {
+                    anyhow::bail!("console_oidc.required_roles entries must be non-empty");
+                }
+            }
+            if !self.console_oidc.redirect_base_url.trim().is_empty() {
+                let b: http::Uri = self
+                    .console_oidc
+                    .redirect_base_url
+                    .trim()
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("console_oidc.redirect_base_url invalid URI: {e}"))?;
+                if b.scheme_str() != Some("https") && b.scheme_str() != Some("http") {
+                    anyhow::bail!("console_oidc.redirect_base_url must use http or https");
+                }
+            }
+        }
+        if self.budget_hierarchy.enabled {
+            let redis = self.effective_budget_hierarchy_redis_url();
+            if redis.is_none() {
+                anyhow::bail!(
+                    "budget_hierarchy.enabled requires tpm.redis_url, budget_hierarchy.redis_url, or PANDA_REDIS_URL"
+                );
+            }
+            if self.budget_hierarchy.jwt_claim.trim().is_empty() {
+                anyhow::bail!("budget_hierarchy.jwt_claim must be non-empty when budget_hierarchy.enabled=true");
+            }
+            if self.budget_hierarchy.org_prompt_tokens_per_minute == Some(0) {
+                anyhow::bail!("budget_hierarchy.org_prompt_tokens_per_minute must be > 0 when set");
+            }
+            if self.budget_hierarchy.departments.is_empty()
+                && self.budget_hierarchy.org_prompt_tokens_per_minute.is_none()
+            {
+                anyhow::bail!(
+                    "budget_hierarchy requires at least one departments[] entry or org_prompt_tokens_per_minute"
+                );
+            }
+            for d in &self.budget_hierarchy.departments {
+                if d.department.trim().is_empty() {
+                    anyhow::bail!("budget_hierarchy.departments.department must be non-empty");
+                }
+                if d.prompt_tokens_per_minute == 0 {
+                    anyhow::bail!("budget_hierarchy.departments.prompt_tokens_per_minute must be > 0");
+                }
+            }
+            if !self.identity.require_jwt {
+                anyhow::bail!("budget_hierarchy.enabled requires identity.require_jwt=true for JWT claim extraction");
+            }
+        }
+        if self.model_failover.enabled {
+            if self.model_failover.path_prefix.trim().is_empty()
+                || !self.model_failover.path_prefix.starts_with('/')
+            {
+                anyhow::bail!("model_failover.path_prefix must be a non-empty path starting with /");
+            }
+            if self.model_failover.groups.is_empty() {
+                anyhow::bail!("model_failover.groups must not be empty when model_failover.enabled=true");
+            }
+            for g in &self.model_failover.groups {
+                if g.backends.is_empty() {
+                    anyhow::bail!("each model_failover group must have at least one backend");
+                }
+                for m in &g.match_models {
+                    if m.trim().is_empty() {
+                        anyhow::bail!("model_failover.match_models entries must be non-empty");
+                    }
+                }
+                for b in &g.backends {
+                    if b.upstream.trim().is_empty() {
+                        anyhow::bail!("model_failover backend upstream must not be empty");
+                    }
+                    let u: http::Uri = b
+                        .upstream
+                        .trim()
+                        .parse()
+                        .map_err(|e| anyhow::anyhow!("model_failover backend upstream invalid URI: {e}"))?;
+                    if u.scheme_str() != Some("http") && u.scheme_str() != Some("https") {
+                        anyhow::bail!("model_failover backend upstream must use http or https");
+                    }
+                    if b.api_key_env.as_ref().is_some_and(|e| e.trim().is_empty()) {
+                        anyhow::bail!("model_failover backend api_key_env must be non-empty when set");
+                    }
+                    if b.protocol == ModelFailoverProtocol::Anthropic {
+                        for op in &b.supports {
+                            if *op != ModelFailoverOperation::ChatCompletions {
+                                anyhow::bail!(
+                                    "model_failover: anthropic protocol backends only support chat_completions (got {:?})",
+                                    op
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(ref e) = self.model_failover.embeddings_path_prefix {
+                let t = e.trim();
+                if t.is_empty() || !t.starts_with('/') {
+                    anyhow::bail!("model_failover.embeddings_path_prefix must be a non-empty path starting with /");
+                }
+            }
+            if let Some(ref r) = self.model_failover.responses_path_prefix {
+                let t = r.trim();
+                if t.is_empty() || !t.starts_with('/') {
+                    anyhow::bail!("model_failover.responses_path_prefix must be a non-empty path starting with /");
+                }
+            }
+            if let Some(ref r) = self.model_failover.images_path_prefix {
+                let t = r.trim();
+                if t.is_empty() || !t.starts_with('/') {
+                    anyhow::bail!("model_failover.images_path_prefix must be a non-empty path starting with /");
+                }
+            }
+            if let Some(ref r) = self.model_failover.audio_path_prefix {
+                let t = r.trim();
+                if t.is_empty() || !t.starts_with('/') {
+                    anyhow::bail!("model_failover.audio_path_prefix must be a non-empty path starting with /");
+                }
+            }
+            if self.model_failover.circuit_breaker_enabled {
+                if self.model_failover.circuit_breaker_failure_threshold == 0 {
+                    anyhow::bail!("model_failover.circuit_breaker_failure_threshold must be > 0");
+                }
+                if self.model_failover.circuit_breaker_open_seconds == 0 {
+                    anyhow::bail!("model_failover.circuit_breaker_open_seconds must be > 0");
+                }
+            }
+        }
         if self.semantic_cache.enabled {
             match self.semantic_cache.backend.as_str() {
                 "memory" | "redis" => {}
@@ -1474,6 +1885,15 @@ impl PandaConfig {
             })
     }
 
+    /// Redis for hierarchical budgets: explicit `budget_hierarchy.redis_url`, else TPM/env Redis.
+    pub fn effective_budget_hierarchy_redis_url(&self) -> Option<String> {
+        self.budget_hierarchy
+            .redis_url
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| self.effective_redis_url())
+    }
+
     /// Effective semantic-cache Redis URL: YAML, then env `PANDA_SEMANTIC_CACHE_REDIS_URL`, then `PANDA_REDIS_URL`.
     pub fn effective_semantic_cache_redis_url(&self) -> Option<String> {
         self.semantic_cache
@@ -1565,6 +1985,12 @@ mod tests {
         assert_eq!(cfg.tpm.redis_degraded_limit_ratio, 0.5);
         assert!(!cfg.observability.compliance_export.enabled);
         assert_eq!(cfg.observability.compliance_export.mode, "off");
+        assert!(!cfg.console_oidc.enabled);
+        assert!(!cfg.budget_hierarchy.enabled);
+        assert!(!cfg.model_failover.enabled);
+        assert!(!cfg.model_failover.allow_failover_after_first_byte);
+        assert!(cfg.model_failover.embeddings_path_prefix.is_none());
+        assert!(cfg.model_failover.responses_path_prefix.is_none());
         assert_eq!(cfg.observability.admin_auth_header, "x-panda-admin-secret");
         assert!(cfg.observability.admin_secret_env.is_none());
         assert!(!cfg.identity.require_jwt);

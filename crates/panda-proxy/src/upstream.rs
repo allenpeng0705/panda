@@ -16,6 +16,19 @@ pub fn join_upstream_uri(upstream_base: &str, req_uri: &Uri) -> anyhow::Result<U
         .map_err(|e| anyhow::anyhow!("invalid joined upstream URI: {e}"))
 }
 
+/// Replace the path on `uri`, preserving the query string if present (`new_path` is e.g. `/v1/messages`).
+pub fn rewrite_uri_path_preserving_query(uri: &Uri, new_path: &str) -> anyhow::Result<Uri> {
+    let mut parts = uri.clone().into_parts();
+    let pq = parts
+        .path_and_query
+        .as_ref()
+        .and_then(|pq| pq.query())
+        .map(|q| format!("{new_path}?{q}"))
+        .unwrap_or_else(|| new_path.to_string());
+    parts.path_and_query = Some(pq.parse().map_err(|e| anyhow::anyhow!("path_and_query: {e}"))?);
+    Uri::from_parts(parts).map_err(|e| anyhow::anyhow!("uri parts: {e}"))
+}
+
 /// Request headers we never forward (hop-by-hop or set from target URI).
 pub fn filter_request_headers(src: &HeaderMap, dst: &mut HeaderMap) {
     for (name, value) in src.iter() {
@@ -99,6 +112,14 @@ mod tests {
         let u = join_upstream_uri("https://api.openai.com/v1/", &"/chat/completions".parse().unwrap())
             .unwrap();
         assert_eq!(u.to_string(), "https://api.openai.com/v1/chat/completions");
+    }
+
+    #[test]
+    fn rewrite_uri_path_preserving_query_keeps_query() {
+        let u = "https://api.example/v1/chat/completions?x=1".parse::<Uri>().unwrap();
+        let out = super::rewrite_uri_path_preserving_query(&u, "/v1/messages").unwrap();
+        assert_eq!(out.path(), "/v1/messages");
+        assert_eq!(out.query(), Some("x=1"));
     }
 
     #[test]

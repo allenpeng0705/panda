@@ -17,6 +17,9 @@ mod tls;
 mod tpm;
 mod compliance_export;
 mod upstream;
+mod budget_hierarchy;
+mod console_oidc;
+mod model_failover;
 
 #[cfg(feature = "embedded-console-ui")]
 #[derive(rust_embed::RustEmbed)]
@@ -132,6 +135,10 @@ pub struct ProxyState {
     pub jwks: Option<Arc<jwks::JwksResolver>>,
     /// Optional compliance audit sink (local signed JSONL stub).
     compliance: Option<Arc<compliance_export::ComplianceSinkShared>>,
+    /// Org / department prompt caps (Enterprise; Redis).
+    pub budget_hierarchy: Option<Arc<budget_hierarchy::BudgetHierarchyCounters>>,
+    /// OIDC login runtime for the developer console (Enterprise).
+    pub console_oidc: Option<Arc<console_oidc::ConsoleOidcRuntime>>,
 }
 
 #[derive(Clone)]
@@ -813,6 +820,40 @@ struct JwtClaims {
     scp: Option<serde_json::Value>,
     #[allow(dead_code)]
     exp: usize,
+    #[serde(default)]
+    #[serde(flatten)]
+    extra: HashMap<String, serde_json::Value>,
+}
+
+fn jwt_claim_as_string(claims: &JwtClaims, key: &str) -> Option<String> {
+    let k = key.trim();
+    if k.is_empty() {
+        return None;
+    }
+    if k == "sub" {
+        return claims
+            .sub
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+    }
+    let v = claims.extra.get(k)?;
+    match v {
+        serde_json::Value::String(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        }
+        serde_json::Value::Array(a) => a
+            .first()
+            .and_then(|x| x.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        _ => None,
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -933,6 +974,29 @@ pub async fn run(config: Arc<PandaConfig>) -> anyhow::Result<()> {
         None
     };
 
+    let budget_hierarchy = if config.budget_hierarchy.enabled {
+        let redis_url = config
+            .effective_budget_hierarchy_redis_url()
+            .ok_or_else(|| anyhow::anyhow!("budget_hierarchy.enabled but no Redis URL"))?;
+        Some(Arc::new(
+            budget_hierarchy::BudgetHierarchyCounters::connect(
+                Arc::new(config.budget_hierarchy.clone()),
+                &redis_url,
+            )
+            .await?,
+        ))
+    } else {
+        None
+    };
+
+    let console_oidc = if config.console_oidc.enabled {
+        Some(
+            console_oidc::ConsoleOidcRuntime::connect(&config.console_oidc, &client).await?,
+        )
+    } else {
+        None
+    };
+
     let state = Arc::new(ProxyState {
         config: Arc::clone(&config),
         client,
@@ -950,6 +1014,8 @@ pub async fn run(config: Arc<PandaConfig>) -> anyhow::Result<()> {
         rps,
         jwks,
         compliance,
+        budget_hierarchy,
+        console_oidc,
     });
 
     if let Some(ref tls_cfg) = config.tls {
@@ -1161,6 +1227,52 @@ async fn dispatch(mut req: Request<Incoming>, state: Arc<ProxyState>) -> Result<
         && (path == "/console"
             || path == "/console/"
             || path.starts_with("/console/"));
+    if console_get && path == "/console/oauth/login" && state.config.console_oidc.enabled {
+        if let Some(ref oidc) = state.console_oidc {
+            match oidc.handle_login() {
+                Ok(r) => {
+                    trace_request(
+                        &path,
+                        &method,
+                        &corr,
+                        r.status(),
+                        started.elapsed().as_millis(),
+                    );
+                    return Ok(r);
+                }
+                Err(e) => {
+                    eprintln!("panda: console oauth login error: {e:#}");
+                    return Ok(text_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "oauth login failed",
+                    ));
+                }
+            }
+        }
+    }
+    if console_get && path == "/console/oauth/callback" && state.config.console_oidc.enabled {
+        if let Some(ref oidc) = state.console_oidc {
+            match oidc.handle_callback(&state.client, req.uri().query()).await {
+                Ok(r) => {
+                    trace_request(
+                        &path,
+                        &method,
+                        &corr,
+                        r.status(),
+                        started.elapsed().as_millis(),
+                    );
+                    return Ok(r);
+                }
+                Err(e) => {
+                    eprintln!("panda: console oauth callback error: {e:#}");
+                    return Ok(text_response(
+                        StatusCode::BAD_REQUEST,
+                        "oauth callback failed",
+                    ));
+                }
+            }
+        }
+    }
     if console_get {
         let Some(ref hub) = state.console_hub else {
             return Ok(text_response(
@@ -1182,19 +1294,25 @@ async fn dispatch(mut req: Request<Incoming>, state: Arc<ProxyState>) -> Result<
                 console_api_config_json(&state.config),
             ));
         }
-        if state
+        let need_console_auth = state
             .config
             .observability
             .admin_secret_env
             .as_ref()
             .is_some_and(|v| !v.trim().is_empty())
-        {
+            || state.config.console_oidc.enabled;
+        if need_console_auth {
             let corr_ops = ops_log_correlation_id(req.headers(), &state.config);
             let uri_q = req.uri().query();
             let auth = if path == "/console/ws" {
-                enforce_ops_auth_if_configured_for_console_ws(req.headers(), &state.config, uri_q)
+                enforce_console_access(
+                    req.headers(),
+                    &state.config,
+                    uri_q,
+                    state.console_oidc.as_ref(),
+                )
             } else {
-                enforce_ops_auth_if_configured(req.headers(), &state.config)
+                enforce_console_access(req.headers(), &state.config, None, state.console_oidc.as_ref())
             };
             if let Err(resp) = auth {
                 state.ops_metrics.inc_ops_auth_denied(&path);
@@ -1431,16 +1549,6 @@ fn enforce_ops_auth_if_configured(headers: &HeaderMap, cfg: &PandaConfig) -> Res
     enforce_ops_auth_if_configured_inner(headers, cfg, None)
 }
 
-/// Like [`enforce_ops_auth_if_configured`], but for `/console/ws` also accepts `?panda_ops_secret=` (dev-only;
-/// browsers cannot set custom headers on WebSocket). Prefer the admin header when possible.
-fn enforce_ops_auth_if_configured_for_console_ws(
-    headers: &HeaderMap,
-    cfg: &PandaConfig,
-    query: Option<&str>,
-) -> Result<(), Response<BoxBody>> {
-    enforce_ops_auth_if_configured_inner(headers, cfg, query)
-}
-
 fn parse_query_panda_ops_secret(query: &str) -> Option<String> {
     for pair in query.split('&') {
         let mut it = pair.splitn(2, '=');
@@ -1525,6 +1633,37 @@ fn enforce_ops_auth_if_configured_inner(
         }
     }
     Err(text_response(StatusCode::UNAUTHORIZED, "unauthorized: invalid ops secret"))
+}
+
+/// Developer console: ops shared secret and/or OIDC session cookie (when `console_oidc.enabled`).
+fn enforce_console_access(
+    headers: &HeaderMap,
+    cfg: &PandaConfig,
+    query: Option<&str>,
+    oidc: Option<&Arc<console_oidc::ConsoleOidcRuntime>>,
+) -> Result<(), Response<BoxBody>> {
+    let has_admin = cfg
+        .observability
+        .admin_secret_env
+        .as_ref()
+        .is_some_and(|v| !v.trim().is_empty());
+    if has_admin && enforce_ops_auth_if_configured_inner(headers, cfg, query).is_ok() {
+        return Ok(());
+    }
+    if cfg.console_oidc.enabled {
+        if let Some(o) = oidc {
+            if o.validate_session_cookie(headers) {
+                return Ok(());
+            }
+        }
+    }
+    if !has_admin && !cfg.console_oidc.enabled {
+        return Ok(());
+    }
+    Err(text_response(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized: invalid ops secret or console session",
+    ))
 }
 
 async fn validate_bearer_jwt(headers: &HeaderMap, path: &str, state: &ProxyState) -> Result<(), &'static str> {
@@ -1683,6 +1822,8 @@ enum ProxyError {
         remaining: u64,
         retry_after_seconds: u64,
     },
+    /// Org/department hierarchical budget (Redis) exceeded.
+    HierarchyBudgetExceeded { retry_after_seconds: u64 },
     Upstream(anyhow::Error),
 }
 
@@ -1718,14 +1859,25 @@ async fn merge_jwt_identity_into_context(
     state: &ProxyState,
 ) {
     let cfg = state.config.as_ref();
-    if !cfg.identity.require_jwt || ctx.subject.is_some() {
+    if !cfg.identity.require_jwt {
+        return;
+    }
+    if ctx.subject.is_some() && !cfg.budget_hierarchy.enabled {
         return;
     }
     if let Ok(claims) = validate_and_decode_bearer_jwt(headers, path, state).await {
-        if let Some(s) = claims.sub {
-            let t = s.trim();
-            if !t.is_empty() {
-                ctx.subject = Some(t.to_string());
+        if ctx.subject.is_none() {
+            if let Some(ref s) = claims.sub {
+                let t = s.trim();
+                if !t.is_empty() {
+                    ctx.subject = Some(t.to_string());
+                }
+            }
+        }
+        if cfg.budget_hierarchy.enabled {
+            let k = cfg.budget_hierarchy.jwt_claim.trim();
+            if !k.is_empty() {
+                ctx.department = jwt_claim_as_string(&claims, k);
             }
         }
     }
@@ -2715,6 +2867,38 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
         && parts.method == hyper::Method::POST
         && path == "/v1/chat/completions"
         && is_json_request(&parts.headers);
+    let mf_cfg = &state.config.model_failover;
+    let chat_pf = mf_cfg.path_prefix.trim_end_matches('/');
+    let mut model_failover_needs_buffer = mf_cfg.enabled
+        && parts.method == hyper::Method::POST
+        && !chat_pf.is_empty()
+        && ingress_path.starts_with(chat_pf);
+    if mf_cfg.enabled && parts.method == hyper::Method::POST {
+        if let Some(ref ep) = mf_cfg.embeddings_path_prefix {
+            let p = ep.trim().trim_end_matches('/');
+            if !p.is_empty() && ingress_path.starts_with(p) {
+                model_failover_needs_buffer = true;
+            }
+        }
+        if let Some(ref rp) = mf_cfg.responses_path_prefix {
+            let p = rp.trim().trim_end_matches('/');
+            if !p.is_empty() && ingress_path.starts_with(p) {
+                model_failover_needs_buffer = true;
+            }
+        }
+        if let Some(ref ip) = mf_cfg.images_path_prefix {
+            let p = ip.trim().trim_end_matches('/');
+            if !p.is_empty() && ingress_path.starts_with(p) {
+                model_failover_needs_buffer = true;
+            }
+        }
+        if let Some(ref ap) = mf_cfg.audio_path_prefix {
+            let p = ap.trim().trim_end_matches('/');
+            if !p.is_empty() && ingress_path.starts_with(p) {
+                model_failover_needs_buffer = true;
+            }
+        }
+    }
     let need_early_buffer =
         needs_body_hooks
             || advertise_mcp_tools
@@ -2722,8 +2906,10 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
             || adapter_anthropic_candidate
             || (tpm_on && cl.is_none())
             || rate_fallback_needs_buffer
-            || context_mgmt_needs_buffer;
+            || context_mgmt_needs_buffer
+            || model_failover_needs_buffer;
 
+    let mut optional_failover_body: Option<Vec<u8>> = None;
     let mut openai_chat_snapshot_for_fallback: Option<Vec<u8>> = None;
     let (
         est,
@@ -2778,6 +2964,13 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
             }
         } else {
             state.tpm.add_prompt_tokens(&bucket, est).await;
+        }
+        if let Some(ref hier) = state.budget_hierarchy {
+            if !hier.try_reserve(ctx.department.as_deref(), est).await {
+                return Err(ProxyError::HierarchyBudgetExceeded {
+                    retry_after_seconds: 60,
+                });
+            }
         }
         log_request_context(&ctx);
         parts.headers = headers;
@@ -3000,6 +3193,7 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
         } else {
             None
         };
+        optional_failover_body = Some(next_bytes.clone());
         parts.headers.remove(header::CONTENT_LENGTH);
         (
             est,
@@ -3038,6 +3232,13 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
         } else {
             state.tpm.add_prompt_tokens(&bucket, est).await;
         }
+        if let Some(ref hier) = state.budget_hierarchy {
+            if !hier.try_reserve(ctx.department.as_deref(), est).await {
+                return Err(ProxyError::HierarchyBudgetExceeded {
+                    retry_after_seconds: 60,
+                });
+            }
+        }
         log_request_context(&ctx);
         parts.headers = headers;
         if let Some(ref sink) = state.compliance {
@@ -3059,22 +3260,129 @@ async fn forward_to_upstream(req: Request<Incoming>, state: &ProxyState) -> Resu
             None,
         )
     };
-    let mcp_followup_method = parts.method.clone();
-    let mcp_followup_uri = parts.uri.clone();
-    let mcp_followup_headers = parts.headers.clone();
-    let req_up = Request::from_parts(parts, boxed_req_body);
+    let upstream_req_template = parts.clone();
+    let mcp_followup_method = upstream_req_template.method.clone();
+    let mcp_followup_uri = upstream_req_template.uri.clone();
+    let mcp_followup_headers = upstream_req_template.headers.clone();
+    let failover_result = if adapter_anthropic_candidate {
+        None
+    } else {
+        model_failover::resolve_failover_chain(
+            &state.config.model_failover,
+            ingress_path.as_str(),
+            &upstream_req_template.method,
+            optional_failover_body.as_deref(),
+        )
+    };
+    let upstream_timeout = Duration::from_secs(DEFAULT_UPSTREAM_REQUEST_TIMEOUT_SECONDS);
 
-    let resp = request_upstream_with_timeout(
-        &state.client,
-        req_up,
-        Duration::from_secs(DEFAULT_UPSTREAM_REQUEST_TIMEOUT_SECONDS),
-        "initial",
-    )
-    .await?;
-    let (mut parts, body) = resp.into_parts();
-    let mut body_opt = Some(body);
+    let mut failover_winner_anthropic = false;
+    let mut failover_anthropic_streaming = false;
+
+    let (mut parts, mut body_opt) = if let Some((chain, classified)) = failover_result.filter(|(c, _)| !c.is_empty()) {
+        let body_bytes = optional_failover_body.ok_or_else(|| {
+            ProxyError::Upstream(anyhow::anyhow!(
+                "model_failover: expected buffered request body"
+            ))
+        })?;
+        let n_back = chain.len();
+        let mut out_resp: Option<Response<Incoming>> = None;
+        for (i, backend) in chain.into_iter().enumerate() {
+            if !model_failover::circuit_allows_attempt(&state.config.model_failover, &backend) {
+                if i + 1 < n_back {
+                    continue;
+                }
+                return Err(ProxyError::Upstream(anyhow::anyhow!(
+                    "model_failover: all backends blocked by circuit breaker"
+                )));
+            }
+            let mut p_try = upstream_req_template.clone();
+            let mut h_try = p_try.headers.clone();
+            if let Err(msg) = model_failover::apply_backend_auth(&mut h_try, &backend) {
+                return Err(ProxyError::Upstream(anyhow::anyhow!("{msg}")));
+            }
+            p_try.headers = h_try;
+            let hop_body = match model_failover::prepare_failover_hop(
+                &backend,
+                &classified,
+                &mut p_try,
+                body_bytes.as_slice(),
+                state.config.adapter.anthropic_version.trim(),
+            ) {
+                Ok(b) => b,
+                Err(e) => {
+                    if i + 1 < n_back {
+                        eprintln!("panda: model_failover hop skipped: {e:#}");
+                        continue;
+                    }
+                    return Err(ProxyError::Upstream(e));
+                }
+            };
+            let body_stream = Full::new(bytes::Bytes::from(hop_body))
+                .map_err(|never: std::convert::Infallible| match never {})
+                .boxed_unsync();
+            let req_try = model_failover::build_upstream_request(
+                &p_try,
+                body_stream,
+                backend.upstream.trim(),
+            )?;
+            match request_upstream_with_timeout(
+                &state.client,
+                req_try,
+                upstream_timeout,
+                "failover",
+            )
+            .await
+            {
+                Ok(resp) => {
+                    let st = resp.status();
+                    if model_failover::should_retry_failover(st) && i + 1 < n_back {
+                        model_failover::record_circuit_retryable_failure(&state.config.model_failover, &backend);
+                        let (_, drain) = resp.into_parts();
+                        let _ = collect_body_bounded(drain, max_body).await?;
+                        continue;
+                    }
+                    model_failover::record_circuit_success(&state.config.model_failover, &backend);
+                    out_resp = Some(resp);
+                    failover_winner_anthropic = matches!(
+                        backend.protocol,
+                        panda_config::ModelFailoverProtocol::Anthropic
+                    ) && classified.operation == model_failover::FailoverApiOperation::ChatCompletions;
+                    failover_anthropic_streaming = failover_winner_anthropic && classified.features.streaming;
+                    break;
+                }
+                Err(e) => {
+                    model_failover::record_circuit_retryable_failure(&state.config.model_failover, &backend);
+                    if i + 1 < n_back {
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        let resp = out_resp.ok_or_else(|| {
+            ProxyError::Upstream(anyhow::anyhow!("model_failover: all backends exhausted"))
+        })?;
+        let (rp, rb) = resp.into_parts();
+        (rp, Some(rb))
+    } else {
+        let req_up = Request::from_parts(parts, boxed_req_body);
+        let resp = request_upstream_with_timeout(
+            &state.client,
+            req_up,
+            upstream_timeout,
+            "initial",
+        )
+        .await?;
+        let (rp, rb) = resp.into_parts();
+        (rp, Some(rb))
+    };
     let mut anthropic_to_openai_response = adapter_anthropic_candidate;
     let mut adapter_anthropic_streaming_resp = adapter_anthropic_streaming;
+    if failover_winner_anthropic {
+        anthropic_to_openai_response = true;
+        adapter_anthropic_streaming_resp = failover_anthropic_streaming;
+    }
     if parts.status == StatusCode::TOO_MANY_REQUESTS {
         if let Some(ref snap) = openai_chat_snapshot_for_fallback {
             if brain::rate_limit_fallback_can_attempt(state.config.as_ref(), Some(snap.as_slice())) {
@@ -3833,6 +4141,20 @@ fn proxy_error_response(e: ProxyError) -> Response<BoxBody> {
             }
             resp
         }
+        ProxyError::HierarchyBudgetExceeded {
+            retry_after_seconds,
+        } => {
+            eprintln!("hierarchy budget exceeded");
+            let mut resp = text_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many requests: org or department prompt budget exceeded",
+            );
+            if let Ok(v) = HeaderValue::from_str(&retry_after_seconds.to_string()) {
+                resp.headers_mut()
+                    .insert(HeaderName::from_static("retry-after"), v);
+            }
+            resp
+        }
         ProxyError::Upstream(err) => {
             eprintln!("upstream error: {err:#}");
             text_response(StatusCode::BAD_GATEWAY, "bad gateway: upstream request failed")
@@ -4279,6 +4601,8 @@ mod tests {
             rps: None,
             jwks: None,
             compliance: None,
+            budget_hierarchy: None,
+            console_oidc: None,
         }
     }
 
@@ -4403,6 +4727,9 @@ mod tests {
             adapter: Default::default(),
             rate_limit_fallback: Default::default(),
             context_management: Default::default(),
+            console_oidc: Default::default(),
+            budget_hierarchy: Default::default(),
+            model_failover: Default::default(),
         });
         let state = test_proxy_state(Arc::clone(&cfg)).await;
         let mut ctx = RequestContext::default();
@@ -4480,6 +4807,9 @@ mod tests {
             adapter: Default::default(),
             rate_limit_fallback: Default::default(),
             context_management: Default::default(),
+            console_oidc: Default::default(),
+            budget_hierarchy: Default::default(),
+            model_failover: Default::default(),
         });
         let state = test_proxy_state(Arc::clone(&cfg)).await;
         let mut ctx = RequestContext {
@@ -4488,6 +4818,93 @@ mod tests {
         };
         super::merge_jwt_identity_into_context(&mut ctx, &headers, "/v1/chat", &state).await;
         assert_eq!(ctx.subject.as_deref(), Some("gateway-subject"));
+        unsafe {
+            std::env::remove_var(secret_env);
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_jwt_identity_sets_department_from_budget_claim() {
+        #[derive(serde::Serialize)]
+        struct Claims {
+            sub: &'static str,
+            department: &'static str,
+            iss: &'static str,
+            aud: &'static str,
+            scope: &'static str,
+            exp: usize,
+        }
+        let secret_env = "PANDA_TEST_MERGE_JWT_DEPT_SECRET";
+        unsafe {
+            std::env::set_var(secret_env, "merge-dept-secret");
+        }
+        let exp = (StdSystemTime::now() + StdDuration::from_secs(300))
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as usize;
+        let token = encode(
+            &Header::default(),
+            &Claims {
+                sub: "jwt-user",
+                department: "marketing",
+                iss: "https://issuer.example",
+                aud: "panda-gateway",
+                scope: "gateway:invoke",
+                exp,
+            },
+            &EncodingKey::from_secret("merge-dept-secret".as_bytes()),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        let cfg = Arc::new(PandaConfig {
+            listen: "127.0.0.1:0".to_string(),
+            server: None,
+            upstream: "http://127.0.0.1:1".to_string(),
+            routes: vec![],
+            trusted_gateway: Default::default(),
+            observability: Default::default(),
+            tpm: Default::default(),
+            tls: None,
+            plugins: Default::default(),
+            identity: panda_config::IdentityConfig {
+                require_jwt: true,
+                jwt_hs256_secret_env: secret_env.to_string(),
+                jwks_url: None,
+                jwks_cache_ttl_seconds: 3600,
+                accepted_issuers: vec!["https://issuer.example".to_string()],
+                accepted_audiences: vec!["panda-gateway".to_string()],
+                required_scopes: vec!["gateway:invoke".to_string()],
+                route_scope_rules: vec![],
+                enable_token_exchange: false,
+                agent_token_secret_env: "PANDA_AGENT_TOKEN_HS256_SECRET".to_string(),
+                agent_token_ttl_seconds: 300,
+                agent_token_scopes: vec![],
+            },
+            prompt_safety: Default::default(),
+            pii: Default::default(),
+            mcp: Default::default(),
+            semantic_cache: Default::default(),
+            auth: Default::default(),
+            adapter: Default::default(),
+            rate_limit_fallback: Default::default(),
+            context_management: Default::default(),
+            console_oidc: Default::default(),
+            budget_hierarchy: panda_config::BudgetHierarchyConfig {
+                enabled: true,
+                jwt_claim: "department".to_string(),
+                ..Default::default()
+            },
+            model_failover: Default::default(),
+        });
+        let state = test_proxy_state(Arc::clone(&cfg)).await;
+        let mut ctx = RequestContext::default();
+        super::merge_jwt_identity_into_context(&mut ctx, &headers, "/v1/chat", &state).await;
+        assert_eq!(ctx.subject.as_deref(), Some("jwt-user"));
+        assert_eq!(ctx.department.as_deref(), Some("marketing"));
         unsafe {
             std::env::remove_var(secret_env);
         }
@@ -4560,6 +4977,9 @@ mod tests {
             adapter: Default::default(),
             rate_limit_fallback: Default::default(),
             context_management: Default::default(),
+            console_oidc: Default::default(),
+            budget_hierarchy: Default::default(),
+            model_failover: Default::default(),
         };
         let mut headers = HeaderMap::new();
         std::env::set_var("PANDA_TEST_OPS_SECRET", "s3cr3t");
@@ -4601,6 +5021,9 @@ mod tests {
             adapter: Default::default(),
             rate_limit_fallback: Default::default(),
             context_management: Default::default(),
+            console_oidc: Default::default(),
+            budget_hierarchy: Default::default(),
+            model_failover: Default::default(),
         });
         let hub = Arc::new(ConsoleEventHub::new(DEFAULT_CONSOLE_CHANNEL_CAPACITY));
         let state = Arc::new(ProxyState {
@@ -4620,6 +5043,8 @@ mod tests {
             rps: None,
             jwks: None,
             compliance: None,
+            budget_hierarchy: None,
+            console_oidc: None,
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4718,6 +5143,9 @@ mod tests {
             adapter: Default::default(),
             rate_limit_fallback: Default::default(),
             context_management: Default::default(),
+            console_oidc: Default::default(),
+            budget_hierarchy: Default::default(),
+            model_failover: Default::default(),
         });
         let state = Arc::new(ProxyState {
             config: Arc::clone(&cfg),
@@ -4736,6 +5164,8 @@ mod tests {
             rps: None,
             jwks: None,
             compliance: None,
+            budget_hierarchy: None,
+            console_oidc: None,
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4840,6 +5270,9 @@ mod tests {
             adapter: Default::default(),
             rate_limit_fallback: Default::default(),
             context_management: Default::default(),
+            console_oidc: Default::default(),
+            budget_hierarchy: Default::default(),
+            model_failover: Default::default(),
         });
         let tpm = Arc::new(TpmCounters::connect(None).await.unwrap());
         tpm.add_prompt_tokens("anonymous", 30).await;
@@ -4860,6 +5293,8 @@ mod tests {
             rps: None,
             jwks: None,
             compliance: None,
+            budget_hierarchy: None,
+            console_oidc: None,
         };
         let json = tpm_status_json(&state, "/tpm/status", &HeaderMap::new()).await;
         assert_eq!(json.get("enforce_budget").and_then(|v| v.as_bool()), Some(true));
@@ -4902,6 +5337,9 @@ mod tests {
             adapter: Default::default(),
             rate_limit_fallback: Default::default(),
             context_management: Default::default(),
+            console_oidc: Default::default(),
+            budget_hierarchy: Default::default(),
+            model_failover: Default::default(),
         });
         let state = ProxyState {
             config: cfg,
@@ -4920,6 +5358,8 @@ mod tests {
             rps: None,
             jwks: None,
             compliance: None,
+            budget_hierarchy: None,
+            console_oidc: None,
         };
         state
             .ops_metrics
@@ -5037,6 +5477,9 @@ mod tests {
             adapter: Default::default(),
             rate_limit_fallback: Default::default(),
             context_management: Default::default(),
+            console_oidc: Default::default(),
+            budget_hierarchy: Default::default(),
+            model_failover: Default::default(),
         });
         let state = ProxyState {
             config: cfg,
@@ -5055,6 +5498,8 @@ mod tests {
             rps: None,
             jwks: None,
             compliance: None,
+            budget_hierarchy: None,
+            console_oidc: None,
         };
         let json = tpm_status_json(&state, "/tpm/status", &headers).await;
         assert_eq!(json.get("bucket").and_then(|v| v.as_str()), Some("status-user"));
@@ -5085,6 +5530,9 @@ mod tests {
             adapter: Default::default(),
             rate_limit_fallback: Default::default(),
             context_management: Default::default(),
+            console_oidc: Default::default(),
+            budget_hierarchy: Default::default(),
+            model_failover: Default::default(),
         });
         let state = ProxyState {
             config: cfg,
@@ -5103,6 +5551,8 @@ mod tests {
             rps: None,
             jwks: None,
             compliance: None,
+            budget_hierarchy: None,
+            console_oidc: None,
         };
         let (status, body) = readiness_status(&state);
         assert_eq!(status, StatusCode::OK);
@@ -5134,6 +5584,9 @@ mod tests {
             adapter: Default::default(),
             rate_limit_fallback: Default::default(),
             context_management: Default::default(),
+            console_oidc: Default::default(),
+            budget_hierarchy: Default::default(),
+            model_failover: Default::default(),
         });
         let state = ProxyState {
             config: cfg,
@@ -5152,6 +5605,8 @@ mod tests {
             rps: None,
             jwks: None,
             compliance: None,
+            budget_hierarchy: None,
+            console_oidc: None,
         };
         let (status, body) = readiness_status(&state);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -5185,6 +5640,9 @@ mod tests {
             adapter: Default::default(),
             rate_limit_fallback: Default::default(),
             context_management: Default::default(),
+            console_oidc: Default::default(),
+            budget_hierarchy: Default::default(),
+            model_failover: Default::default(),
         });
         let state = ProxyState {
             config: cfg,
@@ -5203,6 +5661,8 @@ mod tests {
             rps: None,
             jwks: None,
             compliance: None,
+            budget_hierarchy: None,
+            console_oidc: None,
         };
         let (status, body) = readiness_status(&state);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -5326,6 +5786,9 @@ mod tests {
             adapter: Default::default(),
             rate_limit_fallback: Default::default(),
             context_management: Default::default(),
+            console_oidc: Default::default(),
+            budget_hierarchy: Default::default(),
+            model_failover: Default::default(),
         });
 
         let runtime = PluginRuntime::load_optional(
@@ -5361,6 +5824,8 @@ mod tests {
             rps: None,
             jwks: None,
             compliance: None,
+            budget_hierarchy: None,
+            console_oidc: None,
         });
         assert!(state.plugins.is_some());
         assert!(state.config.plugins.fail_closed);
@@ -5490,6 +5955,8 @@ mcp:
             rps: None,
             jwks: None,
             compliance: None,
+            budget_hierarchy: None,
+            console_oidc: None,
         });
 
         let panda_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5635,6 +6102,8 @@ mcp:
             rps: None,
             jwks: None,
             compliance: None,
+            budget_hierarchy: None,
+            console_oidc: None,
         });
 
         let panda_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5783,6 +6252,8 @@ mcp:
             rps: None,
             jwks: None,
             compliance: None,
+            budget_hierarchy: None,
+            console_oidc: None,
         });
 
         let panda_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5854,6 +6325,9 @@ mcp:
             adapter: Default::default(),
             rate_limit_fallback: Default::default(),
             context_management: Default::default(),
+            console_oidc: Default::default(),
+            budget_hierarchy: Default::default(),
+            model_failover: Default::default(),
         });
         let state = test_proxy_state(Arc::clone(&cfg)).await;
         let headers = HeaderMap::new();
@@ -5932,6 +6406,9 @@ mcp:
             adapter: Default::default(),
             rate_limit_fallback: Default::default(),
             context_management: Default::default(),
+            console_oidc: Default::default(),
+            budget_hierarchy: Default::default(),
+            model_failover: Default::default(),
         });
         let state = test_proxy_state(Arc::clone(&cfg)).await;
 
@@ -6006,6 +6483,9 @@ mcp:
             adapter: Default::default(),
             rate_limit_fallback: Default::default(),
             context_management: Default::default(),
+            console_oidc: Default::default(),
+            budget_hierarchy: Default::default(),
+            model_failover: Default::default(),
         });
         let state = test_proxy_state(Arc::clone(&cfg)).await;
         let err = validate_bearer_jwt(&headers, "/v1/chat", &state)
@@ -6084,6 +6564,9 @@ mcp:
             adapter: Default::default(),
             rate_limit_fallback: Default::default(),
             context_management: Default::default(),
+            console_oidc: Default::default(),
+            budget_hierarchy: Default::default(),
+            model_failover: Default::default(),
         });
         let state = test_proxy_state(Arc::clone(&cfg)).await;
         let exchanged = maybe_exchange_agent_token(&headers, &state)
@@ -6325,6 +6808,9 @@ data: [DONE]
             adapter: Default::default(),
             rate_limit_fallback: Default::default(),
             context_management: Default::default(),
+            console_oidc: Default::default(),
+            budget_hierarchy: Default::default(),
+            model_failover: Default::default(),
         });
         let state = test_proxy_state(Arc::clone(&cfg)).await;
         let err = validate_bearer_jwt(&headers, "/v1/admin/users", &state)

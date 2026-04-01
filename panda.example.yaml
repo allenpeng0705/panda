@@ -131,6 +131,83 @@ upstream: "http://127.0.0.1:11434"
 #   agent_token_ttl_seconds: 300
 #   agent_token_scopes: ["agent:invoke"]
 
+# Enterprise (optional): OIDC login for the developer console (`/console` + `/console/ws`).
+# Keep enabled=false for Core/small-team defaults.
+# console_oidc:
+#   enabled: false
+#   issuer_url: "https://login.microsoftonline.com/<tenant>/v2.0"
+#   client_id: "<oidc-client-id>"
+#   client_secret_env: "PANDA_CONSOLE_OIDC_CLIENT_SECRET"
+#   redirect_path: "/console/oauth/callback"
+#   # Public URL for redirects (required when enabled); should match IdP app registration.
+#   redirect_base_url: "https://panda.example.com"
+#   scopes: ["openid", "profile", "email"]
+#   cookie_name: "panda_console_session"
+#   session_ttl_seconds: 86400
+#   signing_secret_env: "PANDA_CONSOLE_SESSION_SECRET"
+#   # Optional RBAC claim + required roles.
+#   roles_claim: "groups"
+#   required_roles: ["panda.console.admin"]
+
+# Enterprise (optional): org + department hierarchical prompt budgets (per-minute).
+# Requires identity.require_jwt=true and Redis (`budget_hierarchy.redis_url` or `tpm.redis_url` / PANDA_REDIS_URL).
+# budget_hierarchy:
+#   enabled: false
+#   jwt_claim: "department"
+#   # Optional org-wide cap across departments.
+#   org_prompt_tokens_per_minute: 500000
+#   departments:
+#     - department: "marketing"
+#       prompt_tokens_per_minute: 120000
+#     - department: "sales"
+#       prompt_tokens_per_minute: 80000
+#   # Optional override; otherwise uses tpm.redis_url / PANDA_REDIS_URL.
+#   redis_url: "redis://127.0.0.1:6379"
+
+# Enterprise (optional): model parity map + ordered failover chain.
+# For matching requests, Panda retries the next backend on 5xx/429/timeouts.
+# Classify by path: chat (path_prefix), plus optional embeddings/responses/images/audio prefixes.
+# Each backend: protocol openai_compatible (default) or anthropic (chat-only; maps OpenAI chat → /v1/messages).
+# supports: [chat_completions, embeddings, responses, images, audio] — empty means “all defaults for that protocol”.
+# allow_failover_after_first_byte: keep false for safest streaming semantics.
+# circuit_breaker_*: local per-backend breaker for retryable failures.
+# model_failover:
+#   enabled: false
+#   path_prefix: "/v1/chat"
+#   # embeddings_path_prefix: "/v1/embeddings"
+#   # responses_path_prefix: "/v1/responses"
+#   # images_path_prefix: "/v1/images"
+#   # audio_path_prefix: "/v1/audio"
+#   allow_failover_after_first_byte: false
+#   circuit_breaker_enabled: true
+#   circuit_breaker_failure_threshold: 3
+#   circuit_breaker_open_seconds: 30
+#   groups:
+#     - match_models: ["gpt-4o-mini", "gpt-4.1-mini"]
+#       backends:
+#         - upstream: "https://api.openai.com"
+#           api_key_env: "OPENAI_API_KEY"
+#         - upstream: "https://my-azure-openai.openai.azure.com"
+#           api_key_env: "AZURE_OPENAI_KEY"
+#           use_api_key_header: true
+#     # OpenAI-compatible providers (DeepSeek / Qwen / MiniMax examples):
+#     - match_models: ["deepseek-chat", "deepseek-reasoner", "qwen-max", "minimax-text-01"]
+#       backends:
+#         - upstream: "https://api.deepseek.com"
+#           api_key_env: "DEEPSEEK_API_KEY"
+#         - upstream: "https://dashscope.aliyuncs.com/compatible-mode"
+#           api_key_env: "QWEN_API_KEY"
+#         - upstream: "https://api.minimax.chat"
+#           api_key_env: "MINIMAX_API_KEY"
+#     # Empty match_models means "default group" for other chat models.
+#     - match_models: []
+#       backends:
+#         - upstream: "https://api.anthropic.com"
+#           protocol: anthropic
+#           api_key_env: "ANTHROPIC_API_KEY"
+#         - upstream: "https://api.openai.com"
+#           api_key_env: "OPENAI_API_KEY"
+
 # Optional: prompt safety deny patterns (starter jailbreak/injection heuristics).
 # prompt_safety:
 #   enabled: true

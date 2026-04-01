@@ -15,6 +15,8 @@ pub struct RequestContext {
     pub subject: Option<String>,
     pub tenant: Option<String>,
     pub scopes: Vec<String>,
+    /// From JWT when `budget_hierarchy` is enabled (`budget_hierarchy.jwt_claim`).
+    pub department: Option<String>,
     pub trusted_hop: bool,
     pub correlation_id: String,
 }

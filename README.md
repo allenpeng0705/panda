@@ -35,6 +35,11 @@ Details and limits of each feature live in `docs/` and `panda.example.yaml`; tre
 
 **Rule of thumb:** smaller teams often start **standalone** for simplicity; larger orgs often keep **Kong at the edge** and use Panda for AI paths first.
 
+### Core vs Enterprise
+
+- **Core (default)** — For **solo devs, startups, and small teams**: one `panda.yaml`, a single `upstream` (or simple `routes`), optional JWT, flat token budgets, optional shared-secret ops console. **No SSO, Redis, or failover config required** to get productive quickly.
+- **Enterprise (opt-in)** — Same binary when you need **governance and resilience**: **SSO** (Okta / Microsoft Entra) for the Developer Console, **hierarchical USD budgets** (e.g. per department), and **automated failover** via a **model parity map**. See [`docs/enterprise_track.md`](docs/enterprise_track.md).
+
 **Design highlights:** Memory-safe Rust (including TLS via rustls); **Wasm** plugins for custom request/body/stream checks without rebuilding the gateway; **MCP** as a first-class tool path; **OpenAI-shaped ingress** with an adapter layer for other providers (see config and `docs/high_level_design.md`).
 
 ## What Panda Gives You

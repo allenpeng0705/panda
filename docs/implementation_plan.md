@@ -246,7 +246,7 @@ This plan can be revised as benchmarks and security reviews land; keep the **Pla
 
 The phases above deliver a **credible MVP through production-ready core**. For **final** enterprise positioning—competing with mature API gateways on operability and trust—track the items below (not all need to ship on day one; prioritize by tenant and industry).
 
-For a **revenue-oriented** breakdown (SSO for the Developer Console, **hierarchical USD budgets**, **model parity / failover**), see [`enterprise_track.md`](./enterprise_track.md).
+For **Core vs Enterprise** positioning (fast default path for small teams; optional **SSO**, **hierarchical USD budgets**, **model parity / failover**), see [`enterprise_track.md`](./enterprise_track.md).
 
 ### Reliability and performance
 

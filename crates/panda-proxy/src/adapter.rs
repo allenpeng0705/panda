@@ -32,6 +32,47 @@ pub fn openai_chat_to_anthropic(body: &[u8]) -> anyhow::Result<(Vec<u8>, bool)> 
         "max_tokens": max_tokens,
         "messages": msgs
     });
+    if let Some(tools) = v.get("tools").and_then(|t| t.as_array()) {
+        let mapped_tools: Vec<serde_json::Value> = tools
+            .iter()
+            .filter_map(|t| {
+                let f = t.get("function")?;
+                let name = f.get("name")?.as_str()?;
+                let input_schema = f
+                    .get("parameters")
+                    .cloned()
+                    .unwrap_or_else(|| json!({"type":"object","properties":{}}));
+                Some(json!({
+                    "name": name,
+                    "input_schema": input_schema
+                }))
+            })
+            .collect();
+        if !mapped_tools.is_empty() {
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert("tools".to_string(), serde_json::Value::Array(mapped_tools));
+            }
+        }
+    }
+    if let Some(tc) = v.get("tool_choice") {
+        let mapped_choice = if tc.is_string() {
+            tc.as_str().map(|s| match s {
+                "none" => json!({"type":"none"}),
+                "required" => json!({"type":"any"}),
+                _ => json!({"type":"auto"}),
+            })
+        } else {
+            tc.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .map(|name| json!({"type":"tool","name":name}))
+        };
+        if let Some(choice) = mapped_choice {
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert("tool_choice".to_string(), choice);
+            }
+        }
+    }
     if streaming {
         if let Some(obj) = out.as_object_mut() {
             obj.insert("stream".to_string(), json!(true));
@@ -92,6 +133,20 @@ mod tests {
         assert!(streaming);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["stream"], true);
+    }
+
+    #[test]
+    fn maps_openai_tools_to_anthropic_tools() {
+        let body = br#"{
+            "model":"gpt-4o-mini",
+            "messages":[{"role":"user","content":"weather?"}],
+            "tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}],
+            "tool_choice":"required"
+        }"#;
+        let (out, _) = openai_chat_to_anthropic(body).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["tools"][0]["name"], "get_weather");
+        assert_eq!(v["tool_choice"]["type"], "any");
     }
 
     #[test]

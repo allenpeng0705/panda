@@ -1,102 +1,118 @@
-# Enterprise track (road to revenue)
+# Core vs Enterprise (self-serve and revenue tracks)
 
-This document describes a **commercial “Enterprise” tier** narrative for **2026**: capabilities that large buyers expect before they standardize on Panda as a cluster-wide AI gateway. It is a **product and architecture roadmap**, not a promise of shipping dates.
+Panda is **one binary and one config model**: **small teams and free users** stay fast and simple; **enterprise** features are **optional**—off by default—so they never block the quick path.
 
-**Relationship to other docs:** Deployment evolution with Kong is in [`evolution_phases.md`](./evolution_phases.md). Engineering milestones remain in [`implementation_plan.md`](./implementation_plan.md). Today’s console is documented in [`developer_console.md`](./developer_console.md).
+**Relationship to other docs:** Deployment patterns are in [`evolution_phases.md`](./evolution_phases.md) and [`deployment.md`](./deployment.md). Engineering milestones are in [`implementation_plan.md`](./implementation_plan.md). The Developer Console is in [`developer_console.md`](./developer_console.md).
 
 ---
 
-## Summary
+## Core track: easy and quick (default)
 
-| Pillar | Buyer outcome | Panda direction |
-|--------|----------------|-----------------|
-| **SSO for Developer Console** | Okta / Microsoft Entra–backed access to the live-trace UI; no shared static ops secret as the long-term model. | Add **OIDC (Authorization Code + PKCE)** for `/console` (and optionally `/console/ws`), with **session** or **token** validation on each request; keep **ops shared secret** as a **break-glass / automation** path. |
-| **Hierarchical budgets** | Company-wide cap with **department (or cost-center) sub-caps**—e.g. $5k Marketing, $2k Sales—**enforced in one cluster**. | Generalize **budget identity** beyond flat TPM buckets: **tree-structured limits** (org → dept → team) with **shared Redis (or control-plane API)** for authoritative counters; surface **USD** (from **pricing tables** + token usage) alongside **tokens**. |
-| **Automated failover (model parity)** | If **primary** model provider is down or **SLA-breached**, traffic **fails over** to an **equivalent** model on another vendor (e.g. OpenAI → Azure OpenAI → Anthropic) using a declared **parity map**. | First-class **`upstream_groups`** (or **model routes**) with **health probes**, **circuit breaking**, and **request-shape adapters** already partially aligned with universal adapter work; extend **`rate_limit_fallback`–style** paths into a **general failover policy** driven by config + metrics. |
+**Who:** Solo developers, startups, small companies, hobbyists, internal PoCs.
+
+**Goal:** Go from **zero → proxying traffic** in minutes without SSO, Redis, or multi-provider topology.
+
+| Area | Core experience |
+|------|------------------|
+| **Install** | Copy [`panda.example.yaml`](../panda.example.yaml) → `panda.yaml`, set `listen` + `upstream`, run `panda` (see [QuickStart in README](../README.md#quickstart)). |
+| **Identity** | Optional JWT/JWKS or trusted-gateway headers when you need them; **anonymous or simple bearer** is fine for early use. |
+| **Budgets** | **Flat TPM** (per subject/tenant bucket) with optional Redis for replicas—**no** org tree, **no** USD ledgers required. |
+| **Routing** | Single **`upstream`** or **`routes`** with one backend per path—**no** parity map or automatic failover required. |
+| **Console** | Optional **shared-secret** ops gate (`observability.admin_secret_env`)—enough for a **small trusted team** ([`developer_console.md`](./developer_console.md)). |
+| **Dependencies** | **None** beyond TLS certs if you terminate HTTPS; Redis and OTLP are **optional** quality-of-life. |
+
+**Product principle:** Every **Core** workflow must stay **one YAML file** and **minimal env vars** unless the operator explicitly opts in.
+
+---
+
+## Enterprise track: optional governance and resilience
+
+**Who:** Mid-market and large orgs with IdP standards, finance-owned spend caps, and SLOs on model availability.
+
+**Goal:** Same binary; enable **Enterprise** capabilities through **config blocks / feature flags** (and, if you ship commercial tiers, **license gates**) without forking the open-source UX.
+
+| Pillar | Enterprise outcome | Implementation direction |
+|--------|--------------------|---------------------------|
+| **SSO for Developer Console** | Okta / Microsoft Entra (and OIDC peers) for `/console` + `/console/ws`; **RBAC** from groups/claims. | **OIDC Authorization Code + PKCE**, session or short-lived tokens; keep **shared ops secret** as **break-glass** and for automation. |
+| **Hierarchical budgets** | e.g. $5k **Marketing**, $2k **Sales**, under one **org** cap in **one** cluster. | **Budget tree** in config + **Redis** (or control-plane API) for counters; **USD** from versioned **price cards** × token usage; compliance/metrics tag **budget node**. |
+| **Automated failover + model parity map** | Primary provider unhealthy → **next equivalent** backend (e.g. OpenAI → Azure OpenAI → Anthropic). | **Logical model** → ordered **physical backends**, health probes, **circuit breaking**, adapters on each hop; clear policy for **streaming** vs unary JSON. |
+
+Details for each pillar (architecture notes and sequencing) follow the same headings as before; they apply **only when Enterprise features are enabled**.
 
 ---
 
 ## 1. SSO: Okta and Microsoft Entra for the Developer Console
 
-**Today:** The console is protected by the same **optional shared secret** as other ops routes ([`developer_console.md`](./developer_console.md)). That is appropriate for **dev** and **break-glass**, not for **hundreds of engineers** with role-based access.
+**Core default:** Shared-secret protection for `/console` (optional). No OIDC required.
 
-**Enterprise target**
+**Enterprise:** When `console_oidc.enabled=true` (default is `false`) and the console is enabled:
 
-- **Protocols:** OpenID Connect (OIDC) with **Authorization Code + PKCE** for browser login to `/console`.
-- **IdPs:** Okta, Microsoft Entra ID (Azure AD), and any OIDC-compliant provider via **issuer URL** + **client id/secret** (or confidential client with **rotated** credentials).
-- **Authorization:** Map IdP **groups / claims** to Panda **roles** (e.g. `console.viewer`, `console.admin`, `ops.readonly`). Deny by default for console routes when SSO is enabled and the user lacks a role.
-- **WebSocket:** `/console/ws` must carry a **short-lived session** or **signed ticket** issued after OIDC login (query param or `Sec-WebSocket-Protocol` patterns are common; avoid long-lived secrets in URLs in production).
+- **Protocols:** OpenID Connect Authorization Code flow for browser login to `/console` (Panda callback at `/console/oauth/callback`).
+- **IdPs:** Okta, Microsoft Entra ID, and OIDC-compatible providers via **issuer** + **client** credentials.
+- **Authorization:** Map IdP **groups / claims** to Panda **roles** (e.g. `console.viewer`, `console.admin`). Deny by default when SSO is on and the user lacks a role.
+- **WebSocket:** `/console/ws` uses a **session** or **signed ticket** from the OIDC login (avoid long-lived secrets in URLs in production).
 
 **Architecture notes**
 
-- **Session store:** Encrypted cookie + server-side session (Redis) scales across replicas; alternatively **JWT session** with short TTL + refresh if you accept stateless tradeoffs.
-- **Separation of concerns:** **Edge (Kong)** may still terminate OIDC for **API** clients; **console SSO** can be **Panda-native** so the UI does not depend on Kong plugin availability.
+- **Session store:** Encrypted cookie + Redis-backed session scales across replicas; or short-lived JWT + refresh if you accept stateless tradeoffs.
+- **Edge vs Panda:** Kong may terminate OIDC for **API** traffic; **console SSO** can remain **Panda-native** so the UI does not depend on a specific edge plugin.
 
 **Build sequencing (suggested)**
 
-1. OIDC login/callback endpoints and session middleware scoped to `/console` only.  
+1. OIDC login/callback + session middleware scoped to `/console`.  
 2. Group → role mapping in config.  
-3. Harden `/console/ws` with the same identity.  
-4. Optional: SAML bridge via IdP (Okta/Entra) if customers require SAML at the IdP while Panda speaks OIDC.
+3. Align `/console/ws` with the same identity.  
+4. Optional: SAML at the IdP while Panda speaks OIDC to the client.
 
 ---
 
 ## 2. Hierarchical budgets (org → department → …)
 
-**Today:** TPM and related telemetry use **identity-derived buckets** (e.g. subject, tenant, subject+tenant) and optional **Redis** for shared counters ([`implementation_plan.md`](./implementation_plan.md), TPM sections). That is **flat**, not **hierarchical**, and **token-centric** rather than **dollar-centric**.
+**Core default:** Flat TPM buckets (`subject` / `tenant` / combined) and optional Redis—documented in [`implementation_plan.md`](./implementation_plan.md).
 
-**Enterprise target**
+**Enterprise:** When `budget_hierarchy.enabled=true` (default is `false`):
 
-- **Hierarchy:** Configurable **tree** of budget nodes (e.g. `org:acme` → `dept:marketing` → `dept:sales`). Each request resolves **one leaf** (or multiple ancestors) from **JWT claims**, **trusted gateway headers**, or **custom** Wasm-enriched metadata.
-- **Enforcement:** A spend event (prompt + completion, optionally **cached** vs **uncached**) increments **every ancestor node** up to root until **any** node would exceed its limit—then **429** (or **policy deny**) with a clear **which limit fired** in headers/body for support.
-- **USD:** Maintain **versioned price cards** (per model, per provider, per effective date). **Estimated USD** = f(tokens, model, direction). Store **integer micro-dollars** or **decimal** with explicit rounding rules for audit.
-- **Storage:** **Redis** (or a **small control-plane service**) holds rolling windows per node; **GitOps** remains the source of **limits**, not live counters.
+- **Hierarchy:** Configurable **org + department** limits. Resolve department from JWT claim (`budget_hierarchy.jwt_claim`, e.g. `department`).
+- **Enforcement:** Each spend event increments **ancestors** toward the root; first **over-limit** node wins → **429** / policy response with **which node** tripped.
+- **USD:** Versioned **price cards** (model, provider, effective date); store amounts with explicit rounding for audit.
+- **Storage:** Redis counters (using `budget_hierarchy.redis_url`, else `tpm.redis_url` / `PANDA_REDIS_URL`); GitOps remains the source of limits.
 
-**Why buyers care**
-
-- Finance and procurement see **one** cluster enforcing **delegated** caps without running **separate** gateways per department.
-
-**Dependencies**
-
-- Stable **tenant / cost-center** claims from IdP or edge (aligns with [`kong_handshake.md`](./kong_handshake.md) identity headers).  
-- **Compliance export** and metrics should tag **budget node id** for disputes ([`compliance_export.md`](./compliance_export.md)).
+**Dependencies:** Stable **cost-center / department** claims; extend **compliance export** with **budget node id** ([`compliance_export.md`](./compliance_export.md)).
 
 ---
 
 ## 3. Automated failover and the “model parity map”
 
-**Today:** Panda has **multi-route upstreams**, **adapters** (OpenAI vs Anthropic shapes), and **rate-limit / fallback** style behavior in specific flows ([`implementation_plan.md`](./implementation_plan.md) Phase 4 notes). There is **no** single documented **parity map** object in config.
+**Core default:** One `upstream` or explicit **`routes`** — operators handle outages manually or at the load balancer.
 
-**Enterprise target**
+**Enterprise:** When `model_failover.enabled=true` (default is `false`):
 
-- **Model parity map:** Declarative mapping: **logical model name** (customer-facing) → **ordered list** of **physical endpoints** (provider URL + credentials ref + **adapter**), each tagged with **equivalence class** (e.g. “chat JSON, function tools, 128k class”).
-- **Triggers:** **HTTP errors** (5xx, 429), **timeout**, **circuit breaker** open, optional **synthetic probes** (lightweight health checks) to mark a **backend unhealthy**.
-- **Behavior:** On failure of attempt *i*, **retry once** on *i+1* with the **same** normalized request (adapter applies provider-specific encoding). Cap **max hops** to avoid storms. **Stream** failover is harder than unary JSON—policy may be **fail only before first byte** or **restart stream** with explicit product semantics.
-- **Observability:** Metrics **per logical model** and **per physical backend** (`failover_total`, `active_backend`) for SRE dashboards.
+- **Parity map:** Request `model` → ordered backends from `model_failover.groups`. Paths are classified separately: **`path_prefix`** (chat), optional **`embeddings_path_prefix`**, **`responses_path_prefix`**, **`images_path_prefix`**, and **`audio_path_prefix`**.
+- **Capabilities:** Each backend declares **`protocol`** (`openai_compatible` or `anthropic`) and optional **`supports`** (`chat_completions`, `embeddings`, `responses`, `images`, `audio`). Empty `supports` means defaults for that protocol (Anthropic: chat only; OpenAI-shaped: all operations). Anthropic hops map **OpenAI chat JSON** to **`/v1/messages`** for that hop only, including tool definitions/selection mapping.
+- **Triggers:** 5xx, 429, timeouts on the current hop before the response is returned. **Streaming:** HTTP 200 + SSE is not retried on status alone by default; `allow_failover_after_first_byte` remains default `false`.
+- **Circuit breaker:** Optional local breaker (`circuit_breaker_enabled`) opens per backend after `circuit_breaker_failure_threshold` retryable failures for `circuit_breaker_open_seconds`.
+- **Global adapter:** If the main request is already transformed to Anthropic (`adapter.provider=anthropic` for that route), **model failover is skipped** to avoid double-mapping.
+- **Provider coverage:** OpenAI-compatible providers (for example DeepSeek, Qwen-compatible endpoints, MiniMax OpenAI-compatible endpoints) can be added directly as `protocol=openai_compatible` backends. Non-compatible providers should use a protocol adapter hop (currently Anthropic is built in; others can be added as new protocol adapters).
 
-**Alignment with existing design**
-
-- **Universal adapter** work reduces duplicate glue per provider.  
-- **Semantic cache** keys should include **logical model** so a failover does not silently serve a **wrong** provider’s cached answer unless **explicitly** allowed.
+**Alignment:** Universal **adapter** work; **semantic cache** keys must include **logical model** so failover does not return a **wrong-provider** cache entry unless explicitly allowed.
 
 ---
 
-## Packaging as “Enterprise tier”
+## Packaging summary
 
-A practical **SKU** split for 2026 conversations:
+| Area | Core / self-serve | Enterprise (opt-in) |
+|------|-------------------|------------------------|
+| Onboarding | Example YAML + upstream URL | Same; then enable SSO / budget tree / parity blocks |
+| Console | Optional shared secret | **SSO + RBAC** (+ break-glass secret) |
+| Budgets | Flat TPM (+ optional Redis) | **Hierarchy + USD** + finance-friendly exports |
+| Routing | Static `upstream` / `routes` | **Parity map**, health, **circuit breaking**, SLO-driven failover |
 
-| Area | Core / open usage | Enterprise |
-|------|-------------------|------------|
-| Console | Shared-secret ops gate, single team | **SSO**, **RBAC**, audit of console access |
-| Budgets | Per-user / per-tenant TPM | **Hierarchy + USD** + finance-friendly exports |
-| Routing | Static `upstream` / `routes` | **Parity map**, **circuit breaking**, **SLO-driven** failover |
-
-This framing matches how buyers compare you to **managed gateways** and **cloud provider** proxies: **data-plane performance** in core, **governance and resilience** in Enterprise.
+**Messaging:** Panda leads with **speed and simplicity** for the long tail; **Enterprise** is “turn on when you need IdP-backed console access, delegated spend caps, and provider failover”—not a separate product fork.
 
 ---
 
 ## See also
 
-- [`panda_vs_kong_positioning.md`](./panda_vs_kong_positioning.md) — where Panda sits relative to the edge.  
-- [`high_level_design.md`](./high_level_design.md) — intent-aware gateway pillars.  
+- [`panda_vs_kong_positioning.md`](./panda_vs_kong_positioning.md) — edge vs AI gateway.  
+- [`high_level_design.md`](./high_level_design.md) — pillars.  
 - [`integration_and_evolution.md`](./integration_and_evolution.md) — coexistence and domain split.

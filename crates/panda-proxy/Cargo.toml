@@ -39,6 +39,7 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt"
 tokio-tungstenite = "0.24"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tracing = "0.1"
+urlencoding = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
