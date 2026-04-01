@@ -2,7 +2,9 @@
 
 ![Panda Logo](panda_site/assets/images/panda-logo.svg)
 
-**Panda is a Rust AI gateway** that sits between your clients (apps, agents, SDKs) and model providers. It speaks an **OpenAI-compatible HTTP API** on the front, and forwards to your chosen upstream—while adding **policy, identity, budgets, MCP tools, caching, safety, and observability** in one place.
+**Website:** https://www.homeclaw.cn/panda-ai/
+
+**Panda is a Rust AI gateway** that sits between your clients (apps, agents, SDKs) and model providers. It speaks an **OpenAI-compatible HTTP API** on front, and forwards to your chosen upstream—while adding **policy, identity, budgets, MCP tools, caching, safety, and observability** in one place.
 
 ---
 
