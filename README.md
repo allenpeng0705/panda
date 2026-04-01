@@ -149,21 +149,59 @@ Details and limits live in `docs/` and `panda.example.yaml`.
 ## Architecture (high level)
 
 ```mermaid
-flowchart LR
-  C[Client / Agent SDK] --> P[Panda Gateway]
-  P --> U[LLM Upstream]
-  P --> M[MCP Tool Servers]
-  P --> O[Ops: Metrics/Status/Logs]
+flowchart TD
+  C["Clients and Agent SDKs (core)"]
 
-  subgraph Panda
-    I[Ingress + Auth]
-    S[Safety + Policy]
-    A[Adapter + Streaming]
-    T[TPM + Cache + Context]
+  subgraph EDGE["Ingress — core: pick a deployment pattern"]
+    E1["Standalone: clients → Panda (core)"]
+    E2["With Kong or edge: AI routes → Panda (core)"]
   end
 
-  P --> I --> S --> A --> T
+  C --> E1
+  C --> E2
+
+  E1 --> P
+  E2 --> P
+
+  subgraph PANDA["Panda Gateway data plane"]
+    I["Ingress: auth & routing (core)"]
+    S["Safety & policy (core)\nJWT/JWKS, prompt safety, PII, Wasm hooks"]
+    X["AI control (core + optional enterprise)\nTPM, semantic cache, context\nenterprise: hierarchical budgets"]
+    A["Adapter & streaming (core + optional enterprise)\nOpenAI ingress, SSE guards\nenterprise: model failover / parity"]
+    M["MCP orchestration (core)"]
+    I --> S --> X --> A --> M
+  end
+
+  P["Panda HTTP listener (core)"] --> I
+
+  subgraph STATEFUL["State & observability"]
+    R["Redis (optional)\ncore optional: TPM, semantic cache\nenterprise: hierarchical budgets"]
+    PM["Prometheus (core)\nscrape /metrics"]
+    OT["OTLP (core)\ntraces to your collector"]
+    OPS["Ops HTTP (core)\n/health, /ready, /tpm/status, /mcp/status"]
+  end
+
+  X <--> R
+  P --> PM
+  P --> OT
+  P --> OPS
+
+  subgraph PROVIDERS["Model providers (core: single upstream)\nenterprise: ordered failover chain"]
+    OAI["OpenAI / Azure OpenAI"]
+    DS["DeepSeek / Qwen / MiniMax (OpenAI-compatible)"]
+    ANT["Anthropic (adapter or failover hop)"]
+    LOC["Local: Ollama / vLLM / TGI / compatible"]
+  end
+
+  A --> OAI
+  A --> DS
+  A --> ANT
+  A --> LOC
+
+  M --> TOOLS["MCP tool servers (core)\nPostgres, Slack/Discord, RAG, custom"]
 ```
+
+**Legend:** **(core)** means usable with default small-team `panda.yaml` without Enterprise-only blocks. **Enterprise** items are opt-in (`console_oidc`, `budget_hierarchy`, `model_failover`, etc.); see [`docs/enterprise_track.md`](docs/enterprise_track.md).
 
 ---
 
