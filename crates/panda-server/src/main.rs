@@ -3,16 +3,19 @@
 /// JSON Schema for WebSocket text frames on `GET /console/ws` (Live Trace v1).
 const LIVE_TRACE_WS_SCHEMA_V1: &str = include_str!("../schemas/live_trace_ws.v1.schema.json");
 
+#[cfg(feature = "grpc")]
+mod grpc_health;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
+use opentelemetry::global;
 use opentelemetry::trace::TracerProvider;
 use opentelemetry::KeyValue;
-use opentelemetry::global;
 use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::{Resource, trace::SdkTracerProvider};
+use opentelemetry_sdk::{trace::SdkTracerProvider, Resource};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
@@ -91,7 +94,9 @@ fn init_observability() -> Option<SdkTracerProvider> {
                 return Some(shutdown_handle);
             }
             Err(e) => {
-                eprintln!("panda: failed to init OTLP exporter ({e}); falling back to logs-only tracing");
+                eprintln!(
+                    "panda: failed to init OTLP exporter ({e}); falling back to logs-only tracing"
+                );
                 let _ = tracing_subscriber::registry()
                     .with(filter)
                     .with(fmt_layer)
@@ -160,7 +165,45 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
 
-    let out = rt.block_on(panda_proxy::run(config));
+    let out = rt.block_on(async move {
+        #[cfg(feature = "grpc")]
+        let grpc_shutdown_tx = {
+            if let Ok(raw) = std::env::var("PANDA_GRPC_HEALTH_LISTEN") {
+                let raw = raw.trim();
+                if raw.is_empty() {
+                    None
+                } else {
+                    match raw.parse::<std::net::SocketAddr>() {
+                        Ok(addr) => {
+                            let (tx, rx) = tokio::sync::oneshot::channel();
+                            tokio::spawn(async move {
+                                if let Err(e) = grpc_health::serve_health(addr, rx).await {
+                                    eprintln!("panda: gRPC health server exited: {e}");
+                                }
+                            });
+                            eprintln!("panda: gRPC health listening on grpc://{addr} (stops with HTTP gateway)");
+                            Some(tx)
+                        }
+                        Err(_) => {
+                            eprintln!("panda: PANDA_GRPC_HEALTH_LISTEN invalid: {raw}");
+                            None
+                        }
+                    }
+                }
+            } else {
+                None
+            }
+        };
+
+        let run_result = panda_proxy::run(config).await;
+
+        #[cfg(feature = "grpc")]
+        if let Some(tx) = grpc_shutdown_tx {
+            let _ = tx.send(());
+        }
+
+        run_result
+    });
     if let Some(p) = otel_provider {
         let _ = p.shutdown();
     }

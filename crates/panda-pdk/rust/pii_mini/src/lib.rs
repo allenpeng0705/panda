@@ -7,7 +7,7 @@
 //! `cargo build --target wasm32-unknown-unknown --release`
 
 use panda_pdk::{
-    PANDA_WASM_ABI_VERSION, RC_ALLOW, guest_bytes, redact_sequential, set_body, set_header,
+    guest_bytes, redact_sequential, set_body, set_header, PANDA_WASM_ABI_VERSION, RC_ALLOW,
 };
 
 #[no_mangle]

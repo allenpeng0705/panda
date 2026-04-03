@@ -4,40 +4,37 @@
 
 **Website:** https://www.homeclaw.cn/panda-ai/
 
-**Panda is a Rust AI gateway** that sits between your clients (apps, agents, SDKs) and model providers. It speaks an **OpenAI-compatible HTTP API** on front, and forwards to your chosen upstream—while adding **policy, identity, budgets, MCP tools, caching, safety, and observability** in one place.
+**Panda is a Rust AI gateway**: **OpenAI-compatible HTTP** in front, your **models and routes** behind—one **YAML** config, one binary. It is built for **streaming**, **token-aware budgets**, **MCP agents**, and **low-cardinality observability** so you get clear **key values** (who, what, cost, cache, tools) without turning the proxy into a data warehouse.
+
+### Key values (what you get)
+
+| Value | How Panda delivers it |
+|-------|------------------------|
+| **Easy adoption** | Clients keep `/v1/chat/completions` and familiar JSON; swap `upstream` in `panda.yaml`. |
+| **Cost & fairness** | TPM-style **token budgets**, optional **semantic cache**, **`GET /tpm/status`** for this replica’s view of a caller’s window. |
+| **Agent-ready** | **MCP host** (stdio / SSE-style servers), multi-round tool loops, optional tool-result cache + metrics. |
+| **Operable at scale** | **`/metrics`** stays **low-cardinality**; use **logs / optional compliance JSONL** + correlation id to join detail; **`GET /ops/fleet/status`** for a one-page snapshot; **`GET /ready`** documents model-failover streaming behavior. |
+| **Fast path** | **Rust + rustls**, stream-first proxying, **SSE timeouts** (slow upstreams don’t hang clients forever). |
+| **Governance hooks** | JWT/JWKS, prompt safety, PII scrub, **Wasm** plugins; optional **signed audit JSONL** ([`docs/compliance_export.md`](docs/compliance_export.md)). |
+
+**Enterprise (opt-in):** hierarchical budgets (Redis), **model failover** / parity chains, console SSO—[`docs/enterprise_track.md`](docs/enterprise_track.md). Buffered mid-stream SSE failover trades **time-to-first-token** for resilience when enabled; see **`/ready`** → `model_failover.streaming_failover`.
 
 ---
 
 ## What is Panda?
 
-Panda is a **specialized reverse proxy for LLM traffic**. Unlike a generic API gateway that mostly cares about TLS and routing, Panda treats **prompts, tokens, tools, and streaming bodies** as first-class: the same request carries auth context, spend limits, optional Wasm checks, and MCP orchestration.
-
-You run a single binary with a **YAML config** (`panda.yaml`). Clients keep using familiar paths like `/v1/chat/completions`; Panda enforces your rules before traffic hits OpenAI, Azure, Anthropic, Ollama, or any **OpenAI-compatible** endpoint.
+A **specialized reverse proxy for LLM traffic**: auth, routing, budgets, cache, tools, and policy share one **request context**. You run **`cargo run -p panda-server -- panda.yaml`** (or Docker/K8s); upstreams can be OpenAI, Azure, Anthropic (via adapter/failover), Ollama, vLLM, or any **OpenAI-compatible** base URL.
 
 ---
 
-## Why do we need it?
+## Inbound vs outbound (product shape)
 
-| Without a focused AI gateway | With Panda |
-|------------------------------|------------|
-| Identity and rate limits live in ad-hoc middleware | **JWT/JWKS**, trusted edge headers, and ops endpoints in one model |
-| “How much did we spend?” is log archaeology | **TPM-style budgets**, optional semantic cache, `/tpm/status` |
-| Tool use is custom glue per app | **MCP host**: intercept tool calls, run servers, optional streaming tool loops |
-| Safety is “hope the model behaves” | **Prompt safety, PII hooks, Wasm plugins** on the data plane |
-| Streaming hangs tie up clients | **SSE guards** (first-byte and idle-between-chunks timeouts), graceful drain |
+| Pillar | Role | Typical stack |
+|--------|------|----------------|
+| **Inbound — all-in-one** | **Panda API gateway** (first-class): **ingress** in front of **Panda MCP**, and/or **egress** behind MCP toward **corporate** API gateway + REST. Optional **external** Kong/NGINX outside Panda | [`docs/panda_data_flow.md`](docs/panda_data_flow.md) |
+| **Outbound — AI gateway** | **Control organizational AI use:** OpenAI-shaped traffic to LLMs, **budgets**, usage signals, adapters, streaming, semantic cache, routing, failover | Same process and `panda.yaml`; providers behind `upstream` / `routes` |
 
-**Rule of thumb:** if you only need TLS and path routing, use your existing edge. If you need **governed, observable, tool-aware AI traffic**, Panda is the layer for that.
-
----
-
-## What Panda can do
-
-- **OpenAI-shaped ingress** — Chat completions and streaming (SSE); adapter path for other provider protocols where configured.
-- **MCP** — Host MCP tool servers (stdio/SSE patterns); tool-call interception and multi-round follow-ups.
-- **Operations** — `/health`, `/ready`, `/metrics`, `/mcp/status`, `/tpm/status`; optional OTLP traces; graceful shutdown with drain.
-- **Policy & extensibility** — JWT scopes, prompt safety, PII scrubbing, **Wasm** plugins (request/body/stream hooks).
-- **Performance** — Rust + rustls; stream-native path; optional `mimalloc` for long-lived workloads.
-- **Enterprise (opt-in)** — SSO for the developer console, hierarchical budgets (Redis), model failover / parity map. See [`docs/enterprise_track.md`](docs/enterprise_track.md).
+Cross-cutting identity, policy, and observability apply to both. **First step:** narrow inbound to **[Phase 1 MCP + API gateway](docs/mcp_gateway_phase1.md)** (defer advanced MCP options until basics work). **MCP is not the only future wire format** — [`docs/protocol_evolution.md`](docs/protocol_evolution.md). Full map: [`docs/architecture_two_pillars.md`](docs/architecture_two_pillars.md).
 
 ---
 
@@ -105,7 +102,7 @@ cargo run -p panda-server -- --ui panda.yaml
 | **Local dev / lab** | `cargo run` + `panda.yaml`; optional `PANDA_DEV_CONSOLE_ENABLED=true` for [`/console`](docs/developer_console.md) |
 | **Container** | `docker build` + mount `panda.yaml`; see **Docker** below |
 | **Kubernetes** | Manifests under `k8s/`; ConfigMap + Deployment pattern |
-| **Behind Kong / existing edge** | Kong keeps TLS and coarse routing; route AI paths to Panda—see [`docs/kong_handshake.md`](docs/kong_handshake.md), [`docs/deployment.md`](docs/deployment.md) |
+| **Behind an API / edge gateway** | Edge handles TLS and coarse routing; forward AI and MCP paths to Panda—see [`docs/kong_handshake.md`](docs/kong_handshake.md) (trusted hop contract, any L7), [`docs/deployment.md`](docs/deployment.md) |
 | **MCP + databases (Compose)** | `deploy/mcp-starters/docker-compose.yml` — see `deploy/mcp-starters/README.md` |
 | **Load / staging checks** | `scripts/staging_readiness_gate.sh`, `scripts/load_profile_chat.sh` (see **Validation scripts** below) |
 
@@ -113,40 +110,19 @@ cargo run -p panda-server -- --ui panda.yaml
 
 - `PANDA_LISTEN_OVERRIDE=0.0.0.0:8080` — override YAML `listen` (e.g. bind all interfaces).
 - `OTEL_EXPORTER_OTLP_ENDPOINT=...` — enable OTLP trace export (see full list in [`crates/panda-server/src/main.rs`](crates/panda-server/src/main.rs) `ENV_HELP`).
+- `PANDA_GRPC_HEALTH_LISTEN=0.0.0.0:50051` — gRPC **`grpc.health.v1`** (requires binary built with **`--features grpc`**).
 
 ---
 
-## Unified vision (why Panda is different)
+## Design principles
 
-Panda is built around one idea: **treat AI traffic as a first-class operational domain**, not as “yet another HTTP microservice behind the same edge.”
+- **Two pillars** — **[Inbound](docs/architecture_two_pillars.md)** = **Panda API gateway + MCP gateway** (all-in-one: ingress and/or egress); **[Outbound](docs/architecture_two_pillars.md)** = **AI gateway** (chat/SSE, TPM, cache, adapters to LLMs).
+- **One hop for AI policy** — Identity, budgets, cache, MCP, and safety see the same request; config stays in **YAML** (`panda.example.yaml` is the annotated template).
+- **Stream-native** — SSE stays incremental where possible; optional **buffered mid-stream failover** (enterprise) is explicit in **`/ready`** because it affects **TTFT**.
+- **Key values, not a warehouse** — Prometheus stays **healthy**: high-volume series avoid per-tenant labels; **correlation id**, **`/tpm/status`**, and optional **audit JSONL** carry the detail your log or compliance pipeline aggregates.
+- **Edge + Panda** — **Inbound:** **Panda’s API gateway** (ingress/egress) + **MCP**; optional **external** Kong on top. **Outbound:** Panda as **AI gateway** to LLM providers. **Trusted hop** when an **external** gateway wraps Panda ([`docs/kong_handshake.md`](docs/kong_handshake.md)).
 
-- **One surface for humans and agents** — Clients keep an **OpenAI-compatible** API while Panda handles identity, budgets, safety, and tool orchestration in one place.
-- **Semantic + financial + security together** — Token budgets, semantic cache, prompt/PII policy, Wasm plugins, and MCP tool loops share the same request context.
-- **Stream-native and stateless by default** — Long-lived SSE streams, guards for slow upstreams, horizontal scale without a bespoke session cluster.
-- **Plays well with the edge you already have** — Run standalone or **alongside Kong**: the edge keeps TLS and coarse routing; Panda specializes AI paths with a clear trust model for identity headers.
-- **Extensible without forking the binary** — **Wasm** for custom guards, **MCP** for tools, **GitOps YAML** for config.
-
-### Four layers (what Panda adds on top of “just proxying”)
-
-| Layer | Role in Panda |
-|-------|----------------|
-| **Financial control** | TPM-style token budgets, semantic cache, ops endpoints for budget visibility. |
-| **Security & privacy** | JWT / JWKS, prompt-safety and PII controls, Wasm plugins for extra policy. |
-| **Agentic intelligence** | MCP host: tool calls, routing to your servers, optional proof-of-intent and streaming tool loops. |
-| **Performance & ops** | Rust + rustls, long-lived **SSE** streaming, `/health` / `/ready`, metrics, optional OTLP, graceful drain. |
-
-Details and limits live in `docs/` and `panda.example.yaml`.
-
-### Where Panda sits (with or without Kong)
-
-- **Behind Kong** — Kong stays on the public edge; you route AI paths (e.g. `/v1/chat/*`) to Panda. See `docs/kong_handshake.md`, `docs/deployment.md`.
-- **Standalone** — Panda terminates HTTP(S) from one `panda.yaml`; JWT, routes, and AI features in one place (`docs/deployment.md#standalone-no-kong`, `docs/integration_and_evolution.md`).
-- **Observability** — OTLP and metrics integrate with Prometheus, Jaeger, Honeycomb, etc. (`docs/deployment.md`).
-
-### Core vs Enterprise
-
-- **Core (default)** — Small teams: one `panda.yaml`, single `upstream` or simple `routes`, optional JWT, flat token budgets, optional ops-console secret. No SSO or Redis required to start.
-- **Enterprise (opt-in)** — SSO (Okta / Microsoft Entra) for the console, hierarchical budgets, model failover. See [`docs/enterprise_track.md`](docs/enterprise_track.md).
+**Core vs Enterprise:** core = single `panda.yaml`, optional Redis for TPM/cache, no SSO required. Enterprise = console SSO, hierarchical budgets, model failover chains—[`docs/enterprise_track.md`](docs/enterprise_track.md).
 
 ---
 
@@ -158,7 +134,7 @@ flowchart TD
 
   subgraph EDGE["Ingress — core: pick a deployment pattern"]
     E1["Standalone: clients → Panda (core)"]
-    E2["With Kong or edge: AI routes → Panda (core)"]
+    E2["With API gateway / edge: AI + MCP routes → Panda (core)"]
   end
 
   C --> E1
@@ -182,7 +158,7 @@ flowchart TD
     R["Redis (optional)\ncore optional: TPM, semantic cache\nenterprise: hierarchical budgets"]
     PM["Prometheus (core)\nscrape /metrics"]
     OT["OTLP (core)\ntraces to your collector"]
-    OPS["Ops HTTP (core)\n/health, /ready, /tpm/status, /mcp/status"]
+    OPS["Ops HTTP (core)\n/health, /ready, /metrics\n/tpm/status, /mcp/status\n/ops/fleet/status, /compliance/status"]
   end
 
   X <--> R
@@ -213,7 +189,7 @@ flowchart TD
 sequenceDiagram
   autonumber
   participant U as Client / Agent SDK
-  participant K as Kong / Edge (optional)
+  participant K as API gateway / Edge (optional)
   participant P as Panda Gateway
   participant R as Redis (optional)
   participant M as MCP Tool Server(s) (optional)
@@ -222,7 +198,7 @@ sequenceDiagram
 
   alt Standalone deployment
     U->>P: OpenAI-style request (e.g. /v1/chat/completions)
-  else With Kong or existing edge
+  else With API gateway or existing edge
     U->>K: Request to edge route
     K->>P: Forward AI path + trusted identity headers
   end
@@ -294,8 +270,10 @@ Rollback: `kubectl rollout undo deployment/panda`
 ## Runtime behavior (production)
 
 - `/health` — liveness.
-- `/ready` — readiness (fails during shutdown drain).
-- **Shutdown** — `SIGTERM`/`SIGINT`; drains up to `PANDA_SHUTDOWN_DRAIN_SECONDS` (default `30`).
+- `/ready` — readiness JSON (fails during drain); includes **`model_failover.streaming_failover`** notes when failover is configured (e.g. buffered SSE tradeoffs).
+- **`GET /ops/fleet/status`** — single JSON snapshot: TPM hints, MCP tool-cache counters, semantic-cache counters, Prometheus series hints (operators).
+- **`GET /compliance/status`** — audit export config (same admin auth pattern as `/metrics` when configured).
+- **Shutdown** — `SIGTERM`/`SIGINT`; drains up to `PANDA_SHUTDOWN_DRAIN_SECONDS` (default `30`). Optional **gRPC health** (`panda-server` with **`--features grpc`**, env **`PANDA_GRPC_HEALTH_LISTEN`**) stops when the HTTP gateway exits.
 
 ### Slow upstreams and streaming (“slow-think” guard)
 
@@ -321,10 +299,11 @@ Protect with `observability.admin_secret_env` + `observability.admin_auth_header
 
 ## QuickStart extras (optional env vars)
 
-- **Logs:** `RUST_LOG=info cargo run -p panda-server -- panda.yaml`
+- **Logs:** `RUST_LOG=info cargo run -p panda-server -- panda.yaml` (compliance JSONL append failures log **`tracing::warn`** throttled when export is on—see [`docs/compliance_export.md`](docs/compliance_export.md)).
 - **OTLP:** `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318/v1/traces`, `PANDA_OTEL_SERVICE_NAME=panda-gateway`, `PANDA_OTEL_TRACE_SAMPLING_RATIO=0.2`
 - **Streaming timeouts:** `PANDA_UPSTREAM_FIRST_BYTE_TIMEOUT_MS`, `PANDA_UPSTREAM_SSE_IDLE_TIMEOUT_MS`
 - **Semantic cache (Redis):** `PANDA_SEMANTIC_CACHE_REDIS_URL`, `semantic_cache.backend: "redis"`, `PANDA_SEMANTIC_CACHE_TIMEOUT_MS`
+- **gRPC health (LB probes):** build with `cargo build -p panda-server --features grpc`, set **`PANDA_GRPC_HEALTH_LISTEN=0.0.0.0:50051`** ([`docs/grpc_ingress_roadmap.md`](docs/grpc_ingress_roadmap.md)).
 - **Console:** `PANDA_DEV_CONSOLE_ENABLED=true` — when `observability.admin_secret_env` is set, `/console` requires the admin header; without it, do not expose on untrusted networks.
 
 ---
@@ -365,17 +344,32 @@ cargo build -p panda-server --release --features mimalloc
 
 | Doc | Topic |
 |-----|--------|
-| [`docs/deployment.md`](docs/deployment.md) | Binary, config, Redis, Prometheus, OTLP, Kong |
-| [`docs/kong_handshake.md`](docs/kong_handshake.md) | Working with Kong and trusted identity headers |
-| [`docs/panda_vs_kong_positioning.md`](docs/panda_vs_kong_positioning.md) | Kong vs Panda responsibilities |
+| [`docs/architecture_two_pillars.md`](docs/architecture_two_pillars.md) | Inbound (MCP + API gateway) vs outbound (AI gateway) — module & config map |
+| [`docs/mcp_gateway_phase1.md`](docs/mcp_gateway_phase1.md) | Phase 1: what the API gateway vs Panda MCP own; minimal YAML; what to defer |
+| [`docs/mcp_gateway_reference_designs.md`](docs/mcp_gateway_reference_designs.md) | Design notes: [Docker](https://github.com/docker/mcp-gateway) & [Microsoft](https://github.com/microsoft/mcp-gateway) MCP gateways vs Panda |
+| [`docs/design_mcp_control_plane_rust.md`](docs/design_mcp_control_plane_rust.md) | Target design: Rust MCP gateway + API gateway, control plane vs data plane, phased evolution |
+| [`docs/panda_data_flow.md`](docs/panda_data_flow.md) | Canonical data-flow patterns (API gateway in front / behind / combined) |
+| [`docs/design_api_gateway_and_mcp_gateway.md`](docs/design_api_gateway_and_mcp_gateway.md) | Detailed design: ingress/egress pipelines, MCP execution model, modules, YAML shape |
+| [`docs/implementation_plan_mcp_api_gateway.md`](docs/implementation_plan_mcp_api_gateway.md) | Phased implementation plan: Panda MCP + Panda API gateway |
+| [`docs/panda_api_gateway_features.md`](docs/panda_api_gateway_features.md) | Feature catalog: what Panda’s API gateway provides (and what it doesn’t) |
+| [`docs/protocol_evolution.md`](docs/protocol_evolution.md) | MCP, A2A-style protocols, adapters, future capability registry |
+| [`docs/deployment.md`](docs/deployment.md) | Binary, config, Redis, Prometheus, OTLP, edge placement |
+| [`docs/kong_handshake.md`](docs/kong_handshake.md) | Trusted L7 hop → Panda (attested headers; any gateway) |
+| [`docs/panda_vs_kong_positioning.md`](docs/panda_vs_kong_positioning.md) | Optional: edge vs AI-plane split (legacy filename) |
+| [`docs/openclaw_agent_quickstart.md`](docs/openclaw_agent_quickstart.md) | Agent fleets: metrics, MCP cache, failover hints |
+| [`docs/tool_cache_mvp.md`](docs/tool_cache_mvp.md) | MCP tool-result cache + compliance matrix |
+| [`docs/runbooks/agent_fleet_oncall.md`](docs/runbooks/agent_fleet_oncall.md) | On-call: PromQL → logs/compliance → `/tpm/status` |
+| [`docs/ai_routing_strategy.md`](docs/ai_routing_strategy.md) | Semantic routing, agent sessions, profiles |
+| [`docs/mcp_failover_streaming.md`](docs/mcp_failover_streaming.md) | Why MCP streaming skips buffered mid-stream failover |
+| [`docs/grpc_ingress_roadmap.md`](docs/grpc_ingress_roadmap.md) | Optional gRPC health listener |
 | [`docs/high_level_design.md`](docs/high_level_design.md) | Architecture |
 | [`docs/integration_and_evolution.md`](docs/integration_and_evolution.md) | Coexistence with other systems |
-| [`docs/evolution_phases.md`](docs/evolution_phases.md) | Kong / Panda phases |
+| [`docs/evolution_phases.md`](docs/evolution_phases.md) | Rollout phases (edge + gateway) |
 | [`docs/enterprise_track.md`](docs/enterprise_track.md) | Enterprise features |
 | [`docs/developer_console.md`](docs/developer_console.md) | Developer console |
-| [`docs/compliance_export.md`](docs/compliance_export.md) | Compliance/audit export model |
-| [`docs/wasm_abi.md`](docs/wasm_abi.md) | Wasm guest ABI details |
-| [`docs/dependency_audit.md`](docs/dependency_audit.md) | Dependency and supply-chain notes |
+| [`docs/compliance_export.md`](docs/compliance_export.md) | Compliance / audit JSONL |
+| [`docs/wasm_abi.md`](docs/wasm_abi.md) | Wasm guest ABI |
+| [`docs/dependency_audit.md`](docs/dependency_audit.md) | Dependency notes |
 | [`docs/implementation_plan.md`](docs/implementation_plan.md) | Roadmap |
 
 ### SDKs, plugins, and examples

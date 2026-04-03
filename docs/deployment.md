@@ -86,6 +86,11 @@ export PANDA_REDIS_URL='redis://127.0.0.1:6379'
 4. If **`admin_secret_env` is unset**, `/metrics` may be **unauthenticated**—avoid exposing it publicly.
 
 Metric names are prefixed (e.g. `panda_ops_auth_*`, `panda_tpm_*`, `panda_mcp_stream_probe_*`).
+Semantic-cache observability now includes `panda_semantic_cache_hit_total`, `panda_semantic_cache_miss_total`, and `panda_semantic_cache_store_total`.
+If `agent_sessions.enabled: true`, semantic-cache keys are bucket-scoped by default (same TPM identity bucket) even when `semantic_cache.scope_keys_with_tpm_bucket` is false.
+Optional strict audit: `mcp.tool_cache.compliance_log_misses: true` adds high-volume **`miss`** lines to `panda.compliance.tool_cache.v1` when compliance export is enabled (see `docs/compliance_export.md`).
+
+**JSON ops (same admin header when configured):** `GET /tpm/status`, `GET /mcp/status`, and **`GET /ops/fleet/status`** (single snapshot of process, TPM, agent-session flags, semantic-cache config, MCP tool-cache counters, and governance counters since process start). A starter Grafana dashboard lives at [`docs/grafana/panda_agent_fleet.json`](./grafana/panda_agent_fleet.json).
 
 ---
 
@@ -221,6 +226,7 @@ Starter manifests live under **`k8s/`** (`deployment.yaml`, `configmap.yaml`, `s
 ## See also
 
 - [Developer Console](./developer_console.md) — optional debug UI.
+- [Production SLO runbook](./runbooks/production_slo.md) — readiness fields, scripts, rollout notes.
 - [Standalone deployment](./standalone_deployment.md) — short link to this document (legacy filename).
 - [High-level design](./high_level_design.md) — architecture overview.
 - [Implementation plan](./implementation_plan.md) — engineering roadmap.

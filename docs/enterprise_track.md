@@ -49,7 +49,7 @@ Details for each pillar (architecture notes and sequencing) follow the same head
 
 - **Protocols:** OpenID Connect Authorization Code flow for browser login to `/console` (Panda callback at `/console/oauth/callback`).
 - **IdPs:** Okta, Microsoft Entra ID, and OIDC-compatible providers via **issuer** + **client** credentials.
-- **Authorization:** Map IdP **groups / claims** to Panda **roles** (e.g. `console.viewer`, `console.admin`). Deny by default when SSO is on and the user lacks a role.
+- **Authorization:** Map IdP **groups / claims** to Panda **roles** (e.g. `console.viewer`, `console.admin`) via `console_oidc.roles_claim` and optional `console_oidc.required_roles`. Use **`console_oidc.required_roles_mode`**: `any` (default) = user must have at least one listed role; `all` = user must have every listed role. Deny by default when SSO is on and the user fails the role check.
 - **WebSocket:** `/console/ws` uses a **session** or **signed ticket** from the OIDC login (avoid long-lived secrets in URLs in production).
 
 **Architecture notes**
@@ -77,7 +77,7 @@ Details for each pillar (architecture notes and sequencing) follow the same head
 - **USD:** Versioned **price cards** (model, provider, effective date); store amounts with explicit rounding for audit.
 - **Storage:** Redis counters (using `budget_hierarchy.redis_url`, else `tpm.redis_url` / `PANDA_REDIS_URL`); GitOps remains the source of limits.
 
-**Dependencies:** Stable **cost-center / department** claims; extend **compliance export** with **budget node id** ([`compliance_export.md`](./compliance_export.md)).
+**Dependencies:** Stable **cost-center / department** claims. **Compliance export** includes optional **`budget_hierarchy_nodes`** on ingress/egress JSONL rows when hierarchy is enabled and the JWT department maps to a configured limit and/or an org cap applies ([`compliance_export.md`](./compliance_export.md)).
 
 ---
 
@@ -89,7 +89,8 @@ Details for each pillar (architecture notes and sequencing) follow the same head
 
 - **Parity map:** Request `model` → ordered backends from `model_failover.groups`. Paths are classified separately: **`path_prefix`** (chat), optional **`embeddings_path_prefix`**, **`responses_path_prefix`**, **`images_path_prefix`**, and **`audio_path_prefix`**.
 - **Capabilities:** Each backend declares **`protocol`** (`openai_compatible` or `anthropic`) and optional **`supports`** (`chat_completions`, `embeddings`, `responses`, `images`, `audio`). Empty `supports` means defaults for that protocol (Anthropic: chat only; OpenAI-shaped: all operations). Anthropic hops map **OpenAI chat JSON** to **`/v1/messages`** for that hop only, including tool definitions/selection mapping.
-- **Triggers:** 5xx, 429, timeouts on the current hop before the response is returned. **Streaming:** HTTP 200 + SSE is not retried on status alone by default; `allow_failover_after_first_byte` remains default `false`.
+- **Triggers:** 5xx, 429, timeouts on the current hop before the response is returned. **Streaming:** optional **buffered** mid-body failover when `model_failover.allow_failover_after_first_byte=true`: OpenAI-shaped **chat** SSE under failover is read into memory (cap `midstream_sse_max_buffer_bytes`) so the **next** backend can be retried if the winner disconnects mid-stream—**TTFT increases**; excludes MCP streaming follow-up and Anthropic adapter streaming (see `/ready` → `model_failover.streaming_failover`).
+- **Semantic cache (memory):** optional **embedding** near-miss lookup via `semantic_cache.embedding_lookup_enabled` and OpenAI-compatible `embedding_url` (cosine vs `similarity_threshold`); see [`panda.example.yaml`](../panda.example.yaml) comments.
 - **Circuit breaker:** Optional local breaker (`circuit_breaker_enabled`) opens per backend after `circuit_breaker_failure_threshold` retryable failures for `circuit_breaker_open_seconds`.
 - **Global adapter:** If the main request is already transformed to Anthropic (`adapter.provider=anthropic` for that route), **model failover is skipped** to avoid double-mapping.
 - **Provider coverage:** OpenAI-compatible providers (for example DeepSeek, Qwen-compatible endpoints, MiniMax OpenAI-compatible endpoints) can be added directly as `protocol=openai_compatible` backends. Non-compatible providers should use a protocol adapter hop (currently Anthropic is built in; others can be added as new protocol adapters).
@@ -116,3 +117,4 @@ Details for each pillar (architecture notes and sequencing) follow the same head
 - [`panda_vs_kong_positioning.md`](./panda_vs_kong_positioning.md) — edge vs AI gateway.  
 - [`high_level_design.md`](./high_level_design.md) — pillars.  
 - [`integration_and_evolution.md`](./integration_and_evolution.md) — coexistence and domain split.
+- [`kong_replacement_program.md`](./kong_replacement_program.md) — detailed replacement tracker with status marks.

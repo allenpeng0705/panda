@@ -20,8 +20,8 @@
 //! - any other non-zero: reject plugin-specific
 
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use http::header::{HeaderMap, HeaderName, HeaderValue};
@@ -55,7 +55,10 @@ impl PolicyCode {
 
 #[derive(Debug)]
 pub enum HookFailure {
-    PolicyReject { plugin: String, code: PolicyCode },
+    PolicyReject {
+        plugin: String,
+        code: PolicyCode,
+    },
     Runtime {
         plugin: String,
         reason: RuntimeReason,
@@ -82,7 +85,10 @@ impl std::fmt::Display for HookFailure {
                 plugin,
                 reason,
                 message,
-            } => write!(f, "plugin {plugin} runtime failure reason={reason:?}: {message}"),
+            } => write!(
+                f,
+                "plugin {plugin} runtime failure reason={reason:?}: {message}"
+            ),
         }
     }
 }
@@ -137,11 +143,15 @@ impl LoadedPlugin {
         f: impl FnOnce(&mut PluginInner) -> Result<R, HookCallError>,
     ) -> Result<R, HookCallError> {
         let idx = self.next_idx.fetch_add(1, Ordering::Relaxed) % self.inners.len().max(1);
-        self.stats.pool_acquire_total.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .pool_acquire_total
+            .fetch_add(1, Ordering::Relaxed);
         match self.inners[idx].try_lock() {
             Ok(mut guard) => f(&mut guard),
             Err(_) => {
-                self.stats.pool_contended_total.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .pool_contended_total
+                    .fetch_add(1, Ordering::Relaxed);
                 let started = Instant::now();
                 let mut guard = self.inners[idx]
                     .lock()
@@ -188,9 +198,9 @@ impl LoadedPlugin {
                 Ok(f) => f,
                 Err(_) => return Ok(0),
             };
-            let rc = on_request
-                .call(&mut g.store, ())
-                .map_err(|e| HookCallError::Runtime(anyhow::anyhow!("panda_on_request call: {e}")))?;
+            let rc = on_request.call(&mut g.store, ()).map_err(|e| {
+                HookCallError::Runtime(anyhow::anyhow!("panda_on_request call: {e}"))
+            })?;
             if let Some(code) = PolicyCode::from_rc(rc) {
                 return Err(HookCallError::Policy(code));
             }
@@ -223,10 +233,13 @@ impl LoadedPlugin {
                 Err(_) => return Ok(None),
             };
             let memory = memory_from_store(g).map_err(HookCallError::Runtime)?;
-            write_guest_bytes(&mut g.store, &memory, 0, request_body).map_err(HookCallError::Runtime)?;
-            let rc = on_request_body.call(&mut g.store, (0, request_body.len() as i32)).map_err(|e| {
-                HookCallError::Runtime(anyhow::anyhow!("panda_on_request_body call: {e}"))
-            })?;
+            write_guest_bytes(&mut g.store, &memory, 0, request_body)
+                .map_err(HookCallError::Runtime)?;
+            let rc = on_request_body
+                .call(&mut g.store, (0, request_body.len() as i32))
+                .map_err(|e| {
+                    HookCallError::Runtime(anyhow::anyhow!("panda_on_request_body call: {e}"))
+                })?;
             if let Some(code) = PolicyCode::from_rc(rc) {
                 return Err(HookCallError::Policy(code));
             }
@@ -248,7 +261,9 @@ impl LoadedPlugin {
             write_guest_bytes(&mut g.store, &memory, 0, chunk).map_err(HookCallError::Runtime)?;
             let rc = on_response_chunk
                 .call(&mut g.store, (0, chunk.len() as i32))
-                .map_err(|e| HookCallError::Runtime(anyhow::anyhow!("panda_on_response_chunk call: {e}")))?;
+                .map_err(|e| {
+                    HookCallError::Runtime(anyhow::anyhow!("panda_on_response_chunk call: {e}"))
+                })?;
             if let Some(code) = PolicyCode::from_rc(rc) {
                 return Err(HookCallError::Policy(code));
             }
@@ -306,11 +321,16 @@ impl PluginRuntime {
         let engine = Engine::default();
         let stats = std::sync::Arc::new(RuntimeStats::default());
         let pool_size = instance_pool_size_from_env();
-        let plugins = Self::load_from_directory(&engine, dir, std::sync::Arc::clone(&stats), pool_size)?;
+        let plugins =
+            Self::load_from_directory(&engine, dir, std::sync::Arc::clone(&stats), pool_size)?;
         if plugins.is_empty() {
             eprintln!("panda: no .wasm files in {}", dir.display());
         }
-        Ok(Some(Self { engine, plugins, stats }))
+        Ok(Some(Self {
+            engine,
+            plugins,
+            stats,
+        }))
     }
 
     fn load_from_directory(
@@ -387,7 +407,9 @@ impl PluginRuntime {
                     .instantiate(&mut store, &module)
                     .map_err(|err| anyhow::anyhow!("{} instantiate: {err}", path.display()))?;
                 validate_plugin_abi(&mut store, &instance, &path)?;
-                stats.module_instantiate_total.fetch_add(1, Ordering::Relaxed);
+                stats
+                    .module_instantiate_total
+                    .fetch_add(1, Ordering::Relaxed);
                 stats.pool_instances_total.fetch_add(1, Ordering::Relaxed);
                 inners.push(Mutex::new(PluginInner { store, instance }));
             }
@@ -429,22 +451,23 @@ impl PluginRuntime {
         }
     }
 
-    pub fn apply_request_plugins_strict(&self, headers: &mut HeaderMap) -> Result<usize, HookFailure> {
+    pub fn apply_request_plugins_strict(
+        &self,
+        headers: &mut HeaderMap,
+    ) -> Result<usize, HookFailure> {
         let mut total = 0usize;
         for p in &self.plugins {
-            let n = p.apply_request_headers(headers).map_err(|e| {
-                match e {
-                    HookCallError::Policy(code) => HookFailure::PolicyReject {
+            let n = p.apply_request_headers(headers).map_err(|e| match e {
+                HookCallError::Policy(code) => HookFailure::PolicyReject {
+                    plugin: p.name.clone(),
+                    code,
+                },
+                HookCallError::Runtime(e) => {
+                    let message = format!("plugin {} request hook failed: {e:#}", p.name);
+                    HookFailure::Runtime {
                         plugin: p.name.clone(),
-                        code,
-                    },
-                    HookCallError::Runtime(e) => {
-                        let message = format!("plugin {} request hook failed: {e:#}", p.name);
-                        HookFailure::Runtime {
-                            plugin: p.name.clone(),
-                            reason: classify_runtime_reason(&message),
-                            message,
-                        }
+                        reason: classify_runtime_reason(&message),
+                        message,
                     }
                 }
             })?;
@@ -466,7 +489,9 @@ impl PluginRuntime {
                     if next.len() > max_output_bytes {
                         let message = format!(
                             "plugin {} body hook output too large: {} > {}",
-                            p.name, next.len(), max_output_bytes
+                            p.name,
+                            next.len(),
+                            max_output_bytes
                         );
                         return Err(HookFailure::Runtime {
                             plugin: p.name.clone(),
@@ -511,7 +536,9 @@ impl PluginRuntime {
                     if next.len() > max_output_bytes {
                         let message = format!(
                             "plugin {} response chunk hook output too large: {} > {}",
-                            p.name, next.len(), max_output_bytes
+                            p.name,
+                            next.len(),
+                            max_output_bytes
                         );
                         return Err(HookFailure::Runtime {
                             plugin: p.name.clone(),
@@ -529,7 +556,8 @@ impl PluginRuntime {
                             code,
                         },
                         HookCallError::Runtime(e) => {
-                            let message = format!("plugin {} response chunk hook failed: {e:#}", p.name);
+                            let message =
+                                format!("plugin {} response chunk hook failed: {e:#}", p.name);
                             HookFailure::Runtime {
                                 plugin: p.name.clone(),
                                 reason: classify_runtime_reason(&message),
@@ -692,10 +720,20 @@ mod tests {
 
         let engine = Engine::default();
         let stats = std::sync::Arc::new(RuntimeStats::default());
-        let plugins = PluginRuntime::load_from_directory(&engine, dir.path(), std::sync::Arc::clone(&stats), 1).unwrap();
+        let plugins = PluginRuntime::load_from_directory(
+            &engine,
+            dir.path(),
+            std::sync::Arc::clone(&stats),
+            1,
+        )
+        .unwrap();
         assert_eq!(plugins.len(), 1);
 
-        let runtime = PluginRuntime { engine, plugins, stats };
+        let runtime = PluginRuntime {
+            engine,
+            plugins,
+            stats,
+        };
         let mut headers = HeaderMap::new();
         let n = runtime.apply_request_plugins_strict(&mut headers).unwrap();
         assert_eq!(n, 1);
@@ -732,8 +770,18 @@ mod tests {
 
         let engine = Engine::default();
         let stats = std::sync::Arc::new(RuntimeStats::default());
-        let plugins = PluginRuntime::load_from_directory(&engine, dir.path(), std::sync::Arc::clone(&stats), 1).unwrap();
-        let runtime = PluginRuntime { engine, plugins, stats };
+        let plugins = PluginRuntime::load_from_directory(
+            &engine,
+            dir.path(),
+            std::sync::Arc::clone(&stats),
+            1,
+        )
+        .unwrap();
+        let runtime = PluginRuntime {
+            engine,
+            plugins,
+            stats,
+        };
 
         let out = runtime
             .apply_request_body_plugins_strict(b"original", 1024)
@@ -765,8 +813,18 @@ mod tests {
 
         let engine = Engine::default();
         let stats = std::sync::Arc::new(RuntimeStats::default());
-        let plugins = PluginRuntime::load_from_directory(&engine, dir.path(), std::sync::Arc::clone(&stats), 1).unwrap();
-        let runtime = PluginRuntime { engine, plugins, stats };
+        let plugins = PluginRuntime::load_from_directory(
+            &engine,
+            dir.path(),
+            std::sync::Arc::clone(&stats),
+            1,
+        )
+        .unwrap();
+        let runtime = PluginRuntime {
+            engine,
+            plugins,
+            stats,
+        };
 
         let out = runtime
             .apply_response_chunk_plugins_strict(b"hello", 1024)
@@ -789,12 +847,26 @@ mod tests {
         std::fs::write(dir.path().join("reject.wasm"), wasm).unwrap();
         let engine = Engine::default();
         let stats = std::sync::Arc::new(RuntimeStats::default());
-        let plugins = PluginRuntime::load_from_directory(&engine, dir.path(), std::sync::Arc::clone(&stats), 1).unwrap();
-        let runtime = PluginRuntime { engine, plugins, stats };
+        let plugins = PluginRuntime::load_from_directory(
+            &engine,
+            dir.path(),
+            std::sync::Arc::clone(&stats),
+            1,
+        )
+        .unwrap();
+        let runtime = PluginRuntime {
+            engine,
+            plugins,
+            stats,
+        };
         let mut headers = HeaderMap::new();
-        let err = runtime.apply_request_plugins_strict(&mut headers).unwrap_err();
+        let err = runtime
+            .apply_request_plugins_strict(&mut headers)
+            .unwrap_err();
         match err {
-            HookFailure::PolicyReject { code, .. } => assert_eq!(code, PolicyCode::MalformedRequest),
+            HookFailure::PolicyReject { code, .. } => {
+                assert_eq!(code, PolicyCode::MalformedRequest)
+            }
             HookFailure::Runtime { message, .. } => panic!("unexpected runtime error: {message}"),
         }
     }
@@ -817,8 +889,8 @@ mod tests {
             std::sync::Arc::new(RuntimeStats::default()),
             1,
         )
-            .err()
-            .expect("missing abi should fail");
+        .err()
+        .expect("missing abi should fail");
         assert!(err.to_string().contains("missing export panda_abi_version"));
     }
 
@@ -840,8 +912,8 @@ mod tests {
             std::sync::Arc::new(RuntimeStats::default()),
             1,
         )
-            .err()
-            .expect("abi mismatch should fail");
+        .err()
+        .expect("abi mismatch should fail");
         assert!(err.to_string().contains("ABI mismatch"));
     }
 }

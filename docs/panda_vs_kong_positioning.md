@@ -24,3 +24,5 @@ The **unified vision** is **layered**: Kong remains the **control-plane-friendly
 - **Panda standalone** — Acceptable for dev, PoCs, or small deployments that accept Panda owning TLS and optional JWT/JWKS (see `panda.example.yaml` and `docs/standalone_deployment.md`).
 
 Panda does not aim to replicate Kong’s full plugin marketplace; it aims to be the **specialized second hop** that makes LLM + MCP traffic **safe, observable, and operable** in the same vocabulary your platform team already uses (Prometheus, structured logs, GitOps).
+
+For a concrete plan to match **Kong-class AI gateway surface area** with **pluggable** stages (static → cache → embeddings → optional LLM routing) and to go **deeper** on **semantic, model, tool, MCP, and agent routing**, see **[AI routing strategy](./ai_routing_strategy.md)**.

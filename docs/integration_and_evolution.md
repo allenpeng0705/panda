@@ -46,7 +46,7 @@ Generic gateways often pay an **AI tax** when LLM traffic is forced through gene
 | **Streaming** | Buffers or wraps SSE; risk of “hanging” or brittle timeouts. | Stream-first path, **minimal copy** on hot paths (see [implementation plan](./implementation_plan.md)), SSE-friendly heartbeats and timeouts. |
 | **Throttling** | Requests per second (RPS). | **Tokens per minute (TPM)** and related token budgets to cap spend. |
 | **Caching** | Exact URL / key match (e.g. `?q=hello`). | **Semantic** match (e.g. near-duplicate prompts). |
-| **Intelligence** | Opaque bodies; limited intent context. | **Intent-aware** routing and tool-call alignment (e.g. proof-of-intent). |
+| **Intelligence** | Opaque bodies; limited intent context. | **Intent-aware** routing and tool-call alignment (e.g. proof-of-intent); see [AI routing strategy](./ai_routing_strategy.md) for semantic / tool / MCP / agent / model routing tiers. |
 | **Extensibility** | Lua-centric history. | **Rust / Go via Wasm**; closer to mainstream service engineering. |
 
 Exact behavior is implementation-dependent; this table states **design intent** and positioning.
@@ -126,6 +126,12 @@ Panda is not only a **faster proxy**; it is **specialized depth** for AI traffic
 - **Aligned procurement:** Platform teams approve an **AI gateway**; they are not asked to rip out a certified edge on day one.
 
 Big-bang replacement remains a **valid end state for some apps**, but it should be **optional** and **late**, not the default sales or engineering story.
+
+---
+
+## 7. Agent protocols beyond REST (MCP, A2A, …)
+
+Edge coexistence (above) is about **where** Panda sits. **Protocol evolution** is about **what** agents speak (MCP for tools today, agent-to-agent specs emerging). Panda’s direction is **pluggable protocol modules** and shared governance—not a bet on a single wire format. See **[protocol evolution](./protocol_evolution.md)**.
 
 ---
 

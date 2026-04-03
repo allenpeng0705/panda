@@ -120,6 +120,7 @@ This plan matches the **Kong-style lesson** you care about: a **thin, native dat
 ### Refine
 
 - Add metric export surface (Prometheus / OTel) for plugin counters and reason codes.
+- **`GET /plugins/status`** includes **`wasm_runtime_by_reason`**, aggregating plugin hook **`runtime`** outcomes (e.g. `Trap`) from the same counters exported as `panda_plugin_events_total` on `/metrics`.
 
 ---
 
@@ -154,11 +155,15 @@ This plan matches the **Kong-style lesson** you care about: a **thin, native dat
 
 **Goal:** Move beyond dumb proxying to a **tool-aware** gateway with **cost-aware** reuse and **multi-vendor** egress.
 
+**Program priority note:** Agent usability is now a top differentiator (OpenClaw-class and other small agents). Phase 4 work should prefer outcomes that make Panda easy to adopt for agents while reducing token burn safely (intent-aware caching, selective tool advertising, and clear per-session budget controls).
+
+**Panda API gateway + MCP:** Detailed **pipelines, modules, and config** — [`design_api_gateway_and_mcp_gateway.md`](./design_api_gateway_and_mcp_gateway.md). Phased milestones — [`implementation_plan_mcp_api_gateway.md`](./implementation_plan_mcp_api_gateway.md). **What is implemented vs planned** — [`gateway_design_completion.md`](./gateway_design_completion.md).
+
 ### Plan
 
 - Embed an **MCP host client** in the binary.
 - Add a **semantic router** using a **small ONNX** model (e.g. sentence embedding + k-NN routes, or a tiny classifier—`all-MiniLM-L6-v2` class of model is a reasonable starting point).
-- **Semantic cache:** normalize prompt (+ optional fingerprint of system/tools), embed with a **fast local** model, query **Redis / Milvus / other** vector index for similarity ≥ configured threshold; on hit, return cached completion (skip upstream). Keeps **store pluggable**—the gateway owns the policy and keying, not necessarily the database binary.
+- **Semantic cache:** normalize prompt (+ optional fingerprint of system/tools), embed with a **fast local** model, query **Redis / Milvus / other** vector index for similarity ≥ configured threshold; on hit, return cached completion (skip upstream). Keeps **store pluggable**—the gateway owns the policy and keying, not necessarily the database binary. **Shipped today:** memory/Redis exact keys, optional **Jaccard** on memory, optional **OpenAI embedding cosine** on memory (`semantic_cache.embedding_*`); a dedicated external vector index remains the scale-out direction.
 - **Universal adapter:** map **one** stable inbound API (OpenAI-compatible) to **backend-specific** JSON for Anthropic, Gemini, local llama.cpp servers, etc., so clients swap models without code changes.
 
 ### Implement
@@ -166,6 +171,8 @@ This plan matches the **Kong-style lesson** you care about: a **thin, native dat
 - Connect to at least one MCP server locally (e.g. SQLite or filesystem demo server).
 - Surface discovered tools to the LLM through the **`/v1/chat/completions` tools** field (or equivalent for your chosen API compatibility layer).
 - Optional **context enrichment** middleware: gateway performs retrieval (vector search against corp KB), **injects** snippets into the prompt or messages, then forwards—keeps application clients thin (same pattern as “RAG at the edge”).
+- **Agent sessions (orchestration-adjacent):** optional **`agent_sessions`** — session and planner **profile** from JWT claims and/or headers (headers override JWT), TPM bucket suffix per session, **profile → upstream** rules applied before semantic routing (longest `path_prefix` wins), per-session and per-profile **MCP `max_tool_rounds`** caps, response echo. **`/tpm/status`** includes resolved `agent_sessions.session` / `agent_sessions.profile` when the feature is enabled. **`/mcp/status`** adds **`max_tool_rounds_effective`** (reference path `/v1/chat/completions`, example effective caps, config summary, resolution note). See [`ai_routing_strategy.md`](./ai_routing_strategy.md) §3.5.
+- **Compliance + hierarchy:** when **`budget_hierarchy.enabled`**, optional **`budget_hierarchy_nodes`** (`org`, `dept:<name>`) on **`panda.compliance.ingress.v1`** / **`egress.v1`** JSONL rows when the request resolves to an org cap and/or a configured department limit (see [`compliance_export.md`](./compliance_export.md)).
 
 ### Review
 
@@ -174,7 +181,7 @@ This plan matches the **Kong-style lesson** you care about: a **thin, native dat
 
 ### Refine
 
-- **Tool discovery:** send only **intent-relevant** tools to the model to save context window and reduce misuse surface.
+- **Tool discovery:** send only **intent-relevant** tools to the model to save context window and reduce misuse surface; **`GET /mcp/status`** reports `intent_tool_policies_configured` and `intent_scoped_tool_advertising` when `mcp.intent_tool_policies` is used. Semantic-cache abuse notes: [`threat_model_semantic_cache.md`](./threat_model_semantic_cache.md). gRPC is out of scope for the HTTP hot path today: [`grpc_ingress_roadmap.md`](./grpc_ingress_roadmap.md).
 - **Streaming MCP tuning:** tune `mcp.stream_probe_bytes` (how many first-round bytes Panda inspects before passthrough) together with `mcp.probe_window_seconds` (rolling status window) using `/mcp/status` (`probe_window_*`) and `/metrics` (`panda_mcp_stream_probe_*`) to balance TTFT vs early tool-call detection.
 - **Context enrichment runtime health:** verify `/mcp/status` enrichment fields (`enrichment_enabled`, `enrichment_rules_count`, `enrichment_last_mtime_ms`) during rollouts to ensure rules are resident in memory and reloaded on file updates.
 
@@ -199,6 +206,7 @@ This plan matches the **Kong-style lesson** you care about: a **thin, native dat
   - upstream config URI is valid,
   - MCP runtime is connected when `mcp.enabled=true` and `mcp.fail_open=false`,
   - context enrichment source exists when `PANDA_CONTEXT_ENRICHMENT_FILE` is configured.
+  - JSON also includes **`shutdown_drain_seconds`** (from `PANDA_SHUTDOWN_DRAIN_SECONDS`), **`active_connections`**, and **`model_failover`** summary (`enabled`, `allow_failover_after_first_byte`, `midstream_sse_max_buffer_bytes`, `groups_configured`, streaming failover notes). See [`runbooks/production_slo.md`](./runbooks/production_slo.md).
 
 ### Review
 
@@ -247,6 +255,7 @@ This plan can be revised as benchmarks and security reviews land; keep the **Pla
 The phases above deliver a **credible MVP through production-ready core**. For **final** enterprise positioning—competing with mature API gateways on operability and trust—track the items below (not all need to ship on day one; prioritize by tenant and industry).
 
 For **Core vs Enterprise** positioning (fast default path for small teams; optional **SSO**, **hierarchical USD budgets**, **model parity / failover**), see [`enterprise_track.md`](./enterprise_track.md).
+For the **live Kong-replacement execution tracker** (statuses, scorecard, and progress log), see [`kong_replacement_program.md`](./kong_replacement_program.md).
 
 ### Reliability and performance
 

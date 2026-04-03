@@ -30,7 +30,7 @@ If `attestation_header` is unset or `PANDA_TRUSTED_GATEWAY_SECRET` is unset, **n
 
 ## Attestation semantics (exact)
 
-Implementation: `crates/panda-proxy/src/gateway.rs` (`attestation_equals`, `apply_trusted_gateway`).
+Implementation: `crates/panda-proxy/src/shared/gateway.rs` (`attestation_equals`, `apply_trusted_gateway`).
 
 1. The edge sets **`attestation_header`** to a **string value** (single header value, not multi-line).
 2. Panda compares that value to the string in **`PANDA_TRUSTED_GATEWAY_SECRET`** without leaking timing via naive string compare: it computes **HMAC-SHA256(key, header_value)** and **HMAC-SHA256(key, secret)** with `key = secret.as_bytes()`, then compares those digests with `constant_time_eq`.

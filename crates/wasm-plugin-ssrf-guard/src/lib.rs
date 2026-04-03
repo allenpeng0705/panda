@@ -7,7 +7,7 @@
 //! `cargo build -p wasm-plugin-ssrf-guard --target wasm32-unknown-unknown --release`
 //! Then copy `target/wasm32-unknown-unknown/release/wasm_plugin_ssrf_guard.wasm` into `plugins/`.
 
-use panda_pdk::{PANDA_WASM_ABI_VERSION, RC_ALLOW, RC_REJECT_POLICY_DENIED, set_header};
+use panda_pdk::{set_header, PANDA_WASM_ABI_VERSION, RC_ALLOW, RC_REJECT_POLICY_DENIED};
 
 /// Substrings matched with ASCII case-folding (sufficient for `http://` schemes and hosts).
 static BLOCKED: &[&[u8]] = &[

@@ -1,9 +1,7 @@
 //! Minimal guest module for Panda ABI v0.
 //! Build: `cargo build -p wasm-plugin-sample --target wasm32-unknown-unknown --release`
 
-use panda_pdk::{
-    PANDA_WASM_ABI_VERSION, RC_ALLOW, set_body, set_header, set_response_chunk,
-};
+use panda_pdk::{set_body, set_header, set_response_chunk, PANDA_WASM_ABI_VERSION, RC_ALLOW};
 
 /// Must match `panda_wasm::PANDA_WASM_ABI_VERSION` (duplicated to avoid a host dep in the guest).
 #[no_mangle]

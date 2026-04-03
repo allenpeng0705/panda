@@ -1,6 +1,91 @@
 # Example Panda config (copy to panda.yaml for local runs).
+#
+# First step (see docs/mcp_gateway_phase1.md): MCP gateway in Panda + API gateway at the edge.
+#   Phase 1 MCP: mcp.enabled, servers (stdio), advertise_tools, limits — skip tool_routes, intent, cache, hitl, agent_sessions until ready.
+# Outbound AI gateway (add when needed): upstream, routes, tpm, semantic_cache, adapter, routing, model_failover.
+# Cross-cutting: listen, tls, trusted_gateway, observability, identity, plugins, prompt_safety, pii.
+#
+# Target: Panda API gateway (all-in-one) — ingress in front of MCP and/or egress behind MCP toward corporate L7.
+# Phased implementation: docs/implementation_plan_mcp_api_gateway.md
+#
+# control_plane:   # Epic E — admin JSON (before ingress); pair with observability.admin_secret_env in prod
+#   enabled: false
+#   path_prefix: /ops/control
+#   # Optional: poll backing store so replicas pick up another instance’s writes or GitOps edits to json_file (not for kind: memory).
+#   # reload_from_store_ms: 10000
+#   # Optional: extra env var names whose values are valid for observability.admin_auth_header on control-plane routes only (union with admin_secret_env).
+#   # additional_admin_secret_envs: [PANDA_CP_AUTOMATION_SECRET]
+#   # Optional: Redis pub/sub — all replicas SUBSCRIBE; Panda PUBLISHes after successful POST/DELETE/import (URL from env).
+#   # reload_pubsub:
+#   #   redis_url_env: PANDA_REDIS_URL
+#   #   channel: panda:control_plane:ingress_reload
+#   # GET …/v1/status; GET/POST …/ingress/routes; GET …/ingress/routes/export; POST …/ingress/routes/import?mode=merge|replace; DELETE …/routes?path_prefix=
+#   store:
+#     kind: memory   # memory | json_file | sqlite | postgres
+#     # postgres_listen: true   # only with kind: postgres + control-plane-sql — LISTEN panda_cp_ingress; writers NOTIFY after changes
+#     # postgres = any PostgreSQL wire-compatible endpoint (no separate "aws" / "azure" kind):
+#     #   - AWS: RDS for PostgreSQL, Aurora PostgreSQL — e.g. postgresql://user:pass@cluster-xx.region.rds.amazonaws.com:5432/db?sslmode=require
+#     #   - Azure: Azure Database for PostgreSQL — use the hostname + user from Azure (often sslmode=require)
+#     #   - GCP: Cloud SQL Postgres — TCP URL or host=/cloudsql/... in query string with Cloud SQL Auth Proxy
+#     # Not implemented yet: MySQL (RDS/Aurora/Azure MySQL), Azure SQL Database / SQL Server (different engine).
+#     # json_file: /var/lib/panda/dynamic_ingress.json
+#     # database_url: 'sqlite://./panda_control.db'
+#     # database_url: 'postgresql://user:pass@/db?host=/cloudsql/PROJECT:REGION:INSTANCE&sslmode=disable'
+#
+# api_gateway:
+#   ingress:
+#     enabled: false
+#     # When enabled and routes is empty, built-in prefixes cover /v1, /mcp, /console, /health, /metrics, …
+#     # backend: mcp on /mcp → POST JSON-RPC 2.0 (initialize, tools/list, tools/call); GET → 405. Same tool names as chat (mcp_{server}_{tool}).
+#     # routes:
+#     #   - path_prefix: /v1
+#     #     backend: ai
+#     #   - path_prefix: /hooks
+#     #     backend: ai
+#     #     methods: [POST]          # optional; other verbs get 405 + Allow
+#     #   - path_prefix: /legacy
+#     #     backend: gone            # 410 | not_found → 404 (explicit tombstone)
+#     #   - path_prefix: /internal
+#     #     backend: deny
+#     #   - path_prefix: /mcp
+#     #     backend: mcp
+#     #     rate_limit:
+#     #       rps: 80
+#     # Optional: shared RPS counters across replicas (also applies to top-level routes[].rate_limit when set).
+#     # Process-local 1s windows if url_env unset or Redis errors (warn + local fallback).
+#     # rate_limit_redis:
+#     #   url_env: PANDA_GW_RPS_REDIS_URL
+#     #   key_prefix: panda:gw:ingress_rps
+#   egress:
+#     enabled: false
+#     timeout_ms: 30000
+#     pool_idle_timeout_ms: 90000
+#     corporate:
+#       default_base: "https://api.internal.example.com"
+#       # Optional round-robin bases for relative http_tool paths (replaces default_base for joining when non-empty):
+#       # pool_bases: ["https://gw-a.internal.example.com", "https://gw-b.internal.example.com"]
+#     allowlist:
+#       allow_hosts: ["api.internal.example.com"]
+#       allow_path_prefixes: ["/v1/"]
+#     # Required for mcp http_tool/http_tools and remote_mcp_url: enabled, default_base, allowlist (hosts must cover remote URLs).
+#     # mcp.servers[].remote_mcp_url: full https://host/path for JSON-RPC MCP client via egress (mutually exclusive with command/http_tool).
+#     # default_headers: [{ name: Authorization, value_env: CORP_API_TOKEN }]
+#     # retry: { max_retries: 2, initial_backoff_ms: 50, max_backoff_ms: 2000 }
+#     # Process-local caps (not shared across replicas): fail-fast concurrency + 1s RPS window
+#     # rate_limit:
+#     #   max_in_flight: 32    # 0 = unlimited; concurrent egress request() ops including retries
+#     #   max_rps: 200         # 0 = unlimited
+#     # Optional egress HTTPS client TLS (mTLS + private PKI):
+#     # tls:
+#     #   client_cert_pem: "/path/to/client-fullchain.pem"
+#     #   client_key_pem: "/path/to/client-key.pem"
+#     #   extra_ca_pem: "/path/to/corporate-root-or-intermediate.pem"
+#     #   min_protocol_version: tls12   # or tls13 (TLS 1.3 only); omit for rustls default (1.2+)
+#     #   reload_on_sighup: true        # Unix: re-read PEMs and rebuild client on SIGHUP
+#     #   watch_reload_ms: 60000        # poll PEM mtimes; rebuild client when any changes (>0)
+#
 listen: "127.0.0.1:8080"
-upstream: "http://127.0.0.1:11434"
+upstream: "http://127.0.0.1:5023"
 
 # Alternative to top-level `listen` / `tls`: nested `server` (merged at load time).
 # server:
@@ -11,7 +96,7 @@ upstream: "http://127.0.0.1:11434"
 #     key_pem: "/path/to/privkey.pem"
 
 # Optional: path-based routing (longest path_prefix wins; otherwise `upstream` above).
-# Per-route: rate_limit (HTTP RPS), tpm_limit, semantic_cache, mcp_servers, type (openai|anthropic),
+# Per-route: rate_limit (HTTP RPS; use api_gateway.ingress.rate_limit_redis for shared counters when ingress is enabled),
 # methods (optional allowlist: GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS, …).
 # Global middleware still runs for every hop; these fields override behavior for matching paths.
 # routes:
@@ -28,6 +113,60 @@ upstream: "http://127.0.0.1:11434"
 #   - path_prefix: /api/v1/users
 #     upstream: "http://user-service.internal:8080"
 #     methods: [GET, POST, PUT, PATCH, DELETE]
+#   # Optional per-path overrides for AI routing (inherits global `routing` when unset):
+#   - path_prefix: /v1/embeddings
+#     upstream: "https://api.openai.com/v1"
+#     routing:
+#       semantic_enabled: false
+
+# Optional: correlate multi-step agent traffic, planner upstream routing, and MCP delegation caps (see docs/ai_routing_strategy.md §3.5).
+# agent_sessions:
+#   enabled: true
+#   header: x-panda-agent-session
+#   profile_header: x-panda-agent-profile
+#   tpm_isolated_buckets: true
+#   # Optional: Bearer JWT claims (validated if identity/jwks or HS256 is configured).
+#   jwt_session_claim: panda_agent_session
+#   jwt_profile_claim: panda_agent_profile
+#   # When any session id is present: min(global mcp.max_tool_rounds, this).
+#   mcp_max_tool_rounds_with_session: 6
+#   profile_upstream_rules:
+#     - profile: research
+#       upstream: "https://planner.example/v1"
+#       path_prefix: /v1/chat
+#       mcp_max_tool_rounds: 3
+
+# Pluggable AI routing (semantic / future stages). Off by default. See docs/ai_routing_strategy.md.
+# routing:
+#   enabled: true
+#   shadow_mode: false
+#   # On semantic failure: static = keep path-based upstream; deny = 503 (semantic_routing_failed).
+#   fallback: static
+#   semantic:
+#     enabled: true
+#     # mode: embed | classifier | llm_judge
+#     mode: embed
+#     # --- embed mode ---
+#     embed_upstream: "https://api.openai.com/v1"
+#     embed_api_key_env: "OPENAI_API_KEY"
+#     embed_model: "text-embedding-3-small"
+#     # --- classifier / llm_judge (OpenAI-style POST {router_upstream}/chat/completions) ---
+#     # router_upstream: "https://api.openai.com/v1"
+#     # router_api_key_env: "OPENAI_API_KEY"
+#     # router_model: "gpt-4o-mini"
+#     similarity_threshold: 0.55   # embed: min cosine; classifier/judge: min model confidence (0–1)
+#     targets:
+#       - name: general
+#         routing_text: casual chat, small talk, and general knowledge questions
+#         upstream: "https://api.openai.com/v1"
+#       - name: coding
+#         routing_text: programming, debugging, APIs, and software engineering tasks
+#         upstream: "https://api.anthropic.com/v1"
+#     timeout_ms: 5000
+#     cache_ttl_seconds: 3600
+#     max_prompt_chars: 4096
+#   # Observability: x-panda-semantic-route (+ x-panda-semantic-route-score), shadow variant,
+#   # panda_semantic_routing_events_total{event,target}, panda_semantic_routing_resolve_latency_ms_*.
 
 # Optional: Kong / edge injects identity after OIDC. Attestation uses HMAC-then-constant-time
 # compare (see gateway.rs). Set PANDA_TRUSTED_GATEWAY_SECRET to the same value as the edge sends.
@@ -152,6 +291,8 @@ upstream: "http://127.0.0.1:11434"
 #   # Optional RBAC claim + required roles.
 #   roles_claim: "groups"
 #   required_roles: ["panda.console.admin"]
+#   # any = at least one role match; all = every listed role required.
+#   required_roles_mode: any
 
 # Enterprise (optional): org + department hierarchical prompt budgets (per-minute).
 # Requires identity.require_jwt=true and Redis (`budget_hierarchy.redis_url` or `tpm.redis_url` / PANDA_REDIS_URL).
@@ -169,13 +310,17 @@ upstream: "http://127.0.0.1:11434"
 #   redis_url: "redis://127.0.0.1:6379"
 #   # Safer default is fail-closed when Redis is unavailable.
 #   fail_open: false
+#   # Optional: USD estimate for hierarchy prompt tokens in the current Redis window on GET /tpm/status (not an enforced spend cap).
+#   # usd_per_million_prompt_tokens: 2.5
 
 # Enterprise (optional): model parity map + ordered failover chain.
 # For matching requests, Panda retries the next backend on 5xx/429/timeouts.
 # Classify by path: chat (path_prefix), plus optional embeddings/responses/images/audio prefixes.
 # Each backend: protocol openai_compatible (default) or anthropic (chat-only; maps OpenAI chat → /v1/messages).
 # supports: [chat_completions, embeddings, responses, images, audio] — empty means “all defaults for that protocol”.
-# allow_failover_after_first_byte: keep false for safest streaming semantics.
+# allow_failover_after_first_byte: when true, streaming OpenAI-shaped chat SSE is fully buffered (up to midstream_sse_max_buffer_bytes)
+#   so a later backend can be retried if the winner drops mid-body (higher TTFT; see GET /ready model_failover.streaming_failover).
+#   Excludes MCP advertise/streaming follow-up and Anthropic adapter streaming. Metric: panda_model_failover_midstream_retry_total.
 # circuit_breaker_*: local per-backend breaker for retryable failures.
 # model_failover:
 #   enabled: false
@@ -185,6 +330,7 @@ upstream: "http://127.0.0.1:11434"
 #   # images_path_prefix: "/v1/images"
 #   # audio_path_prefix: "/v1/audio"
 #   allow_failover_after_first_byte: false
+#   # midstream_sse_max_buffer_bytes: 16777216
 #   circuit_breaker_enabled: true
 #   circuit_breaker_failure_threshold: 3
 #   circuit_breaker_open_seconds: 30
@@ -243,6 +389,20 @@ upstream: "http://127.0.0.1:11434"
 #   similarity_threshold: 0.92
 #   max_entries: 10000
 #   ttl_seconds: 300
+#   # Agent / multi-tenant safe defaults: keep false (exact cache key only on memory backend).
+#   # Set true only if you explicitly want Jaccard "near-miss" hits (higher reuse, higher risk).
+#   similarity_fallback: false
+#   # Include TPM identity bucket in the cache key (recommended with untrusted tenants or agents).
+#   scope_keys_with_tpm_bucket: false
+#   # NOTE: breaking behavior: when `agent_sessions.enabled: true`, Panda now scopes semantic-cache
+#   # keys by TPM bucket automatically even if this flag is false.
+#   # Optional (memory backend only): after exact + Jaccard miss, call embeddings API and cosine-match stored vectors (uses similarity_threshold).
+#   # embedding_lookup_enabled: false
+#   # embedding_url: "https://api.openai.com/v1/embeddings"
+#   # embedding_model: "text-embedding-3-small"
+#   # embedding_api_key_env: "OPENAI_API_KEY"
+#   # embedding_timeout_ms: 15000
+#   # embedding_max_prompt_chars: 8192
 
 # Phase 4: universal adapter (OpenAI ingress -> backend protocol).
 # adapter:
@@ -253,48 +413,45 @@ upstream: "http://127.0.0.1:11434"
 # - If OpenAI sets stream=true with provider=anthropic, Panda forwards stream to Anthropic and
 #   translates Anthropic SSE to OpenAI chat.completion.chunk SSE (including data: [DONE]).
 
-# Phase 4: MCP tool servers (stub transports; wire stdio/SSE clients incrementally).
-# When enabled, at least one server entry with enabled=true is required.
-# Optional context enrichment (Phase 4 MVP): set env PANDA_CONTEXT_ENRICHMENT_FILE to a text file
-# with lines like `keyword => snippet` to inject top-matching snippets as a system message.
+# --- MCP gateway (Phase 1) — see docs/mcp_gateway_phase1.md ---
+# Start here: enable + one stdio server (or http_tool + api_gateway.egress) + advertise_tools. Add tool_routes, intent_tool_policies,
+# tool_cache, hitl, agent_sessions only after basics work (documented as "advanced MCP" in that file).
+# Optional: env PANDA_CONTEXT_ENRICHMENT_FILE = text file, lines `keyword => snippet` for system-message hints.
 # mcp:
 #   enabled: false
+#   advertise_tools: true
 #   fail_open: true
 #   tool_timeout_ms: 30000
 #   max_tool_payload_bytes: 1048576
 #   max_tool_rounds: 4
-#   stream_probe_bytes: 16384
-#   probe_window_seconds: 60
-#   advertise_tools: false
-#   # Proof-of-intent mode: off | audit | enforce
-#   proof_of_intent_mode: "off"
-#   # OpenAI stream=true + MCP tools: first upstream round is buffered (JSON or SSE) to detect
-#   # tool calls; follow-ups keep stream=true; final JSON may be wrapped as SSE for the client.
-#   # Optional intent policy examples (names can be `server.tool` or `mcp_server_tool`):
-#   # intent_tool_policies:
-#   #   - intent: "data_read"
-#   #     allowed_tools: ["demo.list_docs"]
-#   #   - intent: "data_write"
-#   #     allowed_tools: ["demo.update_doc"]
 #   servers:
 #     - name: demo
 #       enabled: true
-#       # Optional: real MCP over stdio (JSON-RPC, one JSON object per line). When omitted, server is a stub.
-#       # Repo sample (Python, ping + echo_message): command "python3", args:
-#       #   ["examples/mcp_stdio_minimal/server.py"]
-#       # command: "npx"
-#       # args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+#       command: "python3"
+#       args: ["examples/mcp_stdio_minimal/server.py"]
+#     # Declarative REST tool (egress): one HTTP call per server — no stdio. Requires api_gateway.egress (see top of file).
+#     # Mutually exclusive with `command`. OpenAI function name: mcp_{server}_{tool_name} (default tool_name: call).
+#     # - name: corp_rest
+#     #   enabled: true
+#     #   http_tool:
+#     #     path: /v1/internal/tools/lookup
+#     #     method: GET
+#     #     tool_name: call
+#     #     description: "Internal lookup API"
+#     # POST / PUT / PATCH: tool arguments are sent as JSON body (Content-Type: application/json).
+#     # Multiple tools on one server:
+#     #   http_tools:
+#     #     - path: /v1/tools/a
+#     #       tool_name: lookup_a
+#     #     - path: /v1/tools/b
+#     #       tool_name: lookup_b
+#   # Defaults are fine for streaming+tools tuning unless debugging:
+#   # stream_probe_bytes: 16384
+#   # probe_window_seconds: 60
+#   # proof_of_intent_mode: "off"
 #
-#   # Human-in-the-loop: POST JSON to approval_url before running listed tools (requires mcp.enabled).
-#   # Approval body: { correlation_id, openai_function_name, server, tool, arguments }
-#   # Response: { "approved": true } or { "status": "approved" }
-#   # hitl:
-#   #   enabled: true
-#   #   approval_url: "https://control-plane.internal/mcp/approve"
-#   #   timeout_ms: 120000
-#   #   bearer_token_env: "PANDA_HITL_APPROVAL_TOKEN"
-#   #   fail_open: false
-#   #   tools: ["corp_sql.delete_database", "corp_sql.drop_table"]
+# Advanced MCP (defer): tool_routes, intent_tool_policies, tool_cache, hitl — examples previously lived here;
+# see docs/tool_cache_mvp.md (cache), docs/ai_routing_strategy.md (agent_sessions), and crate tests for YAML shapes.
 
 # Advanced: when the primary OpenAI-compatible upstream returns HTTP 429, retry once via a fallback.
 # Anthropic: set ANTHROPIC_API_KEY (or rate_limit_fallback.api_key_env). OpenAI-shaped body is mapped to /v1/messages.
