@@ -81,7 +81,9 @@ impl McpHttpRemoteClient {
         );
         let hn = self.correlation_header.trim();
         if !hn.is_empty() {
-            if let Some(cv) = correlation_value.map(str::trim).filter(|c| !c.is_empty() && *c != "-")
+            if let Some(cv) = correlation_value
+                .map(str::trim)
+                .filter(|c| !c.is_empty() && *c != "-")
             {
                 if let (Ok(name), Ok(hv)) = (
                     http::HeaderName::from_bytes(hn.as_bytes()),
@@ -125,7 +127,8 @@ impl McpHttpRemoteClient {
     }
 
     fn sse_first_data_line_json_bytes(raw: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let s = std::str::from_utf8(raw).map_err(|e| anyhow::anyhow!("remote MCP SSE body utf8: {e}"))?;
+        let s = std::str::from_utf8(raw)
+            .map_err(|e| anyhow::anyhow!("remote MCP SSE body utf8: {e}"))?;
         for line in s.lines() {
             let t = line.trim_start();
             if let Some(rest) = t.strip_prefix("data:") {
@@ -257,11 +260,9 @@ impl McpClient for McpHttpRemoteClient {
                 "arguments": req.arguments
             }
         });
-        let resp = self.post_json(
-            &rpc,
-            Some(req.correlation_id.as_str()),
-        )
-        .await?;
+        let resp = self
+            .post_json(&rpc, Some(req.correlation_id.as_str()))
+            .await?;
         let body = Self::decode_remote_mcp_body(&resp)?;
         let result = Self::parse_rpc_response(&body, id)?;
         let is_error = result
@@ -303,7 +304,10 @@ mod tests {
         let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let mid = v
             .get("id")
-            .and_then(|x| x.as_u64().or_else(|| x.as_str().and_then(|s| s.parse().ok())))
+            .and_then(|x| {
+                x.as_u64()
+                    .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+            })
             .unwrap_or(0);
         let (status_line, resp_body) = match method {
             "initialize" => (

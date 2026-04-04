@@ -77,7 +77,12 @@ pub(crate) fn ingress_entry_from_route(r: &ApiGatewayIngressRoute) -> Option<Ing
         .as_ref()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let tenant_id = r.tenant_id.as_deref().map(str::trim).unwrap_or("").to_string();
+    let tenant_id = r
+        .tenant_id
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
     let ingress_rps = r.rate_limit.as_ref().map(|rl| rl.rps).filter(|n| *n > 0);
     Some(IngressEntry {
         tenant_id,
@@ -188,13 +193,13 @@ impl DynamicIngressRoutes {
         let mut v = Vec::new();
         for r in preloaded {
             let e = ingress_entry_from_route(&r).ok_or_else(|| {
-                format!("invalid stored route (empty path_prefix): {:?}", r.path_prefix)
+                format!(
+                    "invalid stored route (empty path_prefix): {:?}",
+                    r.path_prefix
+                )
             })?;
             if !e.prefix.starts_with('/') {
-                return Err(format!(
-                    "path_prefix must start with `/`: {}",
-                    e.prefix
-                ));
+                return Err(format!("path_prefix must start with `/`: {}", e.prefix));
             }
             v.push(e);
         }
@@ -215,9 +220,8 @@ impl DynamicIngressRoutes {
 
     /// Memory only (used after import has already written the backing store).
     pub fn upsert_route_memory_only(&self, r: &ApiGatewayIngressRoute) -> Result<(), String> {
-        let e = ingress_entry_from_route(r).ok_or_else(|| {
-            "path_prefix must be non-empty".to_string()
-        })?;
+        let e = ingress_entry_from_route(r)
+            .ok_or_else(|| "path_prefix must be non-empty".to_string())?;
         if !e.prefix.starts_with('/') {
             return Err("path_prefix must start with `/`".to_string());
         }
@@ -252,17 +256,16 @@ impl DynamicIngressRoutes {
         Ok(())
     }
 
-    pub fn replace_all_from_routes(&self, routes: Vec<ApiGatewayIngressRoute>) -> Result<(), String> {
+    pub fn replace_all_from_routes(
+        &self,
+        routes: Vec<ApiGatewayIngressRoute>,
+    ) -> Result<(), String> {
         let mut v = Vec::new();
         for r in routes {
-            let e = ingress_entry_from_route(&r).ok_or_else(|| {
-                format!("invalid route (empty path_prefix): {:?}", r.path_prefix)
-            })?;
+            let e = ingress_entry_from_route(&r)
+                .ok_or_else(|| format!("invalid route (empty path_prefix): {:?}", r.path_prefix))?;
             if !e.prefix.starts_with('/') {
-                return Err(format!(
-                    "path_prefix must start with `/`: {}",
-                    e.prefix
-                ));
+                return Err(format!("path_prefix must start with `/`: {}", e.prefix));
             }
             v.push(e);
         }
@@ -304,10 +307,7 @@ impl DynamicIngressRoutes {
     }
 
     pub(crate) fn entries_snapshot(&self) -> Vec<IngressEntry> {
-        self.inner
-            .read()
-            .map(|g| g.clone())
-            .unwrap_or_default()
+        self.inner.read().map(|g| g.clone()).unwrap_or_default()
     }
 
     pub fn route_count(&self) -> usize {
@@ -328,7 +328,9 @@ impl DynamicIngressRoutes {
                 backend: e.backend,
                 methods: e.methods.iter().map(|m| m.to_string()).collect(),
                 upstream: e.upstream.clone(),
-                rate_limit: e.ingress_rps.map(|rps| panda_config::RouteRateLimitConfig { rps }),
+                rate_limit: e
+                    .ingress_rps
+                    .map(|rps| panda_config::RouteRateLimitConfig { rps }),
             })
             .collect()
     }
@@ -350,7 +352,10 @@ impl IngressRouter {
         let entries: Vec<IngressEntry> = if cfg.routes.is_empty() {
             builtin_default_routes()
         } else {
-            cfg.routes.iter().filter_map(ingress_entry_from_route).collect()
+            cfg.routes
+                .iter()
+                .filter_map(ingress_entry_from_route)
+                .collect()
         };
         let mut entries = entries;
         entries.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
@@ -362,7 +367,12 @@ impl IngressRouter {
     }
 
     /// Longest matching `path_prefix` wins; then optional HTTP method filter.
-    pub fn classify(&self, path: &str, method: &Method, request_tenant: Option<&str>) -> IngressClassify {
+    pub fn classify(
+        &self,
+        path: &str,
+        method: &Method,
+        request_tenant: Option<&str>,
+    ) -> IngressClassify {
         let Some(e) = longest_prefix_match_iter(
             self.entries
                 .iter()
@@ -382,11 +392,7 @@ impl IngressRouter {
     }
 }
 
-fn entry(
-    prefix: &str,
-    backend: ApiGatewayIngressBackend,
-    methods: Vec<Method>,
-) -> IngressEntry {
+fn entry(prefix: &str, backend: ApiGatewayIngressBackend, methods: Vec<Method>) -> IngressEntry {
     IngressEntry {
         tenant_id: String::new(),
         prefix: prefix.to_string(),
@@ -401,9 +407,21 @@ fn entry(
 fn builtin_default_routes() -> Vec<IngressEntry> {
     let any: Vec<Method> = vec![];
     vec![
-        entry("/compliance/status", ApiGatewayIngressBackend::Ops, any.clone()),
-        entry("/ops/fleet/status", ApiGatewayIngressBackend::Ops, any.clone()),
-        entry("/plugins/status", ApiGatewayIngressBackend::Ops, any.clone()),
+        entry(
+            "/compliance/status",
+            ApiGatewayIngressBackend::Ops,
+            any.clone(),
+        ),
+        entry(
+            "/ops/fleet/status",
+            ApiGatewayIngressBackend::Ops,
+            any.clone(),
+        ),
+        entry(
+            "/plugins/status",
+            ApiGatewayIngressBackend::Ops,
+            any.clone(),
+        ),
         entry("/mcp/status", ApiGatewayIngressBackend::Ops, any.clone()),
         entry("/tpm/status", ApiGatewayIngressBackend::Ops, any.clone()),
         entry("/metrics", ApiGatewayIngressBackend::Ops, any.clone()),

@@ -7,8 +7,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use http::header::{self, HeaderMap, HeaderValue};
 use futures_util::stream::{self, StreamExt};
+use http::header::{self, HeaderMap, HeaderValue};
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Frame;
 use hyper::{Response, StatusCode};
@@ -83,7 +83,9 @@ pub(crate) fn read_session_id(headers: &HeaderMap) -> Option<String> {
 
 /// When `Origin` is present, require it to match `Host` (scheme-relative compare on host[:port]).
 /// Absent `Origin` is allowed (non-browser MCP clients).
-pub(crate) fn validate_origin_for_streamable<B>(req: &http::Request<B>) -> Result<(), &'static str> {
+pub(crate) fn validate_origin_for_streamable<B>(
+    req: &http::Request<B>,
+) -> Result<(), &'static str> {
     let Some(origin_raw) = req.headers().get(header::ORIGIN) else {
         return Ok(());
     };
@@ -122,16 +124,17 @@ pub(crate) fn validate_origin_for_streamable<B>(req: &http::Request<B>) -> Resul
 }
 
 /// Long-lived SSE stream for GET listener (keepalive only; server-push can be added later).
-pub(crate) fn mcp_streamable_get_listener_response(last_event_id: Option<&str>) -> Response<BoxBody> {
+pub(crate) fn mcp_streamable_get_listener_response(
+    last_event_id: Option<&str>,
+) -> Response<BoxBody> {
     let _ = last_event_id;
     let mut interval = tokio::time::interval(Duration::from_secs(20));
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let open = stream::once(async {
         Ok::<_, Infallible>(Frame::data(Bytes::from_static(b": mcp-listener\n\n")))
     });
-    let pings = IntervalStream::new(interval).map(|_| {
-        Ok::<_, Infallible>(Frame::data(Bytes::from_static(b": ping\n\n")))
-    });
+    let pings = IntervalStream::new(interval)
+        .map(|_| Ok::<_, Infallible>(Frame::data(Bytes::from_static(b": ping\n\n"))));
     let stream = open.chain(pings);
     let body = StreamBody::new(stream)
         .map_err(|never: Infallible| match never {})
@@ -169,8 +172,5 @@ pub(crate) fn mcp_session_header_missing_response() -> Response<BoxBody> {
 }
 
 pub(crate) fn mcp_session_unknown_response() -> Response<BoxBody> {
-    text_response(
-        StatusCode::NOT_FOUND,
-        "unknown or expired Mcp-Session-Id",
-    )
+    text_response(StatusCode::NOT_FOUND, "unknown or expired Mcp-Session-Id")
 }

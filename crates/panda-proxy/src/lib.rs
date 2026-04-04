@@ -23,17 +23,18 @@ mod inbound;
 mod outbound;
 mod shared;
 
-pub use shared::gateway::RequestContext;
 pub use inbound::mcp::{McpRuntime, McpToolCallRequest, McpToolCallResult, McpToolDescriptor};
 pub use inbound::mcp_openai::{
     openai_function_name, openai_tools_json_value, sanitize_openai_function_name,
 };
+pub use shared::gateway::RequestContext;
 pub use shared::jwks;
 
 use inbound::mcp;
 use outbound::adapter;
 use outbound::adapter_stream;
 use outbound::model_failover;
+use outbound::semantic_cache::SemanticCache;
 use outbound::semantic_routing;
 use outbound::sse;
 use outbound::upstream;
@@ -46,7 +47,6 @@ use shared::route_rps;
 use shared::tls;
 use shared::tpm;
 use shared::tpm::TpmCounters;
-use outbound::semantic_cache::SemanticCache;
 
 #[cfg(feature = "embedded-console-ui")]
 #[derive(rust_embed::RustEmbed)]
@@ -1844,11 +1844,9 @@ pub async fn run(config: Arc<PandaConfig>) -> anyhow::Result<()> {
             }
         };
 
-    let ingress_router =
-        api_gateway::ingress::IngressRouter::try_new(&config.api_gateway.ingress);
+    let ingress_router = api_gateway::ingress::IngressRouter::try_new(&config.api_gateway.ingress);
 
-    let control_plane_api_keys_redis =
-        connect_control_plane_api_keys_redis(config.as_ref()).await;
+    let control_plane_api_keys_redis = connect_control_plane_api_keys_redis(config.as_ref()).await;
 
     let state = Arc::new(ProxyState {
         config: Arc::clone(&config),
@@ -1875,15 +1873,18 @@ pub async fn run(config: Arc<PandaConfig>) -> anyhow::Result<()> {
         egress: egress_client,
         ingress_router,
         dynamic_ingress: {
-            let (d, note) = api_gateway::control_plane_store::init_dynamic_ingress(&config.control_plane)
-                .await?;
+            let (d, note) =
+                api_gateway::control_plane_store::init_dynamic_ingress(&config.control_plane)
+                    .await?;
             if let Some(n) = note {
                 eprintln!("panda: {n}");
             }
             d
         },
         control_plane_api_keys_redis,
-        mcp_streamable_sessions: Arc::new(inbound::mcp_streamable_http::McpStreamableSessionStore::new()),
+        mcp_streamable_sessions: Arc::new(
+            inbound::mcp_streamable_http::McpStreamableSessionStore::new(),
+        ),
     });
 
     if state.config.control_plane.enabled {
@@ -1988,7 +1989,9 @@ pub async fn run(config: Arc<PandaConfig>) -> anyhow::Result<()> {
                     if cur != last {
                         last = cur;
                         match eg_watch.reload_http_client().await {
-                            Ok(()) => eprintln!("panda: egress TLS client reloaded (PEM mtime changed)"),
+                            Ok(()) => {
+                                eprintln!("panda: egress TLS client reloaded (PEM mtime changed)")
+                            }
                             Err(e) => eprintln!("panda: egress TLS watch reload failed: {e:#}"),
                         }
                     }
@@ -2116,17 +2119,20 @@ pub(crate) fn ensure_rustls_ring_provider() {
 pub(crate) fn build_http_client_with_pool_idle(
     pool_idle_timeout: Option<Duration>,
 ) -> anyhow::Result<HttpClient> {
-    build_egress_http_client(pool_idle_timeout, &panda_config::ApiGatewayEgressTlsConfig::default())
+    build_egress_http_client(
+        pool_idle_timeout,
+        &panda_config::ApiGatewayEgressTlsConfig::default(),
+    )
 }
 
-fn load_pem_certificate_chain(path: &std::path::Path) -> anyhow::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+fn load_pem_certificate_chain(
+    path: &std::path::Path,
+) -> anyhow::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
     use anyhow::Context;
     use rustls::pki_types::CertificateDer;
     use std::fs::File;
     use std::io::BufReader;
-    let mut reader = BufReader::new(
-        File::open(path).with_context(|| path.display().to_string())?,
-    );
+    let mut reader = BufReader::new(File::open(path).with_context(|| path.display().to_string())?);
     let v: Vec<_> = rustls_pemfile::certs(&mut reader)
         .filter_map(|r| r.ok())
         .map(CertificateDer::from)
@@ -2135,13 +2141,13 @@ fn load_pem_certificate_chain(path: &std::path::Path) -> anyhow::Result<Vec<rust
     Ok(v)
 }
 
-fn load_pem_private_key(path: &std::path::Path) -> anyhow::Result<rustls::pki_types::PrivateKeyDer<'static>> {
+fn load_pem_private_key(
+    path: &std::path::Path,
+) -> anyhow::Result<rustls::pki_types::PrivateKeyDer<'static>> {
     use anyhow::Context;
     use std::fs::File;
     use std::io::BufReader;
-    let mut reader = BufReader::new(
-        File::open(path).with_context(|| path.display().to_string())?,
-    );
+    let mut reader = BufReader::new(File::open(path).with_context(|| path.display().to_string())?);
     rustls_pemfile::private_key(&mut reader)
         .transpose()
         .context("read private key PEM")?
@@ -2225,10 +2231,9 @@ pub(crate) fn build_egress_http_client(
     let roots = Arc::new(roots);
     let tls_config = match min.as_deref() {
         Some("tls13") => {
-            let builder = rustls::ClientConfig::builder_with_protocol_versions(&[
-                &rustls::version::TLS13,
-            ])
-            .with_root_certificates(Arc::clone(&roots));
+            let builder =
+                rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                    .with_root_certificates(Arc::clone(&roots));
             match (cert_path, key_path) {
                 (Some(cp), Some(kp)) => {
                     let certs = load_pem_certificate_chain(Path::new(cp))
@@ -2595,32 +2600,33 @@ async fn dispatch(
         state.ops_metrics.inc_ops_auth_allowed(&path);
         log_ops_access(&path, "allow", &corr_ops, bucket.as_deref());
 
-        let cp_finish_ok =
-            |state: &ProxyState, body: serde_json::Value| -> Result<Response<BoxBody>, Infallible> {
-                trace_request(
-                    &path,
-                    &method,
-                    &corr,
-                    StatusCode::OK,
-                    started.elapsed().as_millis(),
-                );
-                if let Some(ref hub) = state.console_hub {
-                    hub.emit(ConsoleEvent {
-                        version: "v1",
-                        request_id: corr.clone(),
-                        trace_id: None,
-                        ts_unix_ms: now_epoch_ms(),
-                        stage: "ingress",
-                        kind: "request_finished",
-                        method: method.to_string(),
-                        route: truncate_route(&path),
-                        status: Some(StatusCode::OK.as_u16()),
-                        elapsed_ms: Some(started.elapsed().as_millis() as u64),
-                        payload: None,
-                    });
-                }
-                Ok(json_response(StatusCode::OK, body))
-            };
+        let cp_finish_ok = |state: &ProxyState,
+                            body: serde_json::Value|
+         -> Result<Response<BoxBody>, Infallible> {
+            trace_request(
+                &path,
+                &method,
+                &corr,
+                StatusCode::OK,
+                started.elapsed().as_millis(),
+            );
+            if let Some(ref hub) = state.console_hub {
+                hub.emit(ConsoleEvent {
+                    version: "v1",
+                    request_id: corr.clone(),
+                    trace_id: None,
+                    ts_unix_ms: now_epoch_ms(),
+                    stage: "ingress",
+                    kind: "request_finished",
+                    method: method.to_string(),
+                    route: truncate_route(&path),
+                    status: Some(StatusCode::OK.as_u16()),
+                    elapsed_ms: Some(started.elapsed().as_millis() as u64),
+                    payload: None,
+                });
+            }
+            Ok(json_response(StatusCode::OK, body))
+        };
 
         match rest {
             "/v1/api_keys" => match method {
@@ -2641,16 +2647,15 @@ async fn dispatch(
                     let ttl: Option<u64> = if bytes.is_empty() {
                         None
                     } else {
-                        let v: serde_json::Value =
-                            match serde_json::from_slice(&bytes) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    return Ok(json_response(
-                                        StatusCode::BAD_REQUEST,
-                                        serde_json::json!({ "error": format!("invalid JSON: {e}") }),
-                                    ));
-                                }
-                            };
+                        let v: serde_json::Value = match serde_json::from_slice(&bytes) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                return Ok(json_response(
+                                    StatusCode::BAD_REQUEST,
+                                    serde_json::json!({ "error": format!("invalid JSON: {e}") }),
+                                ));
+                            }
+                        };
                         v.get("ttl_seconds").and_then(|x| x.as_u64())
                     };
                     let prefix = state
@@ -2660,9 +2665,7 @@ async fn dispatch(
                         .api_keys_redis_key_prefix
                         .as_str();
                     match api_gateway::control_plane_store::control_plane_api_key_issue(
-                        &mut rconn,
-                        prefix,
-                        ttl,
+                        &mut rconn, prefix, ttl,
                     )
                     .await
                     {
@@ -2707,9 +2710,7 @@ async fn dispatch(
                         .api_keys_redis_key_prefix
                         .as_str();
                     match api_gateway::control_plane_store::control_plane_api_key_revoke(
-                        &mut rconn,
-                        prefix,
-                        tok,
+                        &mut rconn, prefix, tok,
                     )
                     .await
                     {
@@ -2738,8 +2739,7 @@ async fn dispatch(
                         StatusCode::METHOD_NOT_ALLOWED,
                         "control plane: only POST or DELETE for /v1/api_keys",
                     );
-                    resp
-                        .headers_mut()
+                    resp.headers_mut()
                         .insert(header::ALLOW, HeaderValue::from_static("POST, DELETE"));
                     return Ok(resp);
                 }
@@ -2758,10 +2758,7 @@ async fn dispatch(
                         "control plane: only GET for /v1/status",
                     ));
                 }
-                return cp_finish_ok(
-                    state.as_ref(),
-                    control_plane_status_json(state.as_ref()),
-                );
+                return cp_finish_ok(state.as_ref(), control_plane_status_json(state.as_ref()));
             }
             "/v1/api_gateway/ingress/routes/export" => {
                 if method != hyper::Method::GET {
@@ -2882,9 +2879,7 @@ async fn dispatch(
                     );
                 }
                 hyper::Method::POST => {
-                    if !state.config.api_gateway.ingress.enabled
-                        || state.ingress_router.is_none()
-                    {
+                    if !state.config.api_gateway.ingress.enabled || state.ingress_router.is_none() {
                         trace_request(
                             &path,
                             &method,
@@ -2913,28 +2908,25 @@ async fn dispatch(
                             return Ok(proxy_error_response(e));
                         }
                     };
-                    let route: panda_config::ApiGatewayIngressRoute =
-                        match serde_json::from_slice(&bytes) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                trace_request(
-                                    &path,
-                                    &method,
-                                    &corr,
-                                    StatusCode::BAD_REQUEST,
-                                    started.elapsed().as_millis(),
-                                );
-                                return Ok(json_response(
-                                    StatusCode::BAD_REQUEST,
-                                    serde_json::json!({ "error": "invalid JSON body", "detail": e.to_string() }),
-                                ));
-                            }
-                        };
-                    match state
-                        .dynamic_ingress
-                        .upsert_route_persisted(&route)
-                        .await
-                    {
+                    let route: panda_config::ApiGatewayIngressRoute = match serde_json::from_slice(
+                        &bytes,
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            trace_request(
+                                &path,
+                                &method,
+                                &corr,
+                                StatusCode::BAD_REQUEST,
+                                started.elapsed().as_millis(),
+                            );
+                            return Ok(json_response(
+                                StatusCode::BAD_REQUEST,
+                                serde_json::json!({ "error": "invalid JSON body", "detail": e.to_string() }),
+                            ));
+                        }
+                    };
+                    match state.dynamic_ingress.upsert_route_persisted(&route).await {
                         Ok(()) => {
                             control_plane_publish_redis_reload(&state.config).await;
                             return cp_finish_ok(
@@ -2962,9 +2954,7 @@ async fn dispatch(
                     }
                 }
                 hyper::Method::DELETE => {
-                    if !state.config.api_gateway.ingress.enabled
-                        || state.ingress_router.is_none()
-                    {
+                    if !state.config.api_gateway.ingress.enabled || state.ingress_router.is_none() {
                         trace_request(
                             &path,
                             &method,
@@ -3051,10 +3041,8 @@ async fn dispatch(
                         StatusCode::METHOD_NOT_ALLOWED,
                         "control plane: method not allowed for /v1/api_gateway/ingress/routes",
                     );
-                    resp.headers_mut().insert(
-                        header::ALLOW,
-                        HeaderValue::from_static("GET, POST, DELETE"),
-                    );
+                    resp.headers_mut()
+                        .insert(header::ALLOW, HeaderValue::from_static("GET, POST, DELETE"));
                     return Ok(resp);
                 }
             },
@@ -3144,9 +3132,8 @@ async fn dispatch(
                     });
                 }
                 let allow_s = allow.join(", ");
-                let hv = HeaderValue::from_str(&allow_s).unwrap_or_else(|_| {
-                    HeaderValue::from_static("GET, HEAD, OPTIONS")
-                });
+                let hv = HeaderValue::from_str(&allow_s)
+                    .unwrap_or_else(|_| HeaderValue::from_static("GET, HEAD, OPTIONS"));
                 let body = Full::new(bytes::Bytes::copy_from_slice(
                     b"ingress: method not allowed for this path",
                 ))
@@ -3225,10 +3212,7 @@ async fn dispatch(
                                 payload: None,
                             });
                         }
-                        return Ok(text_response(
-                            StatusCode::FORBIDDEN,
-                            "ingress: denied",
-                        ));
+                        return Ok(text_response(StatusCode::FORBIDDEN, "ingress: denied"));
                     }
                     Igb::Gone => {
                         trace_request(
@@ -3278,10 +3262,7 @@ async fn dispatch(
                                 payload: None,
                             });
                         }
-                        return Ok(text_response(
-                            StatusCode::NOT_FOUND,
-                            "ingress: not found",
-                        ));
+                        return Ok(text_response(StatusCode::NOT_FOUND, "ingress: not found"));
                     }
                     Igb::Mcp => {
                         let resp = inbound::mcp_http_ingress::handle_mcp_ingress_http(
@@ -3317,7 +3298,10 @@ async fn dispatch(
                         return Ok(resp);
                     }
                     Igb::Ai => {
-                        if let Some(u) = upstream.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty())
+                        if let Some(u) = upstream
+                            .as_ref()
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty())
                         {
                             req.extensions_mut()
                                 .insert(IngressAiUpstreamOverride(u.to_string()));
@@ -5266,11 +5250,9 @@ pub(crate) async fn mcp_http_ingress_execute_tools_call(
         }
     }
 
-    if let Err(rule) = mcp::mcp_tool_allowed_by_route_rules(
-        &state.config.mcp.tool_routes,
-        &server_lbl,
-        &tool_lbl,
-    ) {
+    if let Err(rule) =
+        mcp::mcp_tool_allowed_by_route_rules(&state.config.mcp.tool_routes, &server_lbl, &tool_lbl)
+    {
         state
             .ops_metrics
             .inc_mcp_tool_route_event("call_blocked", &rule);
@@ -5344,10 +5326,9 @@ pub(crate) async fn mcp_http_ingress_execute_tools_call(
             &call_args,
             policy_version.as_str(),
         ) {
-            state.ops_metrics.inc_mcp_tool_cache_hit(
-                call.server.as_str(),
-                call.tool.as_str(),
-            );
+            state
+                .ops_metrics
+                .inc_mcp_tool_cache_hit(call.server.as_str(), call.tool.as_str());
             if let (Some(ref sink), Some(ref eh)) =
                 (state.compliance.as_ref(), tool_cache_entry_hex.as_ref())
             {
@@ -5367,10 +5348,9 @@ pub(crate) async fn mcp_http_ingress_execute_tools_call(
                 mcp_ingress_tool_call_result_json(&hit),
             );
         } else {
-            state.ops_metrics.inc_mcp_tool_cache_miss(
-                call.server.as_str(),
-                call.tool.as_str(),
-            );
+            state
+                .ops_metrics
+                .inc_mcp_tool_cache_miss(call.server.as_str(), call.tool.as_str());
             if cache.compliance_log_misses {
                 if let (Some(ref sink), Some(ref eh)) =
                     (state.compliance.as_ref(), tool_cache_entry_hex.as_ref())
@@ -5429,11 +5409,7 @@ pub(crate) async fn mcp_http_ingress_execute_tools_call(
 
     match rt.call_tool(call).await {
         Ok(result) => {
-            let outcome = if result.is_error {
-                "tool_error"
-            } else {
-                "ok"
-            };
+            let outcome = if result.is_error { "tool_error" } else { "ok" };
             state.record_mcp_tool_call(server_lbl.as_str(), tool_lbl.as_str(), outcome);
             if let Some(ref cache) = state.mcp_tool_cache {
                 if cache.write(
@@ -5444,10 +5420,9 @@ pub(crate) async fn mcp_http_ingress_execute_tools_call(
                     policy_version.as_str(),
                     &result,
                 ) {
-                    state.ops_metrics.inc_mcp_tool_cache_store(
-                        server_lbl.as_str(),
-                        tool_lbl.as_str(),
-                    );
+                    state
+                        .ops_metrics
+                        .inc_mcp_tool_cache_store(server_lbl.as_str(), tool_lbl.as_str());
                     if let (Some(ref sink), Some(ref eh)) =
                         (state.compliance.as_ref(), tool_cache_entry_hex.as_ref())
                     {
@@ -5583,11 +5558,7 @@ fn portal_index_html_response() -> Response<BoxBody> {
 </script>
 </body>
 </html>"#;
-    text_with_content_type(
-        StatusCode::OK,
-        HTML.to_string(),
-        "text/html; charset=utf-8",
-    )
+    text_with_content_type(StatusCode::OK, HTML.to_string(), "text/html; charset=utf-8")
 }
 
 fn api_gateway_status_json(state: &ProxyState) -> serde_json::Value {
@@ -6420,9 +6391,7 @@ async fn forward_to_upstream(
 
     let ingress_uri_full = req.uri().clone();
     let ingress_path = ingress_uri_full.path().to_string();
-    let ingress_upstream_override = req
-        .extensions_mut()
-        .remove::<IngressAiUpstreamOverride>();
+    let ingress_upstream_override = req.extensions_mut().remove::<IngressAiUpstreamOverride>();
     let static_upstream_base = if let Some(IngressAiUpstreamOverride(u)) = ingress_upstream_override
     {
         u
@@ -6433,10 +6402,7 @@ async fn forward_to_upstream(
             .to_string()
     };
     if let Some(ref rps) = state.rps {
-        if let Err(limit) = rps
-            .check_route(state.config.as_ref(), &ingress_path)
-            .await
-        {
+        if let Err(limit) = rps.check_route(state.config.as_ref(), &ingress_path).await {
             return Err(ProxyError::RpsLimited { rps: limit });
         }
     }
@@ -7734,11 +7700,7 @@ async fn forward_to_upstream(
                             }
                             match mcp_runtime.call_tool(call).await {
                                 Ok(result) => {
-                                    let outcome = if result.is_error {
-                                        "tool_error"
-                                    } else {
-                                        "ok"
-                                    };
+                                    let outcome = if result.is_error { "tool_error" } else { "ok" };
                                     state.ops_metrics.inc_mcp_tool_call(
                                         server_lbl.as_str(),
                                         tool_lbl.as_str(),
@@ -8682,11 +8644,7 @@ pub(crate) fn mcp_ingress_emit_jsonrpc_envelope(
 ) -> Response<BoxBody> {
     let payload = envelope.to_string();
     if !accept_event_stream {
-        return text_with_content_type(
-            status,
-            payload,
-            "application/json; charset=utf-8",
-        );
+        return text_with_content_type(status, payload, "application/json; charset=utf-8");
     }
     let sse = format!("event: message\ndata: {payload}\n\n");
     let body = Full::new(bytes::Bytes::copy_from_slice(sse.as_bytes()))
@@ -8894,6 +8852,8 @@ mod tests {
 
     use panda_wasm::{HookFailure, PolicyCode};
 
+    mod gateway_workflow;
+
     fn mcp_streamable_accept_value() -> &'static str {
         "application/json, text/event-stream"
     }
@@ -8936,7 +8896,9 @@ mod tests {
             ingress_router: None,
             dynamic_ingress: crate::api_gateway::ingress::DynamicIngressRoutes::new_arc(),
             control_plane_api_keys_redis: None,
-            mcp_streamable_sessions: Arc::new(inbound::mcp_streamable_http::McpStreamableSessionStore::new()),
+            mcp_streamable_sessions: Arc::new(
+                inbound::mcp_streamable_http::McpStreamableSessionStore::new(),
+            ),
         }
     }
 
@@ -9001,11 +8963,9 @@ api_gateway:
         });
 
         let mut c = TcpStream::connect(addr).await.unwrap();
-        c.write_all(
-            b"GET /not-in-ingress-table HTTP/1.1\r\nHost: z\r\nConnection: close\r\n\r\n",
-        )
-        .await
-        .unwrap();
+        c.write_all(b"GET /not-in-ingress-table HTTP/1.1\r\nHost: z\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
         let mut buf = vec![];
         c.read_to_end(&mut buf).await.unwrap();
         let s = String::from_utf8_lossy(&buf);
@@ -9124,9 +9084,7 @@ mcp:
             .expect("ingress router");
         let mut state = test_proxy_state(Arc::clone(&cfg)).await;
         state.ingress_router = Some(ingress);
-        state.mcp = mcp::McpRuntime::connect(cfg.as_ref(), None)
-            .await
-            .unwrap();
+        state.mcp = mcp::McpRuntime::connect(cfg.as_ref(), None).await.unwrap();
         let state = Arc::new(state);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -9292,9 +9250,7 @@ mcp:
             .expect("ingress router");
         let mut state = test_proxy_state(Arc::clone(&cfg)).await;
         state.ingress_router = Some(ingress);
-        state.mcp = mcp::McpRuntime::connect(cfg.as_ref(), None)
-            .await
-            .unwrap();
+        state.mcp = mcp::McpRuntime::connect(cfg.as_ref(), None).await.unwrap();
         let state = Arc::new(state);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -9349,7 +9305,10 @@ mcp:
         c2.read_to_end(&mut buf2).await.unwrap();
         let s2 = String::from_utf8_lossy(&buf2);
         assert!(s2.contains("200 OK"), "{s2}");
-        assert!(s2.contains("\"result\":{}") || s2.contains("\"result\": {}"), "{s2}");
+        assert!(
+            s2.contains("\"result\":{}") || s2.contains("\"result\": {}"),
+            "{s2}"
+        );
 
         server.await.unwrap();
     }
@@ -9381,9 +9340,7 @@ mcp:
             .expect("ingress router");
         let mut state = test_proxy_state(Arc::clone(&cfg)).await;
         state.ingress_router = Some(ingress);
-        state.mcp = mcp::McpRuntime::connect(cfg.as_ref(), None)
-            .await
-            .unwrap();
+        state.mcp = mcp::McpRuntime::connect(cfg.as_ref(), None).await.unwrap();
         let state = Arc::new(state);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -9556,9 +9513,8 @@ mcp:
         let egress = EgressClient::try_new(&cfg.api_gateway.egress)
             .expect("egress try_new")
             .expect("egress some");
-        let ingress =
-            crate::api_gateway::ingress::IngressRouter::try_new(&cfg.api_gateway.ingress)
-                .expect("ingress router");
+        let ingress = crate::api_gateway::ingress::IngressRouter::try_new(&cfg.api_gateway.ingress)
+            .expect("ingress router");
         let mut state = test_proxy_state(Arc::clone(&cfg)).await;
         state.ingress_router = Some(ingress);
         state.egress = Some(egress);
@@ -10204,7 +10160,9 @@ agent_sessions:
             ingress_router: None,
             dynamic_ingress: crate::api_gateway::ingress::DynamicIngressRoutes::new_arc(),
             control_plane_api_keys_redis: None,
-            mcp_streamable_sessions: Arc::new(inbound::mcp_streamable_http::McpStreamableSessionStore::new()),
+            mcp_streamable_sessions: Arc::new(
+                inbound::mcp_streamable_http::McpStreamableSessionStore::new(),
+            ),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -10346,7 +10304,9 @@ agent_sessions:
             ingress_router: None,
             dynamic_ingress: crate::api_gateway::ingress::DynamicIngressRoutes::new_arc(),
             control_plane_api_keys_redis: None,
-            mcp_streamable_sessions: Arc::new(inbound::mcp_streamable_http::McpStreamableSessionStore::new()),
+            mcp_streamable_sessions: Arc::new(
+                inbound::mcp_streamable_http::McpStreamableSessionStore::new(),
+            ),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -10417,10 +10377,9 @@ control_plane:
             Some("/v1/api_gateway/ingress/routes")
         );
         assert!(super::control_plane_rest_path("/ops/control/v1/status", &cfg).is_none());
-        let off = PandaConfig::from_yaml_str(
-            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:1'\n",
-        )
-        .unwrap();
+        let off =
+            PandaConfig::from_yaml_str("listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:1'\n")
+                .unwrap();
         assert!(super::control_plane_rest_path("/ops/control/v1/status", &off).is_none());
     }
 
@@ -10489,7 +10448,9 @@ control_plane:
             ingress_router: None,
             dynamic_ingress: crate::api_gateway::ingress::DynamicIngressRoutes::new_arc(),
             control_plane_api_keys_redis: None,
-            mcp_streamable_sessions: Arc::new(inbound::mcp_streamable_http::McpStreamableSessionStore::new()),
+            mcp_streamable_sessions: Arc::new(
+                inbound::mcp_streamable_http::McpStreamableSessionStore::new(),
+            ),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -10606,7 +10567,9 @@ control_plane:
             ingress_router: None,
             dynamic_ingress: crate::api_gateway::ingress::DynamicIngressRoutes::new_arc(),
             control_plane_api_keys_redis: None,
-            mcp_streamable_sessions: Arc::new(inbound::mcp_streamable_http::McpStreamableSessionStore::new()),
+            mcp_streamable_sessions: Arc::new(
+                inbound::mcp_streamable_http::McpStreamableSessionStore::new(),
+            ),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -10647,7 +10610,10 @@ control_plane:
         let mut b2 = Vec::new();
         c2.read_to_end(&mut b2).await.unwrap();
         let r2 = String::from_utf8_lossy(&b2);
-        assert!(r2.contains("200 OK"), "expected 200 with additional secret: {r2}");
+        assert!(
+            r2.contains("200 OK"),
+            "expected 200 with additional secret: {r2}"
+        );
 
         server.await.ok();
         std::env::remove_var(EXTRA);
@@ -10779,7 +10745,9 @@ control_plane:
             ingress_router: None,
             dynamic_ingress: crate::api_gateway::ingress::DynamicIngressRoutes::new_arc(),
             control_plane_api_keys_redis: None,
-            mcp_streamable_sessions: Arc::new(inbound::mcp_streamable_http::McpStreamableSessionStore::new()),
+            mcp_streamable_sessions: Arc::new(
+                inbound::mcp_streamable_http::McpStreamableSessionStore::new(),
+            ),
         };
         let json = tpm_status_json(&state, "/tpm/status", &HeaderMap::new()).await;
         assert_eq!(
@@ -10878,7 +10846,9 @@ control_plane:
             ingress_router: None,
             dynamic_ingress: crate::api_gateway::ingress::DynamicIngressRoutes::new_arc(),
             control_plane_api_keys_redis: None,
-            mcp_streamable_sessions: Arc::new(inbound::mcp_streamable_http::McpStreamableSessionStore::new()),
+            mcp_streamable_sessions: Arc::new(
+                inbound::mcp_streamable_http::McpStreamableSessionStore::new(),
+            ),
         };
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -10953,7 +10923,9 @@ control_plane:
             ingress_router: None,
             dynamic_ingress: crate::api_gateway::ingress::DynamicIngressRoutes::new_arc(),
             control_plane_api_keys_redis: None,
-            mcp_streamable_sessions: Arc::new(inbound::mcp_streamable_http::McpStreamableSessionStore::new()),
+            mcp_streamable_sessions: Arc::new(
+                inbound::mcp_streamable_http::McpStreamableSessionStore::new(),
+            ),
         };
         state
             .ops_metrics
@@ -10965,8 +10937,14 @@ control_plane:
             .and_then(|v| v.as_array())
             .expect("mcp_tool_calls_total array");
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].get("server").and_then(|v| v.as_str()), Some("demo"));
-        assert_eq!(calls[0].get("tool").and_then(|v| v.as_str()), Some("lookup"));
+        assert_eq!(
+            calls[0].get("server").and_then(|v| v.as_str()),
+            Some("demo")
+        );
+        assert_eq!(
+            calls[0].get("tool").and_then(|v| v.as_str()),
+            Some("lookup")
+        );
         assert_eq!(calls[0].get("outcome").and_then(|v| v.as_str()), Some("ok"));
         assert_eq!(calls[0].get("count").and_then(|v| v.as_u64()), Some(1));
         assert_eq!(
@@ -11171,7 +11149,9 @@ control_plane:
             ingress_router: None,
             dynamic_ingress: crate::api_gateway::ingress::DynamicIngressRoutes::new_arc(),
             control_plane_api_keys_redis: None,
-            mcp_streamable_sessions: Arc::new(inbound::mcp_streamable_http::McpStreamableSessionStore::new()),
+            mcp_streamable_sessions: Arc::new(
+                inbound::mcp_streamable_http::McpStreamableSessionStore::new(),
+            ),
         };
         let json = super::fleet_status_json(&state);
         assert_eq!(json.get("version").and_then(|v| v.as_str()), Some("v1"));
@@ -11220,10 +11200,12 @@ control_plane:
                 .and_then(|v| v.as_bool()),
             Some(false)
         );
-        let tls = ag.get("egress").and_then(|e| e.get("tls")).expect("egress.tls");
+        let tls = ag
+            .get("egress")
+            .and_then(|e| e.get("tls"))
+            .expect("egress.tls");
         assert_eq!(
-            tls.get("client_auth_configured")
-                .and_then(|v| v.as_bool()),
+            tls.get("client_auth_configured").and_then(|v| v.as_bool()),
             Some(false)
         );
         assert_eq!(
@@ -11234,10 +11216,7 @@ control_plane:
             .get("egress")
             .and_then(|e| e.get("rate_limit"))
             .expect("egress.rate_limit");
-        assert_eq!(
-            rl.get("max_in_flight").and_then(|v| v.as_u64()),
-            Some(0)
-        );
+        assert_eq!(rl.get("max_in_flight").and_then(|v| v.as_u64()), Some(0));
         assert_eq!(rl.get("max_rps").and_then(|v| v.as_u64()), Some(0));
         let ops = json
             .get("ops_endpoints")
@@ -11315,7 +11294,9 @@ control_plane:
             ingress_router: None,
             dynamic_ingress: crate::api_gateway::ingress::DynamicIngressRoutes::new_arc(),
             control_plane_api_keys_redis: None,
-            mcp_streamable_sessions: Arc::new(inbound::mcp_streamable_http::McpStreamableSessionStore::new()),
+            mcp_streamable_sessions: Arc::new(
+                inbound::mcp_streamable_http::McpStreamableSessionStore::new(),
+            ),
         };
         let json = super::mcp_status_json(&state);
         let sem = json.get("semantic_cache").expect("semantic_cache");
@@ -11427,7 +11408,9 @@ control_plane:
             ingress_router: None,
             dynamic_ingress: crate::api_gateway::ingress::DynamicIngressRoutes::new_arc(),
             control_plane_api_keys_redis: None,
-            mcp_streamable_sessions: Arc::new(inbound::mcp_streamable_http::McpStreamableSessionStore::new()),
+            mcp_streamable_sessions: Arc::new(
+                inbound::mcp_streamable_http::McpStreamableSessionStore::new(),
+            ),
         };
         let json = tpm_status_json(&state, "/tpm/status", &headers).await;
         assert_eq!(
@@ -11498,7 +11481,9 @@ control_plane:
             ingress_router: None,
             dynamic_ingress: crate::api_gateway::ingress::DynamicIngressRoutes::new_arc(),
             control_plane_api_keys_redis: None,
-            mcp_streamable_sessions: Arc::new(inbound::mcp_streamable_http::McpStreamableSessionStore::new()),
+            mcp_streamable_sessions: Arc::new(
+                inbound::mcp_streamable_http::McpStreamableSessionStore::new(),
+            ),
         };
         let (status, body) = readiness_status(&state);
         assert_eq!(status, StatusCode::OK);
@@ -11574,7 +11559,9 @@ control_plane:
             ingress_router: None,
             dynamic_ingress: crate::api_gateway::ingress::DynamicIngressRoutes::new_arc(),
             control_plane_api_keys_redis: None,
-            mcp_streamable_sessions: Arc::new(inbound::mcp_streamable_http::McpStreamableSessionStore::new()),
+            mcp_streamable_sessions: Arc::new(
+                inbound::mcp_streamable_http::McpStreamableSessionStore::new(),
+            ),
         };
         let (status, body) = readiness_status(&state);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -11642,7 +11629,9 @@ control_plane:
             ingress_router: None,
             dynamic_ingress: crate::api_gateway::ingress::DynamicIngressRoutes::new_arc(),
             control_plane_api_keys_redis: None,
-            mcp_streamable_sessions: Arc::new(inbound::mcp_streamable_http::McpStreamableSessionStore::new()),
+            mcp_streamable_sessions: Arc::new(
+                inbound::mcp_streamable_http::McpStreamableSessionStore::new(),
+            ),
         };
         let (status, body) = readiness_status(&state);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -11817,7 +11806,9 @@ control_plane:
             ingress_router: None,
             dynamic_ingress: crate::api_gateway::ingress::DynamicIngressRoutes::new_arc(),
             control_plane_api_keys_redis: None,
-            mcp_streamable_sessions: Arc::new(inbound::mcp_streamable_http::McpStreamableSessionStore::new()),
+            mcp_streamable_sessions: Arc::new(
+                inbound::mcp_streamable_http::McpStreamableSessionStore::new(),
+            ),
         });
         assert!(state.plugins.is_some());
         assert!(state.config.plugins.fail_closed);
@@ -11959,7 +11950,9 @@ mcp:
             ingress_router: None,
             dynamic_ingress: crate::api_gateway::ingress::DynamicIngressRoutes::new_arc(),
             control_plane_api_keys_redis: None,
-            mcp_streamable_sessions: Arc::new(inbound::mcp_streamable_http::McpStreamableSessionStore::new()),
+            mcp_streamable_sessions: Arc::new(
+                inbound::mcp_streamable_http::McpStreamableSessionStore::new(),
+            ),
         });
 
         let panda_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -12120,7 +12113,9 @@ mcp:
             ingress_router: None,
             dynamic_ingress: crate::api_gateway::ingress::DynamicIngressRoutes::new_arc(),
             control_plane_api_keys_redis: None,
-            mcp_streamable_sessions: Arc::new(inbound::mcp_streamable_http::McpStreamableSessionStore::new()),
+            mcp_streamable_sessions: Arc::new(
+                inbound::mcp_streamable_http::McpStreamableSessionStore::new(),
+            ),
         });
 
         let panda_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -12281,7 +12276,9 @@ mcp:
             ingress_router: None,
             dynamic_ingress: crate::api_gateway::ingress::DynamicIngressRoutes::new_arc(),
             control_plane_api_keys_redis: None,
-            mcp_streamable_sessions: Arc::new(inbound::mcp_streamable_http::McpStreamableSessionStore::new()),
+            mcp_streamable_sessions: Arc::new(
+                inbound::mcp_streamable_http::McpStreamableSessionStore::new(),
+            ),
         });
 
         let panda_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

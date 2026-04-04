@@ -22,8 +22,8 @@ use super::mcp_streamable_http::{
 };
 
 use crate::{
-    collect_body_bounded, enforce_jwt_if_required, mcp_ingress_emit_jsonrpc_envelope, json_response,
-    ProxyError, ProxyState,
+    collect_body_bounded, enforce_jwt_if_required, json_response,
+    mcp_ingress_emit_jsonrpc_envelope, ProxyError, ProxyState,
 };
 
 fn empty_accepted_response() -> Response<crate::BoxBody> {
@@ -297,12 +297,7 @@ async fn dispatch_jsonrpc_object(
                         })
                     })
                     .collect();
-                Ok(jsonrpc_result(
-                    sse,
-                    id,
-                    json!({ "tools": mcp_tools }),
-                    None,
-                ))
+                Ok(jsonrpc_result(sse, id, json!({ "tools": mcp_tools }), None))
             }
             Err(e) => Ok(jsonrpc_error_status(
                 sse,
@@ -353,28 +348,21 @@ async fn dispatch_jsonrpc_object(
                 state,
             )
             .await;
-            Ok(
-                crate::mcp_http_ingress_execute_tools_call(
-                    state,
-                    rt,
-                    &ctx,
-                    ingress_path,
-                    server,
-                    tool,
-                    tool_name,
-                    arguments,
-                    id,
-                    sse,
-                )
-                .await,
+            Ok(crate::mcp_http_ingress_execute_tools_call(
+                state,
+                rt,
+                &ctx,
+                ingress_path,
+                server,
+                tool,
+                tool_name,
+                arguments,
+                id,
+                sse,
             )
+            .await)
         }
-        "resources/list" => Ok(jsonrpc_result(
-            sse,
-            id,
-            json!({ "resources": [] }),
-            None,
-        )),
+        "resources/list" => Ok(jsonrpc_result(sse, id, json!({ "resources": [] }), None)),
         "prompts/list" => Ok(jsonrpc_result(sse, id, json!({ "prompts": [] }), None)),
         _ => Ok(jsonrpc_error_status(
             sse,
@@ -493,9 +481,7 @@ async fn handle_post_batch(
             .to_string();
 
         if method != "initialize" {
-            let sid = implicit_sid
-                .as_deref()
-                .or(header_sid.as_deref());
+            let sid = implicit_sid.as_deref().or(header_sid.as_deref());
             let Some(sid) = sid else {
                 return Ok(mcp_session_header_missing_response());
             };

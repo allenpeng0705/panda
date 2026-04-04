@@ -99,8 +99,24 @@ fn backend_from_token(s: &str) -> Result<ApiGatewayIngressBackend, String> {
 #[cfg(feature = "control-plane-sql")]
 fn route_to_row(
     r: &ApiGatewayIngressRoute,
-) -> Result<(String, String, String, String, Option<String>, Option<i64>, i64), String> {
-    let tenant_id = r.tenant_id.as_deref().map(str::trim).unwrap_or("").to_string();
+) -> Result<
+    (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<i64>,
+        i64,
+    ),
+    String,
+> {
+    let tenant_id = r
+        .tenant_id
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
     let path_prefix = r.path_prefix.trim().to_string();
     if path_prefix.is_empty() {
         return Err("path_prefix must not be empty".to_string());
@@ -222,8 +238,8 @@ pub async fn init_dynamic_ingress(
         Vec::new()
     };
 
-    let d = DynamicIngressRoutes::new_arc_with(persist.clone(), initial)
-        .map_err(anyhow::Error::msg)?;
+    let d =
+        DynamicIngressRoutes::new_arc_with(persist.clone(), initial).map_err(anyhow::Error::msg)?;
 
     let note = match cfg.store.kind {
         ControlPlaneStoreKind::Memory => None,
@@ -295,7 +311,12 @@ impl JsonFilePersist {
 impl ControlPlanePersist for JsonFilePersist {
     async fn upsert(&self, r: &ApiGatewayIngressRoute) -> Result<(), String> {
         let mut all = self.read_file().await?;
-        let t = r.tenant_id.as_deref().map(str::trim).unwrap_or("").to_string();
+        let t = r
+            .tenant_id
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
         let p = r.path_prefix.trim().to_string();
         if let Some(i) = all.iter().position(|x| {
             x.path_prefix.trim() == p
@@ -494,8 +515,7 @@ impl ControlPlanePersist for SqlControlPlanePersist {
                     .map_err(|e| e.to_string())?;
                 let mut out = Vec::with_capacity(rows.len());
                 for row in rows {
-                    let tenant_id: String =
-                        row.try_get("tenant_id").map_err(|e| e.to_string())?;
+                    let tenant_id: String = row.try_get("tenant_id").map_err(|e| e.to_string())?;
                     let path_prefix: String =
                         row.try_get("path_prefix").map_err(|e| e.to_string())?;
                     let backend: String = row.try_get("backend").map_err(|e| e.to_string())?;
@@ -523,8 +543,7 @@ impl ControlPlanePersist for SqlControlPlanePersist {
                     .map_err(|e| e.to_string())?;
                 let mut out = Vec::with_capacity(rows.len());
                 for row in rows {
-                    let tenant_id: String =
-                        row.try_get("tenant_id").map_err(|e| e.to_string())?;
+                    let tenant_id: String = row.try_get("tenant_id").map_err(|e| e.to_string())?;
                     let path_prefix: String =
                         row.try_get("path_prefix").map_err(|e| e.to_string())?;
                     let backend: String = row.try_get("backend").map_err(|e| e.to_string())?;
@@ -557,8 +576,15 @@ impl ControlPlanePersist for SqlControlPlanePersist {
                     .await
                     .map_err(|e| e.to_string())?;
                 for r in routes {
-                    let (tenant_id, path_prefix, backend, methods_json, upstream, rate_limit_rps, ts) =
-                        route_to_row(r)?;
+                    let (
+                        tenant_id,
+                        path_prefix,
+                        backend,
+                        methods_json,
+                        upstream,
+                        rate_limit_rps,
+                        ts,
+                    ) = route_to_row(r)?;
                     sqlx::query(
                         r#"INSERT INTO panda_control_plane_ingress_route (tenant_id, path_prefix, backend, methods_json, upstream, rate_limit_rps, updated_at_ms)
                            VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
@@ -583,8 +609,15 @@ impl ControlPlanePersist for SqlControlPlanePersist {
                     .await
                     .map_err(|e| e.to_string())?;
                 for r in routes {
-                    let (tenant_id, path_prefix, backend, methods_json, upstream, rate_limit_rps, ts) =
-                        route_to_row(r)?;
+                    let (
+                        tenant_id,
+                        path_prefix,
+                        backend,
+                        methods_json,
+                        upstream,
+                        rate_limit_rps,
+                        ts,
+                    ) = route_to_row(r)?;
                     sqlx::query(
                         r#"INSERT INTO panda_control_plane_ingress_route (tenant_id, path_prefix, backend, methods_json, upstream, rate_limit_rps, updated_at_ms)
                            VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
@@ -609,7 +642,9 @@ impl ControlPlanePersist for SqlControlPlanePersist {
 }
 
 /// Re-read routes from the backing store and replace the in-memory dynamic table (no store writes).
-pub async fn reload_dynamic_ingress_from_store(dynamic: &DynamicIngressRoutes) -> Result<(), String> {
+pub async fn reload_dynamic_ingress_from_store(
+    dynamic: &DynamicIngressRoutes,
+) -> Result<(), String> {
     let Some(p) = dynamic.persist_handle() else {
         return Ok(());
     };
@@ -828,8 +863,7 @@ mod reload_tests {
         let path = dir.path().join("routes.json");
         let json_a = r#"{"version":1,"routes":[{"path_prefix":"/a","backend":"ai","methods":[],"upstream":null}]}"#;
         tokio::fs::write(&path, json_a).await.unwrap();
-        let persist: Arc<dyn ControlPlanePersist> =
-            Arc::new(JsonFilePersist::new(path.clone()));
+        let persist: Arc<dyn ControlPlanePersist> = Arc::new(JsonFilePersist::new(path.clone()));
         let initial = persist.load_all().await.unwrap();
         let dynamic =
             DynamicIngressRoutes::new_arc_with(Some(Arc::clone(&persist)), initial).unwrap();

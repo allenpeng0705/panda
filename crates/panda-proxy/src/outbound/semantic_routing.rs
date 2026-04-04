@@ -449,8 +449,7 @@ impl EmbedRouting {
         let key = sha256_key_prefix(text);
         {
             let mut guard = self.prompt_cache.lock().await;
-            if let Some(v) = semantic_prompt_cache_touch_or_miss(&mut guard, &key, self.cache_ttl)
-            {
+            if let Some(v) = semantic_prompt_cache_touch_or_miss(&mut guard, &key, self.cache_ttl) {
                 return Ok(v);
             }
         }
@@ -735,8 +734,7 @@ impl RouterRouting {
         let key = sha256_key_prefix(text);
         {
             let mut guard = self.prompt_cache.lock().await;
-            if let Some(v) = semantic_prompt_cache_touch_or_miss(&mut guard, &key, self.cache_ttl)
-            {
+            if let Some(v) = semantic_prompt_cache_touch_or_miss(&mut guard, &key, self.cache_ttl) {
                 return Ok(v);
             }
         }

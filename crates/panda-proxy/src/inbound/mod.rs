@@ -9,8 +9,8 @@
 
 pub mod mcp;
 pub mod mcp_http_ingress;
-pub mod mcp_streamable_http;
 pub mod mcp_http_remote;
 pub mod mcp_http_tool;
 pub mod mcp_openai;
 pub mod mcp_stdio;
+pub mod mcp_streamable_http;

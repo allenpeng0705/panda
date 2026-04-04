@@ -214,7 +214,7 @@ pub fn parse_openai_function_name(
 ) -> Option<(String, String)> {
     let raw = function_name.strip_prefix("mcp_")?;
     for s in servers.iter().filter(|s| s.enabled) {
-            let sn = super::mcp_openai::sanitize_openai_function_name(&s.name);
+        let sn = super::mcp_openai::sanitize_openai_function_name(&s.name);
         let p = format!("{sn}_");
         if raw.starts_with(&p) {
             let tool = raw.trim_start_matches(&p);
@@ -438,7 +438,10 @@ mcp:
     #[tokio::test]
     async fn connect_enabled_builds_runtime() {
         let cfg = sample_config_with_mcp();
-        let rt = McpRuntime::connect(&cfg, None).await.unwrap().expect("some");
+        let rt = McpRuntime::connect(&cfg, None)
+            .await
+            .unwrap()
+            .expect("some");
         assert_eq!(rt.enabled_server_count(), 1);
         assert!(rt.fail_open);
     }
@@ -446,7 +449,10 @@ mcp:
     #[tokio::test]
     async fn list_all_tools_empty_for_stub() {
         let cfg = sample_config_with_mcp();
-        let rt = McpRuntime::connect(&cfg, None).await.unwrap().expect("some");
+        let rt = McpRuntime::connect(&cfg, None)
+            .await
+            .unwrap()
+            .expect("some");
         let tools = rt.list_all_tools().await.unwrap();
         assert!(tools.is_empty());
     }
@@ -454,7 +460,10 @@ mcp:
     #[tokio::test]
     async fn call_tool_rejects_oversized_arguments() {
         let cfg = sample_config_with_mcp();
-        let rt = McpRuntime::connect(&cfg, None).await.unwrap().expect("some");
+        let rt = McpRuntime::connect(&cfg, None)
+            .await
+            .unwrap()
+            .expect("some");
         let big = serde_json::Value::String("x".repeat(2048));
         let err = rt
             .call_tool(McpToolCallRequest {

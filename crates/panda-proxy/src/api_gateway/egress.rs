@@ -6,13 +6,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::{RwLock, Semaphore};
 use http::header::{self, HeaderMap, HeaderValue};
 use http_body_util::{BodyExt, Full};
 use hyper::{Method, Request, Uri};
 use panda_config::{
     ApiGatewayEgressConfig, ApiGatewayEgressDefaultHeader, ApiGatewayEgressProfile,
 };
+use tokio::sync::{RwLock, Semaphore};
 
 use crate::{build_egress_http_client, HttpClient};
 
@@ -110,7 +110,9 @@ impl EgressMetrics {
 
     pub fn prometheus_text(&self) -> String {
         fn esc(s: &str) -> String {
-            s.replace('\\', "\\\\").replace('\n', "\\n").replace('"', "\\\"")
+            s.replace('\\', "\\\\")
+                .replace('\n', "\\n")
+                .replace('"', "\\\"")
         }
         let mut out = String::new();
         out.push_str("# HELP panda_egress_requests_total API gateway egress HTTP requests by result and route label.\n");
@@ -142,7 +144,9 @@ impl EgressMetrics {
                 ));
             }
         }
-        out.push_str("# HELP panda_egress_request_duration_ms_sum Total egress request latency (ms).\n");
+        out.push_str(
+            "# HELP panda_egress_request_duration_ms_sum Total egress request latency (ms).\n",
+        );
         out.push_str("# TYPE panda_egress_request_duration_ms_sum counter\n");
         if let Ok(g) = self.inner.lock() {
             out.push_str(&format!(
@@ -158,7 +162,9 @@ impl EgressMetrics {
                 g.duration_count
             ));
         }
-        out.push_str("# HELP panda_egress_retries_total Egress retry attempts before a final outcome.\n");
+        out.push_str(
+            "# HELP panda_egress_retries_total Egress retry attempts before a final outcome.\n",
+        );
         out.push_str("# TYPE panda_egress_retries_total counter\n");
         if let Ok(g) = self.inner.lock() {
             let mut entries: Vec<(&String, &u64)> = g.retries.iter().collect();
@@ -215,10 +221,7 @@ impl EgressClient {
         } else {
             None
         };
-        let client = Arc::new(RwLock::new(build_egress_http_client(
-            pool_idle,
-            &cfg.tls,
-        )?));
+        let client = Arc::new(RwLock::new(build_egress_http_client(pool_idle, &cfg.tls)?));
         let tls = cfg.tls.clone();
         let timeout_ms = if cfg.timeout_ms > 0 {
             cfg.timeout_ms
@@ -261,15 +264,14 @@ impl EgressClient {
         let retry_initial_backoff = Duration::from_millis(cfg.retry.initial_backoff_ms);
         let retry_max_backoff = Duration::from_millis(cfg.retry.max_backoff_ms);
         let in_flight = if cfg.rate_limit.max_in_flight > 0 {
-            Some(Arc::new(Semaphore::new(cfg.rate_limit.max_in_flight as usize)))
+            Some(Arc::new(Semaphore::new(
+                cfg.rate_limit.max_in_flight as usize,
+            )))
         } else {
             None
         };
         let rps = if cfg.rate_limit.max_rps > 0 {
-            Some((
-                cfg.rate_limit.max_rps,
-                Mutex::new((Instant::now(), 0u32)),
-            ))
+            Some((cfg.rate_limit.max_rps, Mutex::new((Instant::now(), 0u32))))
         } else {
             None
         };
@@ -314,25 +316,20 @@ impl EgressClient {
             return Err(EgressError::Misconfigured("route_label must be non-empty"));
         }
         let t = req.target.trim();
-        let (pool_slot, relative_base): (String, Option<String>) =
-            if t.starts_with("http://") || t.starts_with("https://") {
-                ("-".to_string(), None)
-            } else {
-                let n = self.corporate_bases.len();
-                if n == 0 {
-                    return Err(EgressError::Misconfigured(
+        let (pool_slot, relative_base): (String, Option<String>) = if t.starts_with("http://")
+            || t.starts_with("https://")
+        {
+            ("-".to_string(), None)
+        } else {
+            let n = self.corporate_bases.len();
+            if n == 0 {
+                return Err(EgressError::Misconfigured(
                         "relative egress path requires api_gateway.egress.corporate.default_base or pool_bases",
                     ));
-                }
-                let idx = self
-                    .corporate_rr
-                    .fetch_add(1, Ordering::Relaxed)
-                    % n;
-                (
-                    idx.to_string(),
-                    Some(self.corporate_bases[idx].clone()),
-                )
-            };
+            }
+            let idx = self.corporate_rr.fetch_add(1, Ordering::Relaxed) % n;
+            (idx.to_string(), Some(self.corporate_bases[idx].clone()))
+        };
         let _in_flight_permit = match &self.in_flight {
             None => None,
             Some(sem) => match sem.try_acquire() {
@@ -360,9 +357,7 @@ impl EgressClient {
                 .await;
             match once {
                 Ok(resp) => {
-                    if egress_http_status_retryable(resp.status)
-                        && attempt < self.max_retries
-                    {
+                    if egress_http_status_retryable(resp.status) && attempt < self.max_retries {
                         self.metrics.record_retry(route);
                         tokio::time::sleep(egress_retry_delay(
                             self.retry_initial_backoff,
@@ -467,9 +462,13 @@ impl EgressClient {
             .map(str::trim)
             .filter(|s| !s.is_empty());
         let profile_layer: Option<&HeaderMap> = if let Some(n) = profile_name {
-            Some(self.profile_headers.get(n).ok_or(
-                EgressError::Misconfigured("unknown egress_profile (not in api_gateway.egress.profiles)"),
-            )?)
+            Some(
+                self.profile_headers
+                    .get(n)
+                    .ok_or(EgressError::Misconfigured(
+                        "unknown egress_profile (not in api_gateway.egress.profiles)",
+                    ))?,
+            )
         } else {
             None
         };
@@ -806,7 +805,10 @@ mod tests {
         };
         let client = EgressClient::try_new(&cfg).expect("new").expect("some");
         let mut headers = HeaderMap::new();
-        headers.insert(header::USER_AGENT, HeaderValue::from_static("panda-egress-test"));
+        headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("panda-egress-test"),
+        );
         let res = client
             .request(EgressHttpRequest {
                 method: Method::GET,
@@ -845,9 +847,7 @@ mod tests {
             let mut buf = vec![0u8; 16_384];
             let _ = sock.read(&mut buf).await;
             let _ = sock
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\none",
-                )
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\none")
                 .await;
         });
         tokio::spawn(async move {
@@ -857,9 +857,7 @@ mod tests {
             let mut buf = vec![0u8; 16_384];
             let _ = sock.read(&mut buf).await;
             let _ = sock
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\ntwo",
-                )
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\ntwo")
                 .await;
         });
 
@@ -875,10 +873,7 @@ mod tests {
                 ],
             },
             allowlist: panda_config::ApiGatewayEgressAllowlistConfig {
-                allow_hosts: vec![
-                    format!("127.0.0.1:{p1}"),
-                    format!("127.0.0.1:{p2}"),
-                ],
+                allow_hosts: vec![format!("127.0.0.1:{p1}"), format!("127.0.0.1:{p2}")],
                 allow_path_prefixes: vec!["/allowed".to_string()],
             },
             ..Default::default()
@@ -1256,9 +1251,9 @@ mod tests {
 
         let mut server_params =
             CertificateParams::new(vec!["egress-mtls-test".to_string()]).expect("srv params");
-        server_params.subject_alt_names = vec![SanType::IpAddress(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        )];
+        server_params.subject_alt_names = vec![SanType::IpAddress(std::net::IpAddr::V4(
+            std::net::Ipv4Addr::LOCALHOST,
+        ))];
         let server_key = KeyPair::generate_for(alg).expect("srv key");
         let server_cert = server_params
             .signed_by(&server_key, &ca_cert, &ca_key)
@@ -1281,7 +1276,9 @@ mod tests {
 
         let ca_der = CertificateDer::from(ca_cert.der().to_vec());
         let mut client_auth_roots = RootCertStore::empty();
-        client_auth_roots.add(ca_der).expect("add ca to client-auth roots");
+        client_auth_roots
+            .add(ca_der)
+            .expect("add ca to client-auth roots");
         let verifier = WebPkiClientVerifier::builder(Arc::new(client_auth_roots))
             .build()
             .expect("WebPkiClientVerifier");
@@ -1451,9 +1448,7 @@ mod tests {
             let mut buf = vec![0u8; 16_384];
             let _ = sock.read(&mut buf).await;
             let _ = sock
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
-                )
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
                 .await;
         });
 

@@ -134,10 +134,7 @@ impl McpHttpToolClient {
                 }),
             }
         };
-        Ok(McpToolCallResult {
-            content,
-            is_error,
-        })
+        Ok(McpToolCallResult { content, is_error })
     }
 }
 
@@ -170,7 +167,10 @@ impl McpClient for McpHttpToolClient {
                     "unknown tool {:?} for MCP HTTP server {:?} (available: {:?})",
                     req.tool,
                     self.server_name,
-                    self.tools.iter().map(|t| t.tool_name.as_str()).collect::<Vec<_>>()
+                    self.tools
+                        .iter()
+                        .map(|t| t.tool_name.as_str())
+                        .collect::<Vec<_>>()
                 )
             })?;
         self.execute_one_tool(ht, &req).await
