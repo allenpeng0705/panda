@@ -47,6 +47,8 @@
 
    You should see JSON containing **`mock_corp_api`** in the tool result text.
 
+**Multi-path mock:** [`mock_corp_api.py`](mock_corp_api.py) also serves **`/corp/service-a`**, **`/corp/service-b`**, **`/api/hi`**, **`/v1/status`** (see script output at startup). Use repo-root [`panda.yaml`](../../panda.yaml) for a **multi-server** example (`mcp_corp_from_a`, `mcp_inventory_health`, etc.); the E2E template stays minimal so the smoke script stays stable.
+
 **Requirements:** `curl`, `python3`, Rust toolchain. **`upstream`** in the template points at **`http://127.0.0.1:1`** so the LLM is not contacted for this flow (only `/mcp` is exercised).
 
-See also: [`docs/testing_mcp_api_gateway.md`](../../docs/testing_mcp_api_gateway.md).
+See also: [`docs/testing_mcp_api_gateway.md`](../../docs/testing_mcp_api_gateway.md) (sections 2.6–2.7).

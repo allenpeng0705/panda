@@ -1,6 +1,110 @@
-# Example Panda config (copy to panda.yaml for local runs).
+# panda.yaml — local profile: multiple MCP servers + one mock HTTP API (integration-test shapes).
+#
+# One mock process (`examples/gateway_mcp_e2e/mock_corp_api.py`) serves every path below on port 18081.
+# Egress allowlist must cover each path prefix you use in `http_tool` / `http_tools`.
+#
+# Ingress-visible tool names are `mcp_<server_name>_<tool_name>` (see docs/testing_mcp_api_gateway.md).
+#
+# | Server     | Transport   | Config field   | Example ingress tool name   |
+# |------------|-------------|----------------|-----------------------------|
+# | corpapi    | REST (egress)| http_tool      | mcp_corpapi_fetch           |
+# | corp       | REST (egress)| http_tools[]   | mcp_corp_from_a, mcp_corp_from_b |
+# | inventory  | REST (egress)| http_tool      | mcp_inventory_health        |
+# | edge       | REST (egress)| http_tool      | mcp_edge_hi                   |
+# | mock       | stdio       | command + args | mcp_mock_ping (optional; needs Python) |
+# | remote1    | MCP over HTTP | remote_mcp_url | mcp_remote1_<remote_tool> (optional; separate port) |
+#
+# Quick check:
+#   python3 examples/gateway_mcp_e2e/mock_corp_api.py 18081
+#   cargo run -p panda-server -- --config panda.yaml
+#   ./scripts/gateway_mcp_e2e_smoke.sh
+#
+# Full commented skeleton (control_plane, tls, routes, …): panda.example.yaml
+
 listen: "127.0.0.1:8080"
 upstream: "http://127.0.0.1:5023"
+
+api_gateway:
+  ingress:
+    enabled: true
+  egress:
+    enabled: true
+    timeout_ms: 5000
+    pool_idle_timeout_ms: 0
+    corporate:
+      # Single base URL: all relative paths in http_tool(s) join to this host.
+      default_base: "http://127.0.0.1:18081"
+    allowlist:
+      allow_hosts: ["127.0.0.1:18081"]
+      # Every path prefix used by MCP REST tools must be allowed (longest-prefix match on requests).
+      allow_path_prefixes: ["/allowed", "/corp", "/api", "/v1"]
+
+mcp:
+  enabled: true
+  advertise_tools: true
+  fail_open: true
+  tool_timeout_ms: 30000
+  # Optional: cache selected tool results (allowlist per server.tool — matches YAML tool_name, not ingress prefix).
+  tool_cache:
+    enabled: true
+    backend: memory
+    default_ttl_seconds: 300
+    max_value_bytes: 65536
+    allow:
+      - server: corpapi
+        tool: fetch
+        ttl_seconds: 60
+      - server: corp
+        tool: from_a
+        ttl_seconds: 30
+  servers:
+    # Server A: single REST tool (same pattern as E2E template + tool-cache integration test).
+    - name: corpapi
+      enabled: true
+      http_tool:
+        path: /allowed/toolpath
+        method: GET
+        tool_name: fetch
+
+    # Server B: two tools on one logical MCP server (`http_tools` — mutually exclusive with `http_tool` on same server).
+    - name: corp
+      enabled: true
+      http_tools:
+        - path: /corp/service-a
+          method: GET
+          tool_name: from_a
+        - path: /corp/service-b
+          method: GET
+          tool_name: from_b
+
+    # Server C: another single-tool server (different paths / ownership in real deployments).
+    - name: inventory
+      enabled: true
+      http_tool:
+        path: /v1/status
+        method: GET
+        tool_name: health
+
+    # Server D: same mock host, different API surface (typical multi-team backends).
+    - name: edge
+      enabled: true
+      http_tool:
+        path: /api/hi
+        method: GET
+        tool_name: hi
+
+    # Optional: stdio MCP (uncomment if `python3` and crates/panda-proxy/tests/mcp_mock_stdio.py exist).
+    # Mutually exclusive per server: use `command` OR `http_tool` OR `http_tools` OR `remote_mcp_url`.
+    # - name: mock
+    #   enabled: true
+    #   command: "python3"
+    #   args: ["crates/panda-proxy/tests/mcp_mock_stdio.py"]
+
+    # Optional: remote MCP server over HTTP via egress (run a separate listener; see testing doc section 2.3).
+    # - name: remote1
+    #   enabled: true
+    #   remote_mcp_url: "http://127.0.0.1:18082/mcp"
+    # Add 127.0.0.1:18082 to allow_hosts and "/" to allow_path_prefixes when enabled.
 
 # Alternative to top-level `listen` / `tls`: nested `server` (merged at load time).
 # server:
@@ -9,62 +113,6 @@ upstream: "http://127.0.0.1:5023"
 #   tls:
 #     cert_pem: "/path/to/fullchain.pem"
 #     key_pem: "/path/to/privkey.pem"
-
-# API gateway (ingress / egress). Full commented skeleton + control_plane: see panda.example.yaml (top).
-# Phases: docs/implementation_plan_mcp_api_gateway.md — G2: ingress + top-level routes RPS, optional Redis;
-# G4: egress tls min_protocol_version, reload_on_sighup (Unix), watch_reload_ms.
-#
-# control_plane:   # dynamic ingress; pair with observability.admin_secret_env in prod
-#   enabled: false
-#   path_prefix: /ops/control
-#   store:
-#     kind: memory   # memory | json_file | sqlite | postgres
-#     # json_file: /var/lib/panda/dynamic_ingress.json
-#     # database_url: 'sqlite://./panda_control.db'
-#
-# api_gateway:
-#   ingress:
-#     enabled: false
-#     # When enabled and routes is empty, built-in prefixes cover /v1, /mcp, /console, /health, /metrics, …
-#     # routes:
-#     #   - path_prefix: /v1
-#     #     backend: ai
-#     #   - path_prefix: /hooks
-#     #     backend: ai
-#     #     methods: [POST]
-#     #   - path_prefix: /legacy
-#     #     backend: gone
-#     #   - path_prefix: /internal
-#     #     backend: deny
-#     #   - path_prefix: /mcp
-#     #     backend: mcp
-#     #     rate_limit:
-#     #       rps: 80
-#     # Shared RPS counters across replicas (also applies to top-level routes[].rate_limit when set).
-#     # Process-local 1s windows if url_env unset or Redis errors (warn + local fallback).
-#     # rate_limit_redis:
-#     #   url_env: PANDA_GW_RPS_REDIS_URL
-#     #   key_prefix: panda:gw:ingress_rps
-#   egress:
-#     enabled: false
-#     timeout_ms: 30000
-#     pool_idle_timeout_ms: 90000
-#     corporate:
-#       default_base: "https://api.internal.example.com"
-#       # pool_bases: ["https://gw-a.internal.example.com", "https://gw-b.internal.example.com"]
-#     allowlist:
-#       allow_hosts: ["api.internal.example.com"]
-#       allow_path_prefixes: ["/v1/"]
-#     # rate_limit:
-#     #   max_in_flight: 32
-#     #   max_rps: 200
-#     # tls:
-#     #   client_cert_pem: "/path/to/client-fullchain.pem"
-#     #   client_key_pem: "/path/to/client-key.pem"
-#     #   extra_ca_pem: "/path/to/corporate-root-or-intermediate.pem"
-#     #   min_protocol_version: tls12   # or tls13 (TLS 1.3 only)
-#     #   reload_on_sighup: true        # Unix: re-read PEMs and rebuild egress client
-#     #   watch_reload_ms: 60000        # poll PEM mtimes; rebuild when any changes (>0)
 
 # Optional: path-based routing (longest path_prefix wins; otherwise `upstream` above).
 # Per-route: rate_limit (HTTP RPS; use api_gateway.ingress.rate_limit_redis for shared counters when ingress is enabled),
@@ -385,6 +433,7 @@ upstream: "http://127.0.0.1:5023"
 #   translates Anthropic SSE to OpenAI chat.completion.chunk SSE (including data: [DONE]).
 
 # Phase 4: MCP tool servers (stub transports; wire stdio/SSE clients incrementally).
+# Active `mcp:` for local/API-gateway tests lives at the top of this file (not below).
 # When enabled, at least one server entry with enabled=true is required.
 # Optional context enrichment (Phase 4 MVP): set env PANDA_CONTEXT_ENRICHMENT_FILE to a text file
 # with lines like `keyword => snippet` to inject top-matching snippets as a system message.

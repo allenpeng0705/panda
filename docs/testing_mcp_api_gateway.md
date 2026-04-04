@@ -95,14 +95,33 @@ Same protocol style; tools **`ping`** and **`echo_message`** (not used by the de
 
 ### 2.6 Live E2E mock HTTP API
 
-**[`examples/gateway_mcp_e2e/mock_corp_api.py`](../examples/gateway_mcp_e2e/mock_corp_api.py)** — `HTTPServer` on **`127.0.0.1:<port>`** (port from argv, default **18081**).
+**[`examples/gateway_mcp_e2e/mock_corp_api.py`](../examples/gateway_mcp_e2e/mock_corp_api.py)** — `HTTPServer` on **`127.0.0.1:<port>`** (port from argv, default **18081**). Prints the list of paths at startup.
 
-| Method + path | Response |
-|---------------|----------|
-| **`GET /allowed/toolpath`** | `200`, JSON **`{"ok": true, "via": "mock_corp_api"}`** |
+| Method + path | Response (JSON) |
+|---------------|-----------------|
+| **`GET /allowed/toolpath`** | `{"ok": true, "via": "mock_corp_api"}` |
+| **`GET /corp/service-a`** | `{"service": "A"}` |
+| **`GET /corp/service-b`** | `{"service": "B"}` |
+| **`GET /api/hi`** | `{"via": "rest", "message": "hello"}` |
+| **`GET /v1/status`** | `{"status": "ok", "component": "inventory"}` |
 | Other paths | **404** |
 
-Aligns with [`examples/gateway_mcp_e2e/panda.e2e.yaml.template`](../examples/gateway_mcp_e2e/panda.e2e.yaml.template): **`http_tool`** **`tool_name: fetch`** on server **`corpapi`** → call **`mcp_corpapi_fetch`** from **`curl`** after **`initialize`**, same idea as **`ingress_mcp_http_tools_call_uses_tool_cache_second_hit`** but against a real **`panda-server`** process.
+The minimal E2E template ([`panda.e2e.yaml.template`](../examples/gateway_mcp_e2e/panda.e2e.yaml.template)) only wires **`corpapi`** + **`/allowed/toolpath`**. The repo-root **[`panda.yaml`](../panda.yaml)** profile uses **several** `mcp.servers` entries against the **same** `default_base` (see section 2.7).
+
+### 2.7 Multi-server, multi-tool local profile (`panda.yaml`)
+
+Typical production setups have **multiple MCP server blocks** (different owners, transports, or rate limits). For local learning, **`panda.yaml`** enables four REST-backed servers at once (all paths hit **`mock_corp_api.py`** on port **18081**):
+
+| `mcp.servers[].name` | Config | Ingress `tools/call` `params.name` |
+|----------------------|--------|-------------------------------------|
+| **`corpapi`** | `http_tool` → `/allowed/toolpath` | **`mcp_corpapi_fetch`** |
+| **`corp`** | `http_tools` → `/corp/service-a`, `/corp/service-b` | **`mcp_corp_from_a`**, **`mcp_corp_from_b`** |
+| **`inventory`** | `http_tool` → `/v1/status` | **`mcp_inventory_health`** |
+| **`edge`** | `http_tool` → `/api/hi` | **`mcp_edge_hi`** |
+
+**Egress:** one **`corporate.default_base`**; **`allow_path_prefixes`** must list every path prefix used above (`/allowed`, `/corp`, `/api`, `/v1`). Add **`pool_bases`** or extra hosts when backends differ (see **`panda.example.yaml`**).
+
+**Other transports (commented in `panda.yaml`):** **`command`/`args`** (stdio MCP), **`remote_mcp_url`** (MCP over HTTP via egress). Each server uses **at most one** of: `command`, `http_tool`, `http_tools`, or `remote_mcp_url`.
 
 ---
 

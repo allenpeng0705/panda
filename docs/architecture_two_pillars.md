@@ -7,7 +7,7 @@ Panda is organized around **two product targets**:
 
 Everything else is **cross-cutting** (identity, ops, policy) or **enterprise** (budget hierarchy, console SSO, model failover chains).
 
-**Data flow (canonical):** **Panda API gateway** (ingress and/or egress) + **Panda MCP** + optional **corporate** API gateway — see **[`panda_data_flow.md`](./panda_data_flow.md)**.
+**Data flow (canonical):** **Panda API gateway** (ingress and/or egress) + **Panda MCP** + optional **corporate** API gateway — see **[`panda_data_flow.md`](./panda_data_flow.md)**. **Scenarios (AI + MCP + ingress/egress):** **[`panda_scenarios_summary.md`](./panda_scenarios_summary.md)**.
 
 **New protocols (e.g. A2A alongside MCP):** Panda is a **gateway and governor**, not a single wire format. MCP is the **current** primary tool-facing protocol in `inbound/`; additional protocols should land as **pluggable modules** reusing shared identity, budgets, and policy—see [`protocol_evolution.md`](./protocol_evolution.md).
 
