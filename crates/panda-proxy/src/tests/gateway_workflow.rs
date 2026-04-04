@@ -160,7 +160,7 @@ async fn raw_mcp_post(
 #[tokio::test]
 async fn workflow_init_only_http_tools_config_reaches_200() {
     let yaml = r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   ingress:
     enabled: true
@@ -242,7 +242,7 @@ async fn workflow_full_stack_two_http_tools_two_mock_paths() {
 
     let yaml = format!(
         r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   ingress:
     enabled: true
@@ -369,7 +369,7 @@ async fn workflow_ingress_remote_mcp_tools_call_via_egress() {
 
     let yaml = format!(
         r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   ingress:
     enabled: true
@@ -503,7 +503,7 @@ async fn workflow_stdio_python_and_http_tool_ingress() {
 
     let yaml = format!(
         r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   ingress:
     enabled: true
@@ -630,7 +630,7 @@ mcp:
 #[tokio::test]
 async fn workflow_ingress_off_post_mcp_not_handled_by_mcp_ingress() {
     let yaml = r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   ingress:
     enabled: false
@@ -658,7 +658,7 @@ mcp:
 #[tokio::test]
 async fn workflow_mcp_runtime_off_ingress_mcp_returns_unavailable() {
     let yaml = r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   ingress:
     enabled: true
@@ -693,7 +693,7 @@ mcp:
 #[test]
 fn workflow_http_tool_requires_egress_enabled() {
     let yaml = r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   ingress:
     enabled: true

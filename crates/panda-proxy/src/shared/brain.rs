@@ -145,7 +145,7 @@ pub async fn maybe_summarize_openai_chat_body(
     });
     let summarize_bytes =
         serde_json::to_vec(&summarize_req).map_err(|e| ProxyError::Upstream(e.into()))?;
-    let base = cfg.summarizer_upstream.trim_end_matches('/');
+    let base = cfg.summarizer_backend_base.trim_end_matches('/');
     let uri: hyper::Uri = format!("{base}/v1/chat/completions")
         .parse()
         .map_err(|e| ProxyError::Upstream(anyhow::anyhow!("summarizer URI: {e}")))?;
@@ -250,10 +250,10 @@ async fn anthropic_fallback_request(
     let cfg = &state.config.rate_limit_fallback;
     let (body_bytes, _) =
         adapter::openai_chat_to_anthropic(openai_body).map_err(ProxyError::Upstream)?;
-    let base = cfg.upstream.trim_end_matches('/');
+    let base = cfg.backend_base.trim_end_matches('/');
     let uri: hyper::Uri = format!("{base}/v1/messages")
         .parse()
-        .map_err(|e| ProxyError::Upstream(anyhow::anyhow!("rate_limit_fallback.upstream: {e}")))?;
+        .map_err(|e| ProxyError::Upstream(anyhow::anyhow!("rate_limit_fallback.backend_base: {e}")))?;
     let version = state.config.adapter.anthropic_version.trim();
     let key_h = HeaderValue::try_from(api_key)
         .map_err(|_| ProxyError::Upstream(anyhow::anyhow!("rate_limit_fallback api key header")))?;
@@ -285,8 +285,8 @@ async fn openai_compatible_fallback_request(
     client: &HttpClient,
 ) -> Result<Option<Response<Incoming>>, ProxyError> {
     let uri: hyper::Uri =
-        cfg.upstream.trim().parse().map_err(|e| {
-            ProxyError::Upstream(anyhow::anyhow!("rate_limit_fallback.upstream: {e}"))
+        cfg.backend_base.trim().parse().map_err(|e| {
+            ProxyError::Upstream(anyhow::anyhow!("rate_limit_fallback.backend_base: {e}"))
         })?;
     let mut req_builder = Request::builder()
         .method(hyper::Method::POST)

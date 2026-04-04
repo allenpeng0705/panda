@@ -126,8 +126,8 @@ fn route_to_row(
     }
     let backend = backend_to_token(r.backend).to_string();
     let methods_json = serde_json::to_string(&r.methods).map_err(|e| e.to_string())?;
-    let upstream = r
-        .upstream
+    let backend_base = r
+        .backend_base
         .as_ref()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
@@ -141,7 +141,7 @@ fn route_to_row(
         path_prefix,
         backend,
         methods_json,
-        upstream,
+        backend_base,
         rate_limit_rps,
         now_ms(),
     ))
@@ -153,7 +153,7 @@ fn row_to_route(
     path_prefix: String,
     backend: String,
     methods_json: String,
-    upstream: Option<String>,
+    backend_base: Option<String>,
     rate_limit_rps: Option<i64>,
 ) -> Result<ApiGatewayIngressRoute, String> {
     let backend = backend_from_token(&backend)?;
@@ -176,7 +176,7 @@ fn row_to_route(
         path_prefix,
         backend,
         methods,
-        upstream,
+        backend_base,
         rate_limit,
     })
 }
@@ -368,12 +368,12 @@ struct SqlControlPlanePersist {
 
 #[cfg(feature = "control-plane-sql")]
 const UPSERT_SQL: &str = r#"
-INSERT INTO panda_control_plane_ingress_route (tenant_id, path_prefix, backend, methods_json, upstream, rate_limit_rps, updated_at_ms)
+INSERT INTO panda_control_plane_ingress_route (tenant_id, path_prefix, backend, methods_json, backend_base, rate_limit_rps, updated_at_ms)
 VALUES ($1, $2, $3, $4, $5, $6, $7)
 ON CONFLICT(tenant_id, path_prefix) DO UPDATE SET
   backend = excluded.backend,
   methods_json = excluded.methods_json,
-  upstream = excluded.upstream,
+  backend_base = excluded.backend_base,
   rate_limit_rps = excluded.rate_limit_rps,
   updated_at_ms = excluded.updated_at_ms
 "#;
@@ -429,7 +429,7 @@ impl SqlControlPlanePersist {
     }
 
     async fn insert_or_update(&self, r: &ApiGatewayIngressRoute) -> Result<(), String> {
-        let (tenant_id, path_prefix, backend, methods_json, upstream, rate_limit_rps, ts) =
+        let (tenant_id, path_prefix, backend, methods_json, backend_base, rate_limit_rps, ts) =
             route_to_row(r)?;
         match &self.db {
             SqlDb::Sqlite(p) => {
@@ -438,7 +438,7 @@ impl SqlControlPlanePersist {
                     .bind(&path_prefix)
                     .bind(&backend)
                     .bind(&methods_json)
-                    .bind(&upstream)
+                    .bind(&backend_base)
                     .bind(rate_limit_rps)
                     .bind(ts)
                     .execute(p)
@@ -451,7 +451,7 @@ impl SqlControlPlanePersist {
                     .bind(&path_prefix)
                     .bind(&backend)
                     .bind(&methods_json)
-                    .bind(&upstream)
+                    .bind(&backend_base)
                     .bind(rate_limit_rps)
                     .bind(ts)
                     .execute(p)
@@ -506,7 +506,7 @@ impl ControlPlanePersist for SqlControlPlanePersist {
 
     async fn load_all(&self) -> Result<Vec<ApiGatewayIngressRoute>, String> {
         use sqlx::Row;
-        const Q: &str = "SELECT tenant_id, path_prefix, backend, methods_json, upstream, rate_limit_rps FROM panda_control_plane_ingress_route ORDER BY tenant_id, path_prefix";
+        const Q: &str = "SELECT tenant_id, path_prefix, backend, methods_json, backend_base, rate_limit_rps FROM panda_control_plane_ingress_route ORDER BY tenant_id, path_prefix";
         match &self.db {
             SqlDb::Sqlite(pool) => {
                 let rows = sqlx::query(Q)
@@ -521,8 +521,8 @@ impl ControlPlanePersist for SqlControlPlanePersist {
                     let backend: String = row.try_get("backend").map_err(|e| e.to_string())?;
                     let methods_json: String =
                         row.try_get("methods_json").map_err(|e| e.to_string())?;
-                    let upstream: Option<String> =
-                        row.try_get("upstream").map_err(|e| e.to_string())?;
+                    let backend_base: Option<String> =
+                        row.try_get("backend_base").map_err(|e| e.to_string())?;
                     let rate_limit_rps: Option<i64> =
                         row.try_get("rate_limit_rps").map_err(|e| e.to_string())?;
                     out.push(row_to_route(
@@ -530,7 +530,7 @@ impl ControlPlanePersist for SqlControlPlanePersist {
                         path_prefix,
                         backend,
                         methods_json,
-                        upstream,
+                        backend_base,
                         rate_limit_rps,
                     )?);
                 }
@@ -549,8 +549,8 @@ impl ControlPlanePersist for SqlControlPlanePersist {
                     let backend: String = row.try_get("backend").map_err(|e| e.to_string())?;
                     let methods_json: String =
                         row.try_get("methods_json").map_err(|e| e.to_string())?;
-                    let upstream: Option<String> =
-                        row.try_get("upstream").map_err(|e| e.to_string())?;
+                    let backend_base: Option<String> =
+                        row.try_get("backend_base").map_err(|e| e.to_string())?;
                     let rate_limit_rps: Option<i64> =
                         row.try_get("rate_limit_rps").map_err(|e| e.to_string())?;
                     out.push(row_to_route(
@@ -558,7 +558,7 @@ impl ControlPlanePersist for SqlControlPlanePersist {
                         path_prefix,
                         backend,
                         methods_json,
-                        upstream,
+                        backend_base,
                         rate_limit_rps,
                     )?);
                 }
@@ -581,19 +581,19 @@ impl ControlPlanePersist for SqlControlPlanePersist {
                         path_prefix,
                         backend,
                         methods_json,
-                        upstream,
+                        backend_base,
                         rate_limit_rps,
                         ts,
                     ) = route_to_row(r)?;
                     sqlx::query(
-                        r#"INSERT INTO panda_control_plane_ingress_route (tenant_id, path_prefix, backend, methods_json, upstream, rate_limit_rps, updated_at_ms)
+                        r#"INSERT INTO panda_control_plane_ingress_route (tenant_id, path_prefix, backend, methods_json, backend_base, rate_limit_rps, updated_at_ms)
                            VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
                     )
                     .bind(&tenant_id)
                     .bind(&path_prefix)
                     .bind(&backend)
                     .bind(&methods_json)
-                    .bind(&upstream)
+                    .bind(&backend_base)
                     .bind(rate_limit_rps)
                     .bind(ts)
                     .execute(&mut *tx)
@@ -614,19 +614,19 @@ impl ControlPlanePersist for SqlControlPlanePersist {
                         path_prefix,
                         backend,
                         methods_json,
-                        upstream,
+                        backend_base,
                         rate_limit_rps,
                         ts,
                     ) = route_to_row(r)?;
                     sqlx::query(
-                        r#"INSERT INTO panda_control_plane_ingress_route (tenant_id, path_prefix, backend, methods_json, upstream, rate_limit_rps, updated_at_ms)
+                        r#"INSERT INTO panda_control_plane_ingress_route (tenant_id, path_prefix, backend, methods_json, backend_base, rate_limit_rps, updated_at_ms)
                            VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
                     )
                     .bind(&tenant_id)
                     .bind(&path_prefix)
                     .bind(&backend)
                     .bind(&methods_json)
-                    .bind(&upstream)
+                    .bind(&backend_base)
                     .bind(rate_limit_rps)
                     .bind(ts)
                     .execute(&mut *tx)
@@ -861,14 +861,14 @@ mod reload_tests {
     async fn reload_dynamic_ingress_from_json_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("routes.json");
-        let json_a = r#"{"version":1,"routes":[{"path_prefix":"/a","backend":"ai","methods":[],"upstream":null}]}"#;
+        let json_a = r#"{"version":1,"routes":[{"path_prefix":"/a","backend":"ai","methods":[],"backend_base":null}]}"#;
         tokio::fs::write(&path, json_a).await.unwrap();
         let persist: Arc<dyn ControlPlanePersist> = Arc::new(JsonFilePersist::new(path.clone()));
         let initial = persist.load_all().await.unwrap();
         let dynamic =
             DynamicIngressRoutes::new_arc_with(Some(Arc::clone(&persist)), initial).unwrap();
         assert_eq!(dynamic.route_count(), 1);
-        let json_b = r#"{"version":1,"routes":[{"path_prefix":"/bee","backend":"mcp","methods":[],"upstream":null}]}"#;
+        let json_b = r#"{"version":1,"routes":[{"path_prefix":"/bee","backend":"mcp","methods":[],"backend_base":null}]}"#;
         tokio::fs::write(&path, json_b).await.unwrap();
         reload_dynamic_ingress_from_store(&dynamic).await.unwrap();
         assert_eq!(dynamic.route_count(), 1);

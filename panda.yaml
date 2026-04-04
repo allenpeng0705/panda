@@ -1,30 +1,178 @@
-# panda.yaml — local profile: multiple MCP servers + one mock HTTP API (integration-test shapes).
+# =============================================================================
+# panda.yaml — repo-root example: MCP gateway + API gateway + AI gateway together
+# =============================================================================
 #
-# One mock process (`examples/gateway_mcp_e2e/mock_corp_api.py`) serves every path below on port 18081.
-# Egress allowlist must cover each path prefix you use in `http_tool` / `http_tools`.
+# Read first: docs/panda_scenarios_summary.md (diagrams, FAQ, ingress vs egress).
 #
-# Ingress-visible tool names are `mcp_<server_name>_<tool_name>` (see docs/testing_mcp_api_gateway.md).
+# HOW TO USE THIS FILE
+# --------------------
+# 1. listen                — Host:port where Panda accepts client connections.
+# 2. default_backend       — Default backend base URL when no `routes` row matches the path.
+# 3. routes                — Optional path-prefix table (longest prefix wins). Each matching row
+#                            sets `backend_base` for that hop — think “virtual hosts by path”.
+#                            If you only have one backend URL, repeat the same URL on every row or
+#                            rely on top-level `default_backend` for paths with no matching prefix.
+# 4. api_gateway.ingress   — true = path table for /mcp, /v1, … (unmatched paths → 404).
+# 5. api_gateway.egress    — MCP http_tool / remote_mcp_url → corporate HTTP (allowlists).
+# 6. mcp                   — Tool servers. Same process also serves POST /mcp JSON-RPC.
+# 7. control_plane         — Optional admin JSON API (before ingress): dynamic ingress routes, status.
+#                            Default path prefix /ops/control — e.g. GET /ops/control/v1/status
 #
-# | Server     | Transport   | Config field   | Example ingress tool name   |
-# |------------|-------------|----------------|-----------------------------|
-# | corpapi    | REST (egress)| http_tool      | mcp_corpapi_fetch           |
-# | corp       | REST (egress)| http_tools[]   | mcp_corp_from_a, mcp_corp_from_b |
-# | inventory  | REST (egress)| http_tool      | mcp_inventory_health        |
-# | edge       | REST (egress)| http_tool      | mcp_edge_hi                   |
-# | mock       | stdio       | command + args | mcp_mock_ping (optional; needs Python) |
-# | remote1    | MCP over HTTP | remote_mcp_url | mcp_remote1_<remote_tool> (optional; separate port) |
+# DEFAULT_BACKEND vs ROUTES (mental model)
+# ----------------------------------------
+#   Client request  →  Panda  →  one backend URL chosen as:
+#       effective_backend_base(path) = longest matching routes[].backend_base  OR  top-level default_backend
 #
-# Quick check:
-#   python3 examples/gateway_mcp_e2e/mock_corp_api.py 18081
-#   cargo run -p panda-server -- --config panda.yaml
-#   ./scripts/gateway_mcp_e2e_smoke.sh
+#   Example: default_backend = http://llm:5023/v1
+#            routes: /v1/chat → https://api.openai.com/v1
+#            POST /v1/chat/completions  →  OpenAI (longest match /v1/chat)
+#            POST /v1/embeddings        →  http://llm:5023/v1  (no /v1/embeddings row → default_backend)
 #
-# Full commented skeleton (control_plane, tls, routes, …): panda.example.yaml
+#   This file repeats the same dev URL on several rows to show per-path limits (RPS, TPM, MCP)
+#   without needing multiple backends.
+#
+# Scenarios covered by this active config (see docs/panda_scenarios_summary.md):
+#   • B — Direct MCP: POST /mcp → tools (stdio / REST / remote).
+#   • C — Chat + tools: POST /v1/chat/completions with merged tools when route matches /v1/chat.
+#   • D — Full stack: ingress + MCP + egress + AI route to placeholder LLM default_backend.
+#   • Internal LLM without tool merge: send X-Panda-MCP-Advertise: false on chat/completions
+#     (same URL path for all clients; per-route cannot split two behaviors on identical path).
+#
+# Mock REST for http_tool(s):  python3 examples/gateway_mcp_e2e/mock_corp_api.py 18081
+# Smoke:                        ./scripts/gateway_mcp_e2e_smoke.sh
+# Tool naming:                  docs/testing_mcp_api_gateway.md
+# Full YAML encyclopedia:       panda.example.yaml
+#
+# | MCP server | Transport      | Example ingress tool name        |
+# |------------|----------------|----------------------------------|
+# | corpapi    | REST (egress)  | mcp_corpapi_fetch                |
+# | corp       | REST (egress)  | mcp_corp_from_a, mcp_corp_from_b |
+# | inventory  | REST (egress)  | mcp_inventory_health             |
+# | edge       | REST (egress)  | mcp_edge_hi                      |
+# | mock       | stdio (opt.)   | mcp_mock_ping                    |
+# | remote1    | remote MCP URL | mcp_remote1_<tool> (opt.)        |
 
 listen: "127.0.0.1:8080"
-upstream: "http://127.0.0.1:5023"
+# Default backend when no `routes` prefix matches (e.g. custom paths or future routes).
+default_backend: "http://127.0.0.1:5023"
+
+# Per-path backend_base and limits (longest path_prefix wins; list order does not matter).
+# Fields: backend_base, type (openai|anthropic), methods, rate_limit, tpm_limit, semantic_cache,
+# mcp_servers, mcp_advertise_tools, routing (overrides when global `routing` is enabled — see commented block below).
+routes:
+  # Chat completions: merge MCP tools here only (global mcp.advertise_tools is false).
+  - path_prefix: /v1/chat
+    backend_base: "http://127.0.0.1:5023"
+    type: openai
+    methods: [POST]
+    mcp_advertise_tools: true
+    mcp_servers: ["corpapi", "corp", "inventory", "edge"]
+    rate_limit:
+      rps: 120
+    tpm_limit: 120000
+    # semantic_cache: true   # only valid when top-level `semantic_cache.enabled` is true (see commented block below)
+    routing:
+      enabled: false
+      semantic_enabled: false
+
+  # Embeddings: no MCP injection; optional tighter RPS / TPM for batch workloads.
+  - path_prefix: /v1/embeddings
+    backend_base: "http://127.0.0.1:5023"
+    type: openai
+    methods: [POST]
+    mcp_advertise_tools: false
+    rate_limit:
+      rps: 300
+    tpm_limit: 800000
+    semantic_cache: false
+
+  # Other OpenAI-shaped /v1/* (models, images, …): inherit global MCP default; cap RPS for catch-all.
+  - path_prefix: /v1
+    backend_base: "http://127.0.0.1:5023"
+    type: openai
+    mcp_advertise_tools: false
+    rate_limit:
+      rps: 200
+
+# -----------------------------------------------------------------------------
+# Control plane (optional admin API — runs first in dispatch; see docs/panda_data_flow.md)
+# -----------------------------------------------------------------------------
+# HTTP surface (replace {path_prefix} with path_prefix below, default /ops/control):
+#   GET  {path_prefix}/v1/status
+#   GET  {path_prefix}/v1/api_gateway/ingress/routes
+#   POST {path_prefix}/v1/api_gateway/ingress/routes
+#   GET  {path_prefix}/v1/api_gateway/ingress/routes/export
+#   POST {path_prefix}/v1/api_gateway/ingress/routes/import?mode=merge|replace
+#   DELETE {path_prefix}/v1/api_gateway/ingress/routes?path_prefix=…&tenant_id=…
+#   POST/DELETE {path_prefix}/v1/api_keys — when auth.api_keys_redis_url_env is set
+# Auth: set observability.admin_secret_env (and/or control_plane.auth + Redis) before enabled: true in prod.
+# Store: memory = dev only; json_file / sqlite / postgres for durable dynamic routes (not for kind: memory: do not set reload_from_store_ms).
+# Postgres URLs: any wire-compatible server (RDS, Aurora, Azure Postgres, Cloud SQL) — use sslmode as your provider requires.
+control_plane:
+  enabled: false
+  path_prefix: /ops/control
+  # Poll backing store so replicas pick up another instance’s writes or GitOps edits to json_file.
+  # reload_from_store_ms: 10000
+  # Extra env vars whose values are accepted as admin auth (union with observability.admin_secret_env):
+  # additional_admin_secret_envs: [PANDA_CP_AUTOMATION_SECRET]
+  # Header for tenant-scoped dynamic ingress rows (must match ApiGatewayIngressRoute.tenant_id):
+  # tenant_resolution_header: X-Panda-Tenant
+  store:
+    kind: memory
+    # --- When enabled: true, pick one kind (comment out memory and uncomment one block) ---
+    # kind: json_file
+    # json_file: ./var/panda_dynamic_ingress.json
+    # json_file: /var/lib/panda/dynamic_ingress.json
+    # kind: sqlite
+    # database_url: sqlite://./panda_control.db
+    # kind: postgres
+    # database_url: postgresql://user:pass@db.example.com:5432/panda?sslmode=require
+    # database_url: postgresql://user:pass@host:5432/db?sslmode=require
+    # postgres_listen: true
+  auth:
+    # If true, accepts a valid developer-console OIDC session cookie (requires console_oidc.enabled).
+    allow_console_oidc_session: false
+    required_console_roles: []
+    required_console_roles_mode: any
+    # Redis-backed control-plane API keys (optional; header below carries the raw token):
+    # api_keys_redis_url_env: PANDA_REDIS_URL
+    api_keys_redis_key_prefix: "panda:cp:apikey:"
+    api_key_header: x-panda-control-api-key
+  # Optional: all replicas SUBSCRIBE; after POST/DELETE/import another instance PUBLISHes to reload in-memory routes.
+  # reload_pubsub:
+  #   redis_url_env: PANDA_REDIS_URL
+  #   channel: panda:control_plane:ingress_reload
 
 api_gateway:
+  # --- Ingress (path → handler kind: ai / mcp / ops / deny / gone / not_found) ---
+  # When ingress.enabled is true, every request path must match a row (longest path_prefix wins).
+  # • ingress.routes OMITTED or []  → use built-in table (/health, /metrics, /v1→ai, /mcp→mcp, …).
+  # • ingress.routes NON-EMPTY      → replaces that table entirely; you must list every prefix you need
+  #   (e.g. /health → ops), or those paths return 404 from ingress.
+  #
+  # Example (commented — uncomment and merge with your needs if you customize ingress):
+  # ingress:
+  #   enabled: true
+  #   routes:
+  #     - path_prefix: /health
+  #       backend: ops
+  #     - path_prefix: /v1
+  #       backend: ai
+  #       # Optional: force a different HTTP base for this ingress row only (else top-level default_backend / routes[]).
+  #       # backend_base: "https://api.openai.com/v1"
+  #     - path_prefix: /mcp
+  #       backend: mcp
+  #     - path_prefix: /hooks/llm
+  #       backend: ai
+  #       methods: [POST]
+  #       rate_limit:
+  #         rps: 50
+  #     - path_prefix: /deprecated/surface
+  #       backend: gone
+  #   # Optional: Redis INCR for per-prefix RPS across replicas (see docs/deployment.md).
+  #   # rate_limit_redis:
+  #   #   url_env: "PANDA_REDIS_URL"
+  #   #   key_prefix: "panda:gw:ingress_rps"
   ingress:
     enabled: true
   egress:
@@ -41,7 +189,9 @@ api_gateway:
 
 mcp:
   enabled: true
-  advertise_tools: true
+  # Global default: false so non-/v1/chat paths (e.g. embeddings) do not get MCP tool injection.
+  # routes[].mcp_advertise_tools above enables injection for /v1/chat/* only.
+  advertise_tools: false
   fail_open: true
   tool_timeout_ms: 30000
   # Optional: cache selected tool results (allowlist per server.tool — matches YAML tool_name, not ingress prefix).
@@ -114,29 +264,7 @@ mcp:
 #     cert_pem: "/path/to/fullchain.pem"
 #     key_pem: "/path/to/privkey.pem"
 
-# Optional: path-based routing (longest path_prefix wins; otherwise `upstream` above).
-# Per-route: rate_limit (HTTP RPS; use api_gateway.ingress.rate_limit_redis for shared counters when ingress is enabled),
-# methods (optional allowlist: GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS, …).
-# Global middleware still runs for every hop; these fields override behavior for matching paths.
-# routes:
-#   - path: /api/inventory
-#     upstream: "http://inventory-service:8001"
-#     rate_limit:
-#       rps: 100
-#   - path_prefix: /v1/chat
-#     upstream: "https://api.openai.com/v1"
-#     tpm_limit: 50000
-#     semantic_cache: true
-#     type: openai
-#     mcp_servers: ["local-db"]
-#   - path_prefix: /api/v1/users
-#     upstream: "http://user-service.internal:8080"
-#     methods: [GET, POST, PUT, PATCH, DELETE]
-#   # Optional per-path overrides for AI routing (inherits global `routing` when unset):
-#   - path_prefix: /v1/embeddings
-#     upstream: "https://api.openai.com/v1"
-#     routing:
-#       semantic_enabled: false
+# Active `routes` live under `listen` / `upstream` at the top of this file. More examples: panda.example.yaml.
 
 # Optional: correlate multi-step agent traffic, planner upstream routing, and MCP delegation caps (see docs/ai_routing_strategy.md §3.5).
 # agent_sessions:
@@ -149,7 +277,7 @@ mcp:
 #   jwt_profile_claim: panda_agent_profile
 #   # When any session id is present: min(global mcp.max_tool_rounds, this).
 #   mcp_max_tool_rounds_with_session: 6
-#   profile_upstream_rules:
+#   profile_backend_rules:
 #     - profile: research
 #       upstream: "https://planner.example/v1"
 #       path_prefix: /v1/chat
@@ -166,11 +294,11 @@ mcp:
 #     # mode: embed | classifier | llm_judge
 #     mode: embed
 #     # --- embed mode ---
-#     embed_upstream: "https://api.openai.com/v1"
+#     embed_backend_base: "https://api.openai.com/v1"
 #     embed_api_key_env: "OPENAI_API_KEY"
 #     embed_model: "text-embedding-3-small"
 #     # --- classifier / llm_judge (OpenAI-style POST {router_upstream}/chat/completions) ---
-#     # router_upstream: "https://api.openai.com/v1"
+#     # router_backend_base: "https://api.openai.com/v1"
 #     # router_api_key_env: "OPENAI_API_KEY"
 #     # router_model: "gpt-4o-mini"
 #     similarity_threshold: 0.55   # embed: min cosine; classifier/judge: min model confidence (0–1)
@@ -517,7 +645,7 @@ mcp:
 #   enabled: true
 #   max_messages: 48
 #   keep_recent_messages: 16
-#   summarizer_upstream: "https://api.openai.com"
+#   summarizer_backend_base: "https://api.openai.com"
 #   summarizer_model: "gpt-4o-mini"
 #   summarizer_api_key_env: "PANDA_SUMMARIZER_API_KEY"
 #   request_timeout_ms: 60000

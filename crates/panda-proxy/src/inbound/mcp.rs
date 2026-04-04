@@ -405,7 +405,7 @@ mod tests {
     fn sample_config_with_mcp() -> PandaConfig {
         PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 mcp:
   enabled: true
   tool_timeout_ms: 1000
@@ -430,7 +430,7 @@ mcp:
     #[tokio::test]
     async fn connect_disabled_yields_none() {
         let cfg =
-            PandaConfig::from_yaml_str("listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:1'\n")
+            PandaConfig::from_yaml_str("listen: '127.0.0.1:0'\ndefault_backend: 'http://127.0.0.1:1'\n")
                 .unwrap();
         assert!(McpRuntime::connect(&cfg, None).await.unwrap().is_none());
     }
@@ -519,7 +519,7 @@ mcp:
     fn tool_allowed_for_intent_uses_policy() {
         let cfg = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 mcp:
   enabled: true
   proof_of_intent_mode: enforce
@@ -588,7 +588,7 @@ mcp:
     fn filter_tools_for_intent_applies_allowlist() {
         let cfg = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 mcp:
   enabled: true
   intent_tool_policies:
@@ -764,7 +764,7 @@ for line in sys.stdin:
 
         let yaml = format!(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   egress:
     enabled: true

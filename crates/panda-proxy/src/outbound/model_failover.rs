@@ -128,7 +128,7 @@ pub async fn collect_openai_sse_with_midstream_failover(
         let body_stream = Full::new(bytes::Bytes::from(hop_body))
             .map_err(|never: std::convert::Infallible| match never {})
             .boxed_unsync();
-        let req_try = match build_upstream_request(&p_try, body_stream, backend.upstream.trim()) {
+        let req_try = match build_upstream_request(&p_try, body_stream, backend.backend_base.trim()) {
             Ok(r) => r,
             Err(_) => continue,
         };
@@ -479,7 +479,7 @@ pub fn circuit_allows_attempt(cfg: &ModelFailoverConfig, backend: &ModelFailover
     let Ok(g) = circuits().lock() else {
         return true;
     };
-    let Some(st) = g.get(&backend.upstream) else {
+    let Some(st) = g.get(&backend.backend_base) else {
         return true;
     };
     st.open_until_epoch_ms <= now_epoch_ms()
@@ -491,7 +491,7 @@ pub fn record_circuit_success(cfg: &ModelFailoverConfig, backend: &ModelFailover
     }
     if let Ok(mut g) = circuits().lock() {
         g.insert(
-            backend.upstream.clone(),
+            backend.backend_base.clone(),
             CircuitState {
                 consecutive_failures: 0,
                 open_until_epoch_ms: 0,
@@ -505,7 +505,7 @@ pub fn record_circuit_retryable_failure(cfg: &ModelFailoverConfig, backend: &Mod
         return;
     }
     if let Ok(mut g) = circuits().lock() {
-        let st = g.entry(backend.upstream.clone()).or_default();
+        let st = g.entry(backend.backend_base.clone()).or_default();
         st.consecutive_failures = st.consecutive_failures.saturating_add(1);
         if st.consecutive_failures >= cfg.circuit_breaker_failure_threshold {
             st.open_until_epoch_ms = now_epoch_ms()
@@ -537,7 +537,7 @@ mod tests {
                 panda_config::ModelFailoverGroup {
                     match_models: vec!["gpt-4o-mini".to_string()],
                     backends: vec![ModelFailoverBackend {
-                        upstream: "https://a.example".to_string(),
+                backend_base: "https://a.example".to_string(),
                         api_key_env: None,
                         use_api_key_header: false,
                         protocol: ModelFailoverProtocol::OpenaiCompatible,
@@ -548,7 +548,7 @@ mod tests {
                 panda_config::ModelFailoverGroup {
                     match_models: vec![],
                     backends: vec![ModelFailoverBackend {
-                        upstream: "https://b.example".to_string(),
+                backend_base: "https://b.example".to_string(),
                         api_key_env: None,
                         use_api_key_header: false,
                         protocol: ModelFailoverProtocol::OpenaiCompatible,
@@ -566,7 +566,7 @@ mod tests {
             Some(body),
         )
         .expect("expected chain");
-        assert_eq!(r[0].upstream, "https://a.example");
+        assert_eq!(r[0].backend_base, "https://a.example");
     }
 
     #[test]
@@ -586,7 +586,7 @@ mod tests {
             groups: vec![panda_config::ModelFailoverGroup {
                 match_models: vec![],
                 backends: vec![ModelFailoverBackend {
-                    upstream: "https://api.anthropic.com".to_string(),
+                backend_base: "https://api.anthropic.com".to_string(),
                     api_key_env: None,
                     use_api_key_header: false,
                     protocol: ModelFailoverProtocol::Anthropic,
@@ -623,7 +623,7 @@ mod tests {
             groups: vec![panda_config::ModelFailoverGroup {
                 match_models: vec!["text-embedding-3-small".to_string()],
                 backends: vec![ModelFailoverBackend {
-                    upstream: "https://embeddings.example".to_string(),
+                backend_base: "https://embeddings.example".to_string(),
                     api_key_env: None,
                     use_api_key_header: false,
                     protocol: ModelFailoverProtocol::OpenaiCompatible,

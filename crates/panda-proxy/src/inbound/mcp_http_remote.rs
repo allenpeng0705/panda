@@ -356,7 +356,7 @@ mod tests {
 
         let yaml = format!(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   egress:
     enabled: true

@@ -383,7 +383,7 @@ impl EmbedRouting {
         let timeout = Duration::from_millis(r.semantic.timeout_ms);
         let threshold = r.semantic.similarity_threshold;
         let cache_ttl = Duration::from_secs(r.semantic.cache_ttl_seconds);
-        let base = r.semantic.embed_upstream.trim_end_matches('/');
+        let base = r.semantic.embed_backend_base.trim_end_matches('/');
         let embed_url = format!("{base}/embeddings");
         let api_key = std::env::var(r.semantic.embed_api_key_env.trim()).map_err(|_| {
             anyhow::anyhow!(
@@ -412,7 +412,7 @@ impl EmbedRouting {
             .map_err(|e| anyhow::anyhow!("semantic routing warmup target {:?}: {e:?}", t.name))?;
             targets.push(TargetEmbeddings {
                 name: t.name.clone(),
-                upstream: t.upstream.trim().to_string(),
+                upstream: t.backend_base.trim().to_string(),
                 vector: vec,
             });
         }
@@ -576,7 +576,7 @@ impl RouterRouting {
                 r.semantic.router_api_key_env
             );
         }
-        let base = r.semantic.router_upstream.trim_end_matches('/');
+        let base = r.semantic.router_backend_base.trim_end_matches('/');
         let chat_url = format!("{base}/chat/completions");
         let mut names = HashSet::new();
         let mut targets = Vec::new();
@@ -584,7 +584,7 @@ impl RouterRouting {
             names.insert(t.name.clone());
             targets.push(RouterTargetRow {
                 name: t.name.clone(),
-                upstream: t.upstream.trim().to_string(),
+                upstream: t.backend_base.trim().to_string(),
                 hint: t.routing_text.trim().to_string(),
             });
         }
@@ -957,21 +957,21 @@ mod mock_upstream_tests {
 
         let yaml = format!(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 routing:
   enabled: true
   fallback: static
   semantic:
     enabled: true
     mode: embed
-    embed_upstream: 'http://{addr}/v1'
+    embed_backend_base: 'http://{addr}/v1'
     embed_api_key_env: '{key}'
     embed_model: 'test'
     similarity_threshold: 0.5
     targets:
       - name: t1
         routing_text: warmup
-        upstream: 'http://127.0.0.1:9/v1'
+        backend_base: 'http://127.0.0.1:9/v1'
 "#,
             addr = addr,
             key = key
@@ -1038,14 +1038,14 @@ routing:
 
         let yaml = format!(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 routing:
   enabled: true
   fallback: static
   semantic:
     enabled: true
     mode: classifier
-    router_upstream: 'http://{addr}/v1'
+    router_backend_base: 'http://{addr}/v1'
     router_api_key_env: '{key}'
     router_model: 'gpt-test'
     similarity_threshold: 0.5
@@ -1053,7 +1053,7 @@ routing:
     targets:
       - name: t1
         routing_text: ''
-        upstream: 'http://127.0.0.1:8/v1'
+        backend_base: 'http://127.0.0.1:8/v1'
 "#,
             addr = addr,
             key = key

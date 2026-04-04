@@ -2535,7 +2535,7 @@ fn ingress_dynamic_entry_wire(
         "path_prefix": e.prefix,
         "backend": ingress_backend_label(e.backend),
         "methods": e.methods.iter().map(|m| m.as_str()).collect::<Vec<_>>(),
-        "upstream": e.upstream,
+        "backend_base": e.upstream,
     })
 }
 
@@ -2551,7 +2551,7 @@ fn control_plane_ingress_routes_json(state: &ProxyState) -> serde_json::Value {
                 "path_prefix": r.path_prefix,
                 "backend": ingress_backend_label(r.backend),
                 "methods": r.methods,
-                "upstream": r.upstream,
+                "backend_base": r.backend_base,
             })
         })
         .collect();
@@ -5006,12 +5006,12 @@ fn apply_agent_profile_to_context(
 fn winning_agent_profile_upstream_rule<'a>(
     ingress_path: &str,
     profile_trimmed: &str,
-    rules: &'a [panda_config::AgentProfileUpstreamRule],
-) -> Option<&'a panda_config::AgentProfileUpstreamRule> {
+    rules: &'a [panda_config::AgentProfileBackendRule],
+) -> Option<&'a panda_config::AgentProfileBackendRule> {
     if profile_trimmed.is_empty() {
         return None;
     }
-    let mut best: Option<(&panda_config::AgentProfileUpstreamRule, usize)> = None;
+    let mut best: Option<(&panda_config::AgentProfileBackendRule, usize)> = None;
     for rule in rules {
         let pref = rule.path_prefix.trim();
         if pref.is_empty() || !ingress_path.starts_with(pref) {
@@ -5042,11 +5042,11 @@ fn resolve_profile_upstream_base(
     };
     let p = profile.trim();
     let Some(rule) =
-        winning_agent_profile_upstream_rule(ingress_path, p, &cfg.profile_upstream_rules)
+        winning_agent_profile_upstream_rule(ingress_path, p, &cfg.profile_backend_rules)
     else {
         return static_base.to_string();
     };
-    let u = rule.upstream.trim();
+    let u = rule.backend_base.trim();
     if u.is_empty() {
         static_base.to_string()
     } else {
@@ -5072,7 +5072,7 @@ fn effective_mcp_max_tool_rounds(
     if let Some(ref prof) = ctx.agent_profile {
         let p = prof.trim();
         if let Some(rule) =
-            winning_agent_profile_upstream_rule(ingress_path, p, &ag.profile_upstream_rules)
+            winning_agent_profile_upstream_rule(ingress_path, p, &ag.profile_backend_rules)
         {
             if let Some(n) = rule.mcp_max_tool_rounds {
                 cap = cap.min(n);
@@ -5130,13 +5130,13 @@ fn mcp_max_tool_rounds_effective_status(cfg: &PandaConfig) -> serde_json::Value 
     session_ctx.agent_session = Some("_".into());
     let profile_rules_with_cap = cfg
         .agent_sessions
-        .profile_upstream_rules
+        .profile_backend_rules
         .iter()
         .filter(|r| r.mcp_max_tool_rounds.is_some())
         .count();
     let profile_rule_example = cfg
         .agent_sessions
-        .profile_upstream_rules
+        .profile_backend_rules
         .iter()
         .find(|r| r.mcp_max_tool_rounds.is_some())
         .map(|rule| {
@@ -5158,9 +5158,9 @@ fn mcp_max_tool_rounds_effective_status(cfg: &PandaConfig) -> serde_json::Value 
         "agent_sessions": {
             "enabled": cfg.agent_sessions.enabled,
             "mcp_max_tool_rounds_with_session": cfg.agent_sessions.mcp_max_tool_rounds_with_session,
-            "profile_upstream_rules_with_mcp_cap": profile_rules_with_cap,
+            "profile_backend_rules_with_mcp_cap": profile_rules_with_cap,
         },
-        "resolution": "Per request in the MCP tool-followup loop: min(global mcp.max_tool_rounds, optional session cap when agent_session is set, optional cap from the longest matching profile_upstream_rules entry for agent_profile and ingress path).",
+        "resolution": "Per request in the MCP tool-followup loop: min(global mcp.max_tool_rounds, optional session cap when agent_session is set, optional cap from the longest matching profile_backend_rules entry for agent_profile and ingress path).",
     })
 }
 
@@ -5718,7 +5718,7 @@ fn portal_summary_json(state: &ProxyState) -> serde_json::Value {
             "tls_terminator_enabled": cfg.tls.is_some(),
         },
         "routing": {
-            "upstream_configured": !cfg.upstream.trim().is_empty(),
+            "default_backend_configured": !cfg.default_backend.trim().is_empty(),
             "path_routes_count": cfg.routes.len(),
         },
         "identity": {
@@ -6069,7 +6069,7 @@ fn fleet_status_json(state: &ProxyState) -> serde_json::Value {
 
 fn readiness_status(state: &ProxyState) -> (StatusCode, serde_json::Value) {
     let draining = state.draining.load(Ordering::SeqCst);
-    let upstream_ok = state.config.all_upstream_uris_valid();
+    let upstream_ok = state.config.all_backend_base_uris_valid();
     let mcp_ok = !state.config.mcp.enabled || state.mcp.is_some();
     let context_enrichment_ok = if let Ok(path) = std::env::var("PANDA_CONTEXT_ENRICHMENT_FILE") {
         let t = path.trim();
@@ -6425,7 +6425,7 @@ async fn forward_to_upstream(
     } else {
         state
             .config
-            .effective_upstream_base(&ingress_path)
+            .effective_backend_base(&ingress_path)
             .to_string()
     };
     if let Some(ref rps) = state.rps {
@@ -6734,7 +6734,7 @@ async fn forward_to_upstream(
             .await?;
         }
 
-        let mut effective_upstream_base = resolve_profile_upstream_base(
+        let mut effective_backend_base = resolve_profile_upstream_base(
             &static_upstream_base,
             path,
             &ctx,
@@ -6756,7 +6756,7 @@ async fn forward_to_upstream(
                             .ops_metrics
                             .record_semantic_routing_resolve_latency_ms(ms);
                         if let Some(ref u) = o.upstream {
-                            effective_upstream_base.clone_from(u);
+                            effective_backend_base.clone_from(u);
                         }
                         semantic_route_outcome = o;
                         state
@@ -6779,7 +6779,7 @@ async fn forward_to_upstream(
                 }
             }
         }
-        parts.uri = upstream::join_upstream_uri(&effective_upstream_base, &ingress_uri_full)
+        parts.uri = upstream::join_upstream_uri(&effective_backend_base, &ingress_uri_full)
             .map_err(ProxyError::Upstream)?;
 
         let mcp_intent = if maybe_mcp_followup {
@@ -6798,7 +6798,7 @@ async fn forward_to_upstream(
             if semantic_cache_candidate && !is_openai_chat_streaming_request(&next_bytes) {
                 semantic_cache_key_for_chat_request(
                     &next_bytes,
-                    &effective_upstream_base,
+                    &effective_backend_base,
                     semantic_cache_bucket_scope,
                 )
             } else {
@@ -7206,7 +7206,7 @@ async fn forward_to_upstream(
             let req_try = model_failover::build_upstream_request(
                 &p_try,
                 body_stream,
-                backend.upstream.trim(),
+                backend.backend_base.trim(),
             )?;
             match request_upstream_with_timeout(
                 &state.client,
@@ -8880,6 +8880,8 @@ mod tests {
     use panda_wasm::{HookFailure, PolicyCode};
 
     mod gateway_workflow;
+    mod backend_routing_and_proxy;
+    mod dispatch_branches;
 
     fn mcp_streamable_accept_value() -> &'static str {
         "application/json, text/event-stream"
@@ -8945,7 +8947,7 @@ mod tests {
     #[test]
     fn config_roundtrip_for_listener() {
         let cfg = Arc::new(
-            PandaConfig::from_yaml_str("listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:1'\n")
+            PandaConfig::from_yaml_str("listen: '127.0.0.1:0'\ndefault_backend: 'http://127.0.0.1:1'\n")
                 .unwrap(),
         );
         assert!(cfg.listen_addr().is_ok());
@@ -8956,7 +8958,7 @@ mod tests {
         let cfg = Arc::new(
             PandaConfig::from_yaml_str(
                 r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   ingress:
     enabled: true
@@ -9016,7 +9018,7 @@ api_gateway:
         const SECRET_ENV: &str = "PANDA_TEST_DYN_INGRESS_CP_SECRET";
         std::env::set_var(SECRET_ENV, "dyn-cp-secret");
         let raw = format!(
-            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:1'\nobservability:\n  correlation_header: x-request-id\n  admin_secret_env: {}\napi_gateway:\n  ingress:\n    enabled: true\ncontrol_plane:\n  enabled: true\n",
+            "listen: '127.0.0.1:0'\ndefault_backend: 'http://127.0.0.1:1'\nobservability:\n  correlation_header: x-request-id\n  admin_secret_env: {}\napi_gateway:\n  ingress:\n    enabled: true\ncontrol_plane:\n  enabled: true\n",
             SECRET_ENV
         );
         let cfg = Arc::new(PandaConfig::from_yaml_str(&raw).unwrap());
@@ -9093,7 +9095,7 @@ api_gateway:
         let cfg = Arc::new(
             PandaConfig::from_yaml_str(
                 r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   ingress:
     enabled: true
@@ -9174,7 +9176,7 @@ mcp:
         let cfg = Arc::new(
             PandaConfig::from_yaml_str(
                 r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   ingress:
     enabled: true
@@ -9259,7 +9261,7 @@ api_gateway:
         let cfg = Arc::new(
             PandaConfig::from_yaml_str(
                 r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   ingress:
     enabled: true
@@ -9349,7 +9351,7 @@ mcp:
         let cfg = Arc::new(
             PandaConfig::from_yaml_str(
                 r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   ingress:
     enabled: true
@@ -9502,7 +9504,7 @@ mcp:
 
         let yaml = format!(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   ingress:
     enabled: true
@@ -9626,7 +9628,7 @@ mcp:
     #[test]
     fn tpm_bucket_key_formats() {
         let cfg =
-            PandaConfig::from_yaml_str("listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:1'\n")
+            PandaConfig::from_yaml_str("listen: '127.0.0.1:0'\ndefault_backend: 'http://127.0.0.1:1'\n")
                 .unwrap();
         let mut a = RequestContext::default();
         assert_eq!(super::tpm_bucket_key(&a, &cfg), "anonymous");
@@ -9640,7 +9642,7 @@ mcp:
     fn tpm_bucket_key_includes_agent_session_suffix_when_configured() {
         let cfg = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 agent_sessions:
   enabled: true
   tpm_isolated_buckets: true
@@ -9673,15 +9675,15 @@ agent_sessions:
     fn effective_mcp_max_tool_rounds_respects_session_and_profile_rules() {
         let cfg = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 mcp:
   max_tool_rounds: 20
 agent_sessions:
   enabled: true
   mcp_max_tool_rounds_with_session: 5
-  profile_upstream_rules:
+  profile_backend_rules:
     - profile: planner
-      upstream: "http://127.0.0.2/v1"
+      backend_base: "http://127.0.0.2/v1"
       path_prefix: /v1/chat
       mcp_max_tool_rounds: 3
 "#,
@@ -9716,15 +9718,15 @@ agent_sessions:
     fn profile_upstream_longest_path_prefix_wins() {
         let cfg = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://default/v1'
+default_backend: 'http://default/v1'
 agent_sessions:
   enabled: true
-  profile_upstream_rules:
+  profile_backend_rules:
     - profile: p1
-      upstream: "http://short/v1"
+      backend_base: "http://short/v1"
       path_prefix: /v1/chat
     - profile: p1
-      upstream: "http://long/v1"
+      backend_base: "http://long/v1"
       path_prefix: /v1/chat/completions
 "#,
         )
@@ -9797,7 +9799,7 @@ agent_sessions:
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
             server: None,
-            upstream: "http://127.0.0.1:1".to_string(),
+            default_backend: "http://127.0.0.1:1".to_string(),
             routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
@@ -9881,7 +9883,7 @@ agent_sessions:
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
             server: None,
-            upstream: "http://127.0.0.1:1".to_string(),
+            default_backend: "http://127.0.0.1:1".to_string(),
             routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
@@ -9970,7 +9972,7 @@ agent_sessions:
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
             server: None,
-            upstream: "http://127.0.0.1:1".to_string(),
+            default_backend: "http://127.0.0.1:1".to_string(),
             routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
@@ -10083,7 +10085,7 @@ agent_sessions:
         let cfg = PandaConfig {
             listen: "127.0.0.1:0".to_string(),
             server: None,
-            upstream: "http://127.0.0.1:1".to_string(),
+            default_backend: "http://127.0.0.1:1".to_string(),
             routes: vec![],
             trusted_gateway: Default::default(),
             observability: panda_config::ObservabilityConfig {
@@ -10131,7 +10133,7 @@ agent_sessions:
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
             server: None,
-            upstream: "http://127.0.0.1:1".to_string(),
+            default_backend: "http://127.0.0.1:1".to_string(),
             routes: vec![],
             trusted_gateway: Default::default(),
             observability: panda_config::ObservabilityConfig {
@@ -10276,7 +10278,7 @@ agent_sessions:
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
             server: None,
-            upstream: "http://127.0.0.1:1".to_string(),
+            default_backend: "http://127.0.0.1:1".to_string(),
             routes: vec![],
             trusted_gateway: Default::default(),
             observability: panda_config::ObservabilityConfig {
@@ -10388,7 +10390,7 @@ agent_sessions:
     fn control_plane_rest_path_respects_prefix() {
         let cfg = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 control_plane:
   enabled: true
   path_prefix: /admin/cp
@@ -10405,7 +10407,7 @@ control_plane:
         );
         assert!(super::control_plane_rest_path("/ops/control/v1/status", &cfg).is_none());
         let off =
-            PandaConfig::from_yaml_str("listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:1'\n")
+            PandaConfig::from_yaml_str("listen: '127.0.0.1:0'\ndefault_backend: 'http://127.0.0.1:1'\n")
                 .unwrap();
         assert!(super::control_plane_rest_path("/ops/control/v1/status", &off).is_none());
     }
@@ -10417,7 +10419,7 @@ control_plane:
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
             server: None,
-            upstream: "http://127.0.0.1:1".to_string(),
+            default_backend: "http://127.0.0.1:1".to_string(),
             routes: vec![],
             trusted_gateway: Default::default(),
             observability: panda_config::ObservabilityConfig {
@@ -10535,7 +10537,7 @@ control_plane:
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
             server: None,
-            upstream: "http://127.0.0.1:1".to_string(),
+            default_backend: "http://127.0.0.1:1".to_string(),
             routes: vec![],
             trusted_gateway: Default::default(),
             observability: panda_config::ObservabilityConfig {
@@ -10714,7 +10716,7 @@ control_plane:
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
             server: None,
-            upstream: "http://127.0.0.1:1".to_string(),
+            default_backend: "http://127.0.0.1:1".to_string(),
             routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
@@ -10819,7 +10821,7 @@ control_plane:
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
             server: None,
-            upstream: "http://127.0.0.1:1".to_string(),
+            default_backend: "http://127.0.0.1:1".to_string(),
             routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
@@ -10897,7 +10899,7 @@ control_plane:
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
             server: None,
-            upstream: "http://127.0.0.1:1".to_string(),
+            default_backend: "http://127.0.0.1:1".to_string(),
             routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
@@ -11126,7 +11128,7 @@ control_plane:
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
             server: None,
-            upstream: "http://127.0.0.1:1".to_string(),
+            default_backend: "http://127.0.0.1:1".to_string(),
             routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
@@ -11268,7 +11270,7 @@ control_plane:
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
             server: None,
-            upstream: "http://127.0.0.1:1".to_string(),
+            default_backend: "http://127.0.0.1:1".to_string(),
             routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
@@ -11372,7 +11374,7 @@ control_plane:
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
             server: None,
-            upstream: "http://127.0.0.1:1".to_string(),
+            default_backend: "http://127.0.0.1:1".to_string(),
             routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
@@ -11458,7 +11460,7 @@ control_plane:
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
             server: None,
-            upstream: "http://127.0.0.1:1".to_string(),
+            default_backend: "http://127.0.0.1:1".to_string(),
             routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
@@ -11532,7 +11534,7 @@ control_plane:
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
             server: None,
-            upstream: "http://127.0.0.1:1".to_string(),
+            default_backend: "http://127.0.0.1:1".to_string(),
             routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
@@ -11606,7 +11608,7 @@ control_plane:
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
             server: None,
-            upstream: "http://127.0.0.1:1".to_string(),
+            default_backend: "http://127.0.0.1:1".to_string(),
             routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
@@ -11757,7 +11759,7 @@ control_plane:
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
             server: None,
-            upstream: format!("http://{upstream_addr}"),
+            default_backend: format!("http://{upstream_addr}"),
             routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
@@ -11936,7 +11938,7 @@ control_plane:
         let cfg = Arc::new(
             PandaConfig::from_yaml_str(&format!(
                 r#"listen: '127.0.0.1:0'
-upstream: 'http://{upstream_addr}'
+default_backend: 'http://{upstream_addr}'
 mcp:
   enabled: true
   fail_open: false
@@ -12099,7 +12101,7 @@ mcp:
         let cfg = Arc::new(
             PandaConfig::from_yaml_str(&format!(
                 r#"listen: '127.0.0.1:0'
-upstream: 'http://{upstream_addr}'
+default_backend: 'http://{upstream_addr}'
 mcp:
   enabled: true
   fail_open: false
@@ -12262,7 +12264,7 @@ mcp:
         let cfg = Arc::new(
             PandaConfig::from_yaml_str(&format!(
                 r#"listen: '127.0.0.1:0'
-upstream: 'http://{upstream_addr}'
+default_backend: 'http://{upstream_addr}'
 mcp:
   enabled: true
   fail_open: false
@@ -12354,7 +12356,7 @@ mcp:
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
             server: None,
-            upstream: "http://127.0.0.1:1".to_string(),
+            default_backend: "http://127.0.0.1:1".to_string(),
             routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
@@ -12439,7 +12441,7 @@ mcp:
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
             server: None,
-            upstream: "http://127.0.0.1:1".to_string(),
+            default_backend: "http://127.0.0.1:1".to_string(),
             routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
@@ -12522,7 +12524,7 @@ mcp:
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
             server: None,
-            upstream: "http://127.0.0.1:1".to_string(),
+            default_backend: "http://127.0.0.1:1".to_string(),
             routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
@@ -12607,7 +12609,7 @@ mcp:
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
             server: None,
-            upstream: "http://127.0.0.1:1".to_string(),
+            default_backend: "http://127.0.0.1:1".to_string(),
             routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),
@@ -12865,7 +12867,7 @@ data: [DONE]
         let cfg = Arc::new(PandaConfig {
             listen: "127.0.0.1:0".to_string(),
             server: None,
-            upstream: "http://127.0.0.1:1".to_string(),
+            default_backend: "http://127.0.0.1:1".to_string(),
             routes: vec![],
             trusted_gateway: Default::default(),
             observability: Default::default(),

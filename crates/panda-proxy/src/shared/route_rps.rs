@@ -157,10 +157,10 @@ mod tests {
         let cfg = Arc::new(
             PandaConfig::from_yaml_str(
                 r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 routes:
   - path_prefix: /api
-    upstream: 'http://127.0.0.1:2'
+    backend_base: 'http://127.0.0.1:2'
     rate_limit:
       rps: 2
 "#,
@@ -181,10 +181,10 @@ routes:
         let cfg = Arc::new(
             PandaConfig::from_yaml_str(
                 r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 routes:
   - path_prefix: /api
-    upstream: 'http://127.0.0.1:2'
+    backend_base: 'http://127.0.0.1:2'
     rate_limit:
       rps: 1
 "#,

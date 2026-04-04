@@ -85,7 +85,7 @@
 #     #   watch_reload_ms: 60000        # poll PEM mtimes; rebuild client when any changes (>0)
 #
 listen: "127.0.0.1:8080"
-upstream: "http://127.0.0.1:5023"
+default_backend: "http://127.0.0.1:5023"
 
 # Alternative to top-level `listen` / `tls`: nested `server` (merged at load time).
 # server:
@@ -132,7 +132,7 @@ upstream: "http://127.0.0.1:5023"
 #   jwt_profile_claim: panda_agent_profile
 #   # When any session id is present: min(global mcp.max_tool_rounds, this).
 #   mcp_max_tool_rounds_with_session: 6
-#   profile_upstream_rules:
+#   profile_backend_rules:
 #     - profile: research
 #       upstream: "https://planner.example/v1"
 #       path_prefix: /v1/chat
@@ -149,11 +149,11 @@ upstream: "http://127.0.0.1:5023"
 #     # mode: embed | classifier | llm_judge
 #     mode: embed
 #     # --- embed mode ---
-#     embed_upstream: "https://api.openai.com/v1"
+#     embed_backend_base: "https://api.openai.com/v1"
 #     embed_api_key_env: "OPENAI_API_KEY"
 #     embed_model: "text-embedding-3-small"
 #     # --- classifier / llm_judge (OpenAI-style POST {router_upstream}/chat/completions) ---
-#     # router_upstream: "https://api.openai.com/v1"
+#     # router_backend_base: "https://api.openai.com/v1"
 #     # router_api_key_env: "OPENAI_API_KEY"
 #     # router_model: "gpt-4o-mini"
 #     similarity_threshold: 0.55   # embed: min cosine; classifier/judge: min model confidence (0–1)
@@ -471,7 +471,7 @@ upstream: "http://127.0.0.1:5023"
 #   enabled: true
 #   max_messages: 48
 #   keep_recent_messages: 16
-#   summarizer_upstream: "https://api.openai.com"
+#   summarizer_backend_base: "https://api.openai.com"
 #   summarizer_model: "gpt-4o-mini"
 #   summarizer_api_key_env: "PANDA_SUMMARIZER_API_KEY"
 #   request_timeout_ms: 60000

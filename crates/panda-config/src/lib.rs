@@ -8,7 +8,7 @@
 //! - **Inbound (all-in-one — Panda API gateway + MCP):** MCP and agent session config—[`McpConfig`](crate::McpConfig),
 //!   [`AgentSessionsConfig`](crate::AgentSessionsConfig)—and [`TrustedGatewayConfig`](crate::TrustedGatewayConfig) when **external**
 //!   L7 wraps Panda (ingress to Panda is then attested). Target: Panda’s own API gateway ingress/egress; see `docs/panda_data_flow.md`.
-//! - **Outbound (AI gateway):** `upstream`, [`routes`](crate::RouteConfig), [`AdapterConfig`](crate::AdapterConfig),
+//! - **Outbound (AI gateway):** `default_backend`, [`routes`](crate::RouteConfig), [`AdapterConfig`](crate::AdapterConfig),
 //!   [`SemanticCacheConfig`](crate::SemanticCacheConfig), [`TpmConfig`](crate::TpmConfig),
 //!   [`ModelFailoverConfig`](crate::ModelFailoverConfig), [`RoutingConfig`](crate::RoutingConfig),
 //!   [`RateLimitFallbackConfig`](crate::RateLimitFallbackConfig), [`ContextManagementConfig`](crate::ContextManagementConfig).
@@ -818,12 +818,12 @@ pub struct McpIntentToolPolicy {
     pub allowed_tools: Vec<String>,
 }
 
-/// When `agent_profile` matches and the ingress path starts with `path_prefix`, use `upstream` for that hop
+/// When `agent_profile` matches and the ingress path starts with `path_prefix`, use `backend_base` for that hop
 /// (longest matching `path_prefix` wins). Optional `mcp_max_tool_rounds` tightens the MCP tool-followup cap for that request.
 #[derive(Debug, Clone, Deserialize)]
-pub struct AgentProfileUpstreamRule {
+pub struct AgentProfileBackendRule {
     pub profile: String,
-    pub upstream: String,
+    pub backend_base: String,
     /// Must start with `/`. Default targets OpenAI-style chat completions.
     #[serde(default = "default_agent_profile_upstream_path_prefix")]
     pub path_prefix: String,
@@ -856,9 +856,9 @@ pub struct AgentSessionsConfig {
     /// When set and `agent_session` is present, MCP tool rounds are capped at `min(mcp.max_tool_rounds, this)`.
     #[serde(default)]
     pub mcp_max_tool_rounds_with_session: Option<usize>,
-    /// Per-profile upstream overrides (planner routing). Requires `agent_profile` from JWT and/or `profile_header`.
+    /// Per-profile backend overrides (planner routing). Requires `agent_profile` from JWT and/or `profile_header`.
     #[serde(default)]
-    pub profile_upstream_rules: Vec<AgentProfileUpstreamRule>,
+    pub profile_backend_rules: Vec<AgentProfileBackendRule>,
     /// When true, TPM prompt budget keys include a short hash of the session id (separate cap per session).
     #[serde(default = "default_agent_sessions_tpm_isolated")]
     pub tpm_isolated_buckets: bool,
@@ -885,7 +885,7 @@ impl Default for AgentSessionsConfig {
             jwt_session_claim: None,
             jwt_profile_claim: None,
             mcp_max_tool_rounds_with_session: None,
-            profile_upstream_rules: Vec::new(),
+            profile_backend_rules: Vec::new(),
             tpm_isolated_buckets: default_agent_sessions_tpm_isolated(),
         }
     }
@@ -922,17 +922,17 @@ pub struct RouteRateLimitConfig {
     pub rps: u32,
 }
 
-/// Optional path-based upstream override (Kong-style routing light).
+/// Optional path-based backend override (Kong-style routing light).
 ///
 /// The first matching route with the **longest** `path_prefix` wins; otherwise the top-level
-/// [`PandaConfig::upstream`] is used. Optional [`RouteConfig::methods`] restricts HTTP verbs for
+/// [`PandaConfig::default_backend`] is used. Optional [`RouteConfig::methods`] restricts HTTP verbs for
 /// that prefix (405 + `Allow` when not listed).
 #[derive(Debug, Clone, Deserialize)]
 pub struct RouteConfig {
-    /// Must start with `/`. Request paths that start with this prefix use `upstream` for that hop.
+    /// Must start with `/`. Request paths that start with this prefix use `backend_base` for that hop.
     #[serde(alias = "path")]
     pub path_prefix: String,
-    pub upstream: String,
+    pub backend_base: String,
     #[serde(default)]
     pub rate_limit: Option<RouteRateLimitConfig>,
     /// Override TPM budget (tokens/minute) for this path; inherits [`TpmConfig::budget_tokens_per_minute`] when unset.
@@ -961,15 +961,15 @@ pub struct RouteConfig {
     pub mcp_advertise_tools: Option<bool>,
 }
 
-/// On upstream HTTP 429, retry the same logical chat request against a secondary provider.
+/// On backend HTTP 429, retry the same logical chat request against a secondary provider.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RateLimitFallbackConfig {
     #[serde(default)]
     pub enabled: bool,
     /// Base URL for `anthropic` (e.g. `https://api.anthropic.com`) or full request URL for `openai_compatible`.
     #[serde(default)]
-    pub upstream: String,
-    /// `anthropic`: map OpenAI chat JSON → Anthropic Messages API. `openai_compatible`: POST the same JSON to `upstream`.
+    pub backend_base: String,
+    /// `anthropic`: map OpenAI chat JSON → Anthropic Messages API. `openai_compatible`: POST the same JSON to `backend_base`.
     #[serde(default = "default_rate_limit_fallback_provider")]
     pub provider: String,
     /// Env var for the fallback API key (`ANTHROPIC_API_KEY`, Azure `api-key`, etc.).
@@ -992,7 +992,7 @@ impl Default for RateLimitFallbackConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            upstream: String::new(),
+            backend_base: String::new(),
             provider: default_rate_limit_fallback_provider(),
             api_key_env: default_rate_limit_fallback_api_key_env(),
             use_api_key_header: false,
@@ -1000,7 +1000,7 @@ impl Default for RateLimitFallbackConfig {
     }
 }
 
-/// Compress long OpenAI-style chat histories via a summarizer model before forwarding upstream.
+/// Compress long OpenAI-style chat histories via a summarizer model before forwarding to the backend.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ContextManagementConfig {
     #[serde(default)]
@@ -1013,10 +1013,10 @@ pub struct ContextManagementConfig {
     pub keep_recent_messages: usize,
     /// OpenAI-compatible base URL for the summarizer (e.g. `https://api.openai.com`).
     #[serde(default)]
-    pub summarizer_upstream: String,
+    pub summarizer_backend_base: String,
     #[serde(default)]
     pub summarizer_model: String,
-    /// Env var holding the bearer token for `summarizer_upstream`.
+    /// Env var holding the bearer token for `summarizer_backend_base`.
     #[serde(default = "default_context_summarizer_api_key_env")]
     pub summarizer_api_key_env: String,
     #[serde(default = "default_context_summarizer_timeout_ms")]
@@ -1058,7 +1058,7 @@ impl Default for ContextManagementConfig {
             enabled: false,
             max_messages: default_context_max_messages(),
             keep_recent_messages: default_context_keep_recent_messages(),
-            summarizer_upstream: String::new(),
+            summarizer_backend_base: String::new(),
             summarizer_model: String::new(),
             summarizer_api_key_env: default_context_summarizer_api_key_env(),
             request_timeout_ms: default_context_summarizer_timeout_ms(),
@@ -1255,7 +1255,7 @@ pub enum ModelFailoverOperation {
 /// One physical backend in a model parity / failover chain.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelFailoverBackend {
-    pub upstream: String,
+    pub backend_base: String,
     /// When set, replace `Authorization` (or `api-key`) for this hop only.
     #[serde(default)]
     pub api_key_env: Option<String>,
@@ -1372,7 +1372,7 @@ pub struct RouteRoutingOverrides {
     pub semantic_enabled: Option<bool>,
 }
 
-/// Named upstream for semantic routing (`embed`, `classifier`, or `llm_judge`).
+/// Named backend for semantic routing (`embed`, `classifier`, or `llm_judge`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct SemanticRouteTarget {
     /// Short id for logs and router JSON (`target` must match this exactly).
@@ -1380,7 +1380,7 @@ pub struct SemanticRouteTarget {
     /// Embed mode: non-empty text embedded at warmup. Classifier / `llm_judge`: optional hint shown to the router model.
     pub routing_text: String,
     /// OpenAI-compatible API base for chat when this target wins (e.g. `https://api.openai.com/v1`).
-    pub upstream: String,
+    pub backend_base: String,
 }
 
 /// Semantic / model-intent routing stage (embeddings, classifier, or LLM judge); executed in `panda-proxy` for chat JSON.
@@ -1393,8 +1393,8 @@ pub struct SemanticRoutingConfig {
     pub mode: String,
     /// OpenAI-compatible base URL for embedding requests (e.g. `https://api.openai.com/v1`).
     #[serde(default)]
-    pub embed_upstream: String,
-    /// Env var for bearer key used with `embed_upstream` when `mode` is `embed`.
+    pub embed_backend_base: String,
+    /// Env var for bearer key used with `embed_backend_base` when `mode` is `embed`.
     #[serde(default)]
     pub embed_api_key_env: String,
     /// Chat model id for `/v1/chat/completions` when `mode` is `classifier` or `llm_judge`.
@@ -1413,7 +1413,7 @@ pub struct SemanticRoutingConfig {
     pub targets: Vec<SemanticRouteTarget>,
     /// HTTP base for classifier or LLM-judge routing when `mode` is `classifier` or `llm_judge`.
     #[serde(default)]
-    pub router_upstream: String,
+    pub router_backend_base: String,
     #[serde(default)]
     pub router_api_key_env: String,
     #[serde(default = "default_semantic_routing_timeout_ms")]
@@ -1457,12 +1457,12 @@ impl Default for SemanticRoutingConfig {
         Self {
             enabled: false,
             mode: default_semantic_routing_mode(),
-            embed_upstream: String::new(),
+            embed_backend_base: String::new(),
             embed_api_key_env: String::new(),
             embed_model: default_semantic_routing_embed_model(),
             similarity_threshold: default_semantic_routing_similarity_threshold(),
             targets: vec![],
-            router_upstream: String::new(),
+            router_backend_base: String::new(),
             router_api_key_env: String::new(),
             router_model: default_semantic_routing_router_model(),
             router_response_json: false,
@@ -1568,9 +1568,9 @@ pub struct ApiGatewayIngressRoute {
     /// When non-empty, only these HTTP methods reach the backend; others get **405** (with `Allow`).
     #[serde(default)]
     pub methods: Vec<String>,
-    /// When set and `backend` is **`ai`**, use this URL as the upstream base for matching paths (overrides `routes` / top-level `upstream` resolution for that hop).
+    /// When set and `backend` is **`ai`**, use this URL as the backend base for matching paths (overrides `routes` / top-level `default_backend` resolution for that hop).
     #[serde(default)]
-    pub upstream: Option<String>,
+    pub backend_base: Option<String>,
     /// Optional per-prefix RPS cap (same semantics as top-level `routes[].rate_limit`).
     #[serde(default)]
     pub rate_limit: Option<RouteRateLimitConfig>,
@@ -1980,25 +1980,25 @@ impl ApiGatewayIngressConfig {
                     )
                 })?;
             }
-            let u = r.upstream.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty());
+            let u = r.backend_base.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty());
             if let Some(base) = u {
                 if r.backend != ApiGatewayIngressBackend::Ai {
                     anyhow::bail!(
-                        "api_gateway.ingress.routes[{i}].upstream is only valid when backend is `ai`"
+                        "api_gateway.ingress.routes[{i}].backend_base is only valid when backend is `ai`"
                     );
                 }
                 let uri: http::Uri = base
                     .parse()
                     .map_err(|e| {
                         anyhow::anyhow!(
-                            "api_gateway.ingress.routes[{i}].upstream: invalid URL: {e}"
+                            "api_gateway.ingress.routes[{i}].backend_base: invalid URL: {e}"
                         )
                     })?;
                 if uri.scheme_str() != Some("https") && uri.scheme_str() != Some("http") {
-                    anyhow::bail!("api_gateway.ingress.routes[{i}].upstream must use http or https");
+                    anyhow::bail!("api_gateway.ingress.routes[{i}].backend_base must use http or https");
                 }
                 if uri.host().is_none() {
-                    anyhow::bail!("api_gateway.ingress.routes[{i}].upstream must include a host");
+                    anyhow::bail!("api_gateway.ingress.routes[{i}].backend_base must include a host");
                 }
             }
             if let Some(ref rl) = r.rate_limit {
@@ -2424,8 +2424,9 @@ pub struct PandaConfig {
     pub listen: String,
     #[serde(default)]
     pub server: Option<ServerSection>,
-    pub upstream: String,
-    /// Per-path upstream bases; see [`RouteConfig`]. Empty preserves single-upstream behavior.
+    /// Default HTTP backend base when no [`RouteConfig`] matches (scheme + authority + optional path prefix).
+    pub default_backend: String,
+    /// Per-path backend bases; see [`RouteConfig`]. Empty preserves single-backend behavior.
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
     #[serde(default)]
@@ -2573,16 +2574,16 @@ impl PandaConfig {
         }
         match mode.as_str() {
             "embed" => {
-                if semantic.embed_upstream.trim().is_empty() {
-                    anyhow::bail!("routing.semantic.embed_upstream is required when routing.semantic.mode=embed");
+                if semantic.embed_backend_base.trim().is_empty() {
+                    anyhow::bail!("routing.semantic.embed_backend_base is required when routing.semantic.mode=embed");
                 }
                 let u: http::Uri = semantic
-                    .embed_upstream
+                    .embed_backend_base
                     .trim()
                     .parse()
-                    .map_err(|e| anyhow::anyhow!("routing.semantic.embed_upstream invalid URI: {e}"))?;
+                    .map_err(|e| anyhow::anyhow!("routing.semantic.embed_backend_base invalid URI: {e}"))?;
                 if u.scheme_str() != Some("http") && u.scheme_str() != Some("https") {
-                    anyhow::bail!("routing.semantic.embed_upstream must use http or https");
+                    anyhow::bail!("routing.semantic.embed_backend_base must use http or https");
                 }
                 if semantic.embed_api_key_env.trim().is_empty() {
                     anyhow::bail!(
@@ -2609,32 +2610,32 @@ impl PandaConfig {
                     if t.routing_text.trim().is_empty() {
                         anyhow::bail!("routing.semantic.targets.routing_text must be non-empty");
                     }
-                    if t.upstream.trim().is_empty() {
-                        anyhow::bail!("routing.semantic.targets.upstream must be non-empty");
+                    if t.backend_base.trim().is_empty() {
+                        anyhow::bail!("routing.semantic.targets.backend_base must be non-empty");
                     }
                     let tu: http::Uri = t
-                        .upstream
+                        .backend_base
                         .trim()
                         .parse()
-                        .map_err(|e| anyhow::anyhow!("routing.semantic.targets.upstream invalid URI: {e}"))?;
+                        .map_err(|e| anyhow::anyhow!("routing.semantic.targets.backend_base invalid URI: {e}"))?;
                     if tu.scheme_str() != Some("http") && tu.scheme_str() != Some("https") {
-                        anyhow::bail!("routing.semantic.targets.upstream must use http or https");
+                        anyhow::bail!("routing.semantic.targets.backend_base must use http or https");
                     }
                 }
             }
             "classifier" | "llm_judge" => {
-                if semantic.router_upstream.trim().is_empty() {
+                if semantic.router_backend_base.trim().is_empty() {
                     anyhow::bail!(
-                        "routing.semantic.router_upstream is required when routing.semantic.mode is classifier or llm_judge"
+                        "routing.semantic.router_backend_base is required when routing.semantic.mode is classifier or llm_judge"
                     );
                 }
                 let u: http::Uri = semantic
-                    .router_upstream
+                    .router_backend_base
                     .trim()
                     .parse()
-                    .map_err(|e| anyhow::anyhow!("routing.semantic.router_upstream invalid URI: {e}"))?;
+                    .map_err(|e| anyhow::anyhow!("routing.semantic.router_backend_base invalid URI: {e}"))?;
                 if u.scheme_str() != Some("http") && u.scheme_str() != Some("https") {
-                    anyhow::bail!("routing.semantic.router_upstream must use http or https");
+                    anyhow::bail!("routing.semantic.router_backend_base must use http or https");
                 }
                 if semantic.router_api_key_env.trim().is_empty() {
                     anyhow::bail!(
@@ -2662,16 +2663,16 @@ impl PandaConfig {
                     if !seen.insert(t.name.clone()) {
                         anyhow::bail!("routing.semantic.targets names must be unique: {:?}", t.name);
                     }
-                    if t.upstream.trim().is_empty() {
-                        anyhow::bail!("routing.semantic.targets.upstream must be non-empty");
+                    if t.backend_base.trim().is_empty() {
+                        anyhow::bail!("routing.semantic.targets.backend_base must be non-empty");
                     }
                     let tu: http::Uri = t
-                        .upstream
+                        .backend_base
                         .trim()
                         .parse()
-                        .map_err(|e| anyhow::anyhow!("routing.semantic.targets.upstream invalid URI: {e}"))?;
+                        .map_err(|e| anyhow::anyhow!("routing.semantic.targets.backend_base invalid URI: {e}"))?;
                     if tu.scheme_str() != Some("http") && tu.scheme_str() != Some("https") {
-                        anyhow::bail!("routing.semantic.targets.upstream must use http or https");
+                        anyhow::bail!("routing.semantic.targets.backend_base must use http or https");
                     }
                 }
             }
@@ -2704,13 +2705,13 @@ impl PandaConfig {
                 "`listen` must be set (top-level `listen`, or `server.listen` / `server.port`)"
             );
         }
-        if self.upstream.trim().is_empty() {
-            anyhow::bail!("`upstream` must not be empty");
+        if self.default_backend.trim().is_empty() {
+            anyhow::bail!("`default_backend` must not be empty");
         }
         let _: http::Uri = self
-            .upstream
+            .default_backend
             .parse()
-            .map_err(|e| anyhow::anyhow!("invalid `upstream` URL: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("invalid `default_backend` URL: {e}"))?;
         self.trusted_gateway.validate()?;
         if self.observability.correlation_header.trim().is_empty() {
             anyhow::bail!("`observability.correlation_header` must not be empty");
@@ -2856,36 +2857,36 @@ impl PandaConfig {
         }
         for (i, rule) in self
             .agent_sessions
-            .profile_upstream_rules
+            .profile_backend_rules
             .iter()
             .enumerate()
         {
             if rule.profile.trim().is_empty() {
                 anyhow::bail!(
-                    "agent_sessions.profile_upstream_rules[{i}].profile must not be empty"
+                    "agent_sessions.profile_backend_rules[{i}].profile must not be empty"
                 );
             }
-            let u = rule.upstream.trim();
+            let u = rule.backend_base.trim();
             if u.is_empty() {
                 anyhow::bail!(
-                    "agent_sessions.profile_upstream_rules[{i}].upstream must not be empty"
+                    "agent_sessions.profile_backend_rules[{i}].backend_base must not be empty"
                 );
             }
             let _: http::Uri = u.parse().map_err(|e| {
                 anyhow::anyhow!(
-                    "invalid agent_sessions.profile_upstream_rules[{i}].upstream URL: {e}"
+                    "invalid agent_sessions.profile_backend_rules[{i}].backend_base URL: {e}"
                 )
             })?;
             let pref = rule.path_prefix.trim();
             if pref.is_empty() || !pref.starts_with('/') {
                 anyhow::bail!(
-                    "agent_sessions.profile_upstream_rules[{i}].path_prefix must be non-empty and start with '/'"
+                    "agent_sessions.profile_backend_rules[{i}].path_prefix must be non-empty and start with '/'"
                 );
             }
             if let Some(m) = rule.mcp_max_tool_rounds {
                 if m == 0 {
                     anyhow::bail!(
-                        "agent_sessions.profile_upstream_rules[{i}].mcp_max_tool_rounds must be > 0 when set"
+                        "agent_sessions.profile_backend_rules[{i}].mcp_max_tool_rounds must be > 0 when set"
                     );
                 }
             }
@@ -3436,8 +3437,8 @@ impl PandaConfig {
             anyhow::bail!("mcp.tool_cache.enabled requires mcp.enabled=true");
         }
         if self.rate_limit_fallback.enabled {
-            if self.rate_limit_fallback.upstream.trim().is_empty() {
-                anyhow::bail!("rate_limit_fallback.upstream must be set when rate_limit_fallback.enabled=true");
+            if self.rate_limit_fallback.backend_base.trim().is_empty() {
+                anyhow::bail!("rate_limit_fallback.backend_base must be set when rate_limit_fallback.enabled=true");
             }
             if self.rate_limit_fallback.api_key_env.trim().is_empty() {
                 anyhow::bail!("rate_limit_fallback.api_key_env must be non-empty when rate_limit_fallback.enabled=true");
@@ -3446,27 +3447,27 @@ impl PandaConfig {
                 "anthropic" => {
                     let u: http::Uri =
                         self.rate_limit_fallback
-                            .upstream
+                            .backend_base
                             .trim()
                             .parse()
                             .map_err(|e| {
-                                anyhow::anyhow!("rate_limit_fallback.upstream invalid URI: {e}")
+                                anyhow::anyhow!("rate_limit_fallback.backend_base invalid URI: {e}")
                             })?;
                     if u.scheme_str() != Some("http") && u.scheme_str() != Some("https") {
-                        anyhow::bail!("rate_limit_fallback.upstream must use http or https");
+                        anyhow::bail!("rate_limit_fallback.backend_base must use http or https");
                     }
                 }
                 "openai_compatible" => {
                     let u: http::Uri =
                         self.rate_limit_fallback
-                            .upstream
+                            .backend_base
                             .trim()
                             .parse()
                             .map_err(|e| {
-                                anyhow::anyhow!("rate_limit_fallback.upstream invalid URI: {e}")
+                                anyhow::anyhow!("rate_limit_fallback.backend_base invalid URI: {e}")
                             })?;
                     if u.scheme_str() != Some("http") && u.scheme_str() != Some("https") {
-                        anyhow::bail!("rate_limit_fallback.upstream must use http or https");
+                        anyhow::bail!("rate_limit_fallback.backend_base must use http or https");
                     }
                 }
                 _ => anyhow::bail!(
@@ -3491,21 +3492,21 @@ impl PandaConfig {
             }
             if self
                 .context_management
-                .summarizer_upstream
+                .summarizer_backend_base
                 .trim()
                 .is_empty()
             {
                 anyhow::bail!(
-                    "context_management.summarizer_upstream must be set when context_management.enabled=true"
+                    "context_management.summarizer_backend_base must be set when context_management.enabled=true"
                 );
             }
             let _: http::Uri = self
                 .context_management
-                .summarizer_upstream
+                .summarizer_backend_base
                 .trim()
                 .parse()
                 .map_err(|e| {
-                    anyhow::anyhow!("context_management.summarizer_upstream invalid URI: {e}")
+                    anyhow::anyhow!("context_management.summarizer_backend_base invalid URI: {e}")
                 })?;
             if self.context_management.summarizer_model.trim().is_empty() {
                 anyhow::bail!(
@@ -3669,14 +3670,14 @@ impl PandaConfig {
                     }
                 }
                 for b in &g.backends {
-                    if b.upstream.trim().is_empty() {
-                        anyhow::bail!("model_failover backend upstream must not be empty");
+                    if b.backend_base.trim().is_empty() {
+                        anyhow::bail!("model_failover.backends[].backend_base must not be empty");
                     }
-                    let u: http::Uri = b.upstream.trim().parse().map_err(|e| {
-                        anyhow::anyhow!("model_failover backend upstream invalid URI: {e}")
+                    let u: http::Uri = b.backend_base.trim().parse().map_err(|e| {
+                        anyhow::anyhow!("model_failover.backends[].backend_base invalid URI: {e}")
                     })?;
                     if u.scheme_str() != Some("http") && u.scheme_str() != Some("https") {
-                        anyhow::bail!("model_failover backend upstream must use http or https");
+                        anyhow::bail!("model_failover.backends[].backend_base must use http or https");
                     }
                     if b.api_key_env.as_ref().is_some_and(|e| e.trim().is_empty()) {
                         anyhow::bail!(
@@ -3812,13 +3813,13 @@ impl PandaConfig {
                     r.path_prefix
                 );
             }
-            if r.upstream.trim().is_empty() {
-                anyhow::bail!("routes.upstream must not be empty");
+            if r.backend_base.trim().is_empty() {
+                anyhow::bail!("routes.backend_base must not be empty");
             }
             let _: http::Uri = r
-                .upstream
+                .backend_base
                 .parse()
-                .map_err(|e| anyhow::anyhow!("invalid routes.upstream URL: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("invalid routes.backend_base URL: {e}"))?;
             if !seen_prefixes.insert(r.path_prefix.clone()) {
                 anyhow::bail!("routes.path_prefix must be unique: {:?}", r.path_prefix);
             }
@@ -3909,11 +3910,11 @@ impl PandaConfig {
         Err(route.methods.join(", "))
     }
 
-    /// Upstream base URL for a request path: longest matching [`PandaConfig::routes`] entry, else [`PandaConfig::upstream`].
-    pub fn effective_upstream_base(&self, path: &str) -> &str {
+    /// Backend base URL for a request path: longest matching [`PandaConfig::routes`] entry, else [`PandaConfig::default_backend`].
+    pub fn effective_backend_base(&self, path: &str) -> &str {
         self.effective_route_for_path(path)
-            .map(|r| r.upstream.as_str())
-            .unwrap_or(self.upstream.as_str())
+            .map(|r| r.backend_base.as_str())
+            .unwrap_or(self.default_backend.as_str())
     }
 
     /// TPM budget (tokens per minute) for an ingress path (per-route [`RouteConfig::tpm_limit`] or global).
@@ -3962,14 +3963,14 @@ impl PandaConfig {
             .map(|v| v.as_slice())
     }
 
-    /// True when the default and every route `upstream` parses as an HTTP URI.
-    pub fn all_upstream_uris_valid(&self) -> bool {
-        if self.upstream.parse::<http::Uri>().is_err() {
+    /// True when the default and every route `backend_base` parses as an HTTP URI.
+    pub fn all_backend_base_uris_valid(&self) -> bool {
+        if self.default_backend.parse::<http::Uri>().is_err() {
             return false;
         }
         self.routes
             .iter()
-            .all(|r| r.upstream.parse::<http::Uri>().is_ok())
+            .all(|r| r.backend_base.parse::<http::Uri>().is_ok())
     }
 
     /// Effective Redis URL: YAML, then env `PANDA_REDIS_URL`.
@@ -4069,14 +4070,14 @@ mod tests {
     #[test]
     fn rejects_empty_listen() {
         let err =
-            PandaConfig::from_yaml_str("listen: ''\nupstream: 'http://localhost'\n").unwrap_err();
+            PandaConfig::from_yaml_str("listen: ''\ndefault_backend: 'http://localhost'\n").unwrap_err();
         assert!(err.to_string().contains("listen"));
     }
 
     #[test]
     fn parses_minimal() {
         let cfg = PandaConfig::from_yaml_str(
-            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n",
+            "listen: '127.0.0.1:0'\ndefault_backend: 'http://127.0.0.1:11434'\n",
         )
         .unwrap();
         assert!(cfg.listen_addr().is_ok());
@@ -4089,7 +4090,7 @@ mod tests {
     fn parses_api_gateway_flags() {
         let cfg = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   ingress:
     enabled: true
@@ -4106,7 +4107,7 @@ api_gateway:
     fn rejects_egress_enabled_without_allow_hosts() {
         let err = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   egress:
     enabled: true
@@ -4120,7 +4121,7 @@ api_gateway:
     fn rejects_ingress_bad_route_prefix() {
         let err = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   ingress:
     enabled: true
@@ -4137,7 +4138,7 @@ api_gateway:
     fn rejects_ingress_duplicate_route_prefix() {
         let err = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   ingress:
     enabled: true
@@ -4156,7 +4157,7 @@ api_gateway:
     fn accepts_ingress_enabled_empty_routes_uses_defaults_at_runtime() {
         let cfg = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   ingress:
     enabled: true
@@ -4171,7 +4172,7 @@ api_gateway:
     fn accepts_egress_enabled_with_allowlist() {
         let cfg = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   egress:
     enabled: true
@@ -4200,7 +4201,7 @@ api_gateway:
     fn rejects_egress_validate_tls_partial_client_auth() {
         let err = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   egress:
     enabled: true
@@ -4228,7 +4229,7 @@ api_gateway:
         std::fs::write(&key, b"dummy").unwrap();
         let yaml = format!(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   egress:
     enabled: true
@@ -4260,7 +4261,7 @@ api_gateway:
         std::fs::write(&key, b"this is not a PEM key").unwrap();
         let yaml = format!(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   egress:
     enabled: true
@@ -4291,7 +4292,7 @@ api_gateway:
         std::fs::write(&ca, b"-----BEGIN NOT A CERT-----\ndeadbeef\n-----END NOT A CERT-----\n").unwrap();
         let yaml = format!(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   egress:
     enabled: true
@@ -4317,7 +4318,7 @@ api_gateway:
     fn accepts_mcp_http_tools_with_egress() {
         let cfg = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   egress:
     enabled: true
@@ -4347,7 +4348,7 @@ mcp:
     fn accepts_mcp_http_tool_with_corporate_pool_bases_only() {
         let cfg = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   egress:
     enabled: true
@@ -4376,7 +4377,7 @@ mcp:
     fn accepts_ingress_route_with_methods() {
         let cfg = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   ingress:
     enabled: true
@@ -4395,7 +4396,7 @@ api_gateway:
     fn rejects_mcp_http_tool_and_http_tools_together() {
         let err = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 api_gateway:
   egress:
     enabled: true
@@ -4424,7 +4425,7 @@ mcp:
     fn accepts_agent_sessions_minimal() {
         let cfg = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 agent_sessions:
   enabled: true
   header: x-my-agent-session
@@ -4441,7 +4442,7 @@ agent_sessions:
     fn rejects_control_plane_bad_path_prefix() {
         let err = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 control_plane:
   enabled: true
   path_prefix: no-leading-slash
@@ -4455,7 +4456,7 @@ control_plane:
     fn accepts_control_plane_enabled_default_prefix() {
         let cfg = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 control_plane:
   enabled: true
 "#,
@@ -4469,7 +4470,7 @@ control_plane:
     fn rejects_control_plane_json_file_without_path() {
         let err = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 control_plane:
   enabled: true
   store:
@@ -4484,7 +4485,7 @@ control_plane:
     fn accepts_control_plane_sqlite_with_url() {
         let cfg = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 control_plane:
   enabled: true
   store:
@@ -4503,7 +4504,7 @@ control_plane:
     fn rejects_control_plane_reload_with_memory_store() {
         let err = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 control_plane:
   enabled: true
   reload_from_store_ms: 5000
@@ -4519,7 +4520,7 @@ control_plane:
     fn rejects_control_plane_postgres_listen_without_postgres() {
         let err = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 control_plane:
   enabled: true
   store:
@@ -4536,7 +4537,7 @@ control_plane:
     fn rejects_control_plane_reload_pubsub_without_redis_env() {
         let err = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 control_plane:
   enabled: true
   reload_pubsub:
@@ -4552,7 +4553,7 @@ control_plane:
     fn accepts_control_plane_reload_pubsub_minimal() {
         let cfg = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 control_plane:
   enabled: true
   reload_pubsub:
@@ -4569,7 +4570,7 @@ control_plane:
     fn rejects_console_oidc_bad_required_roles_mode() {
         let err = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 console_oidc:
   enabled: true
   issuer_url: 'https://issuer.example'
@@ -4588,7 +4589,7 @@ console_oidc:
     fn rejects_budget_hierarchy_bad_usd_rate() {
         let err = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 identity:
   require_jwt: true
 tpm:
@@ -4604,18 +4605,18 @@ budget_hierarchy:
     }
 
     #[test]
-    fn accepts_agent_sessions_jwt_and_profile_upstream() {
+    fn accepts_agent_sessions_jwt_and_profile_backend() {
         let cfg = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 agent_sessions:
   enabled: true
   jwt_session_claim: sid
   jwt_profile_claim: agent_profile
   mcp_max_tool_rounds_with_session: 8
-  profile_upstream_rules:
+  profile_backend_rules:
     - profile: research
-      upstream: "https://planner.example/v1"
+      backend_base: "https://planner.example/v1"
       path_prefix: /v1/chat
       mcp_max_tool_rounds: 2
 "#,
@@ -4627,9 +4628,9 @@ agent_sessions:
             Some("agent_profile")
         );
         assert_eq!(cfg.agent_sessions.mcp_max_tool_rounds_with_session, Some(8));
-        assert_eq!(cfg.agent_sessions.profile_upstream_rules.len(), 1);
+        assert_eq!(cfg.agent_sessions.profile_backend_rules.len(), 1);
         assert_eq!(
-            cfg.agent_sessions.profile_upstream_rules[0].upstream,
+            cfg.agent_sessions.profile_backend_rules[0].backend_base,
             "https://planner.example/v1"
         );
     }
@@ -4638,7 +4639,7 @@ agent_sessions:
     fn listen_addr_honors_panda_listen_override() {
         let _guard = ENV_TEST_LOCK.lock().unwrap();
         let cfg = PandaConfig::from_yaml_str(
-            "listen: '127.0.0.1:9'\nupstream: 'http://127.0.0.1:11434'\n",
+            "listen: '127.0.0.1:9'\ndefault_backend: 'http://127.0.0.1:11434'\n",
         )
         .unwrap();
         unsafe {
@@ -4654,7 +4655,7 @@ agent_sessions:
     #[test]
     fn rejects_bad_trusted_header_name() {
         let err = PandaConfig::from_yaml_str(
-            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:1'\n\
+            "listen: '127.0.0.1:0'\ndefault_backend: 'http://127.0.0.1:1'\n\
              trusted_gateway:\n  subject_header: 'bad name'\n",
         )
         .unwrap_err();
@@ -4664,7 +4665,7 @@ agent_sessions:
     #[test]
     fn plugins_defaults_are_non_zero() {
         let cfg = PandaConfig::from_yaml_str(
-            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n",
+            "listen: '127.0.0.1:0'\ndefault_backend: 'http://127.0.0.1:11434'\n",
         )
         .unwrap();
         assert!(cfg.plugins.max_request_body_bytes > 0);
@@ -4761,7 +4762,7 @@ agent_sessions:
     #[test]
     fn rejects_mcp_enabled_without_servers() {
         let err = PandaConfig::from_yaml_str(
-            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+            "listen: '127.0.0.1:0'\ndefault_backend: 'http://127.0.0.1:11434'\n\
              mcp:\n  enabled: true\n",
         )
         .unwrap_err();
@@ -4771,7 +4772,7 @@ agent_sessions:
     #[test]
     fn rejects_mcp_tool_cache_without_allow_entries() {
         let err = PandaConfig::from_yaml_str(
-            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+            "listen: '127.0.0.1:0'\ndefault_backend: 'http://127.0.0.1:11434'\n\
              mcp:\n  enabled: true\n  servers:\n    - name: fs\n  tool_cache:\n    enabled: true\n",
         )
         .unwrap_err();
@@ -4781,7 +4782,7 @@ agent_sessions:
     #[test]
     fn accepts_mcp_enabled_with_one_server() {
         let cfg = PandaConfig::from_yaml_str(
-            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+            "listen: '127.0.0.1:0'\ndefault_backend: 'http://127.0.0.1:11434'\n\
              mcp:\n  enabled: true\n  servers:\n    - name: demo\n",
         )
         .unwrap();
@@ -4794,7 +4795,7 @@ agent_sessions:
     fn rejects_mcp_remote_mcp_url_with_command() {
         let err = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:11434'
+default_backend: 'http://127.0.0.1:11434'
 api_gateway:
   egress:
     enabled: true
@@ -4822,7 +4823,7 @@ mcp:
     fn accepts_mcp_remote_mcp_url_with_egress() {
         let cfg = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:11434'
+default_backend: 'http://127.0.0.1:11434'
 api_gateway:
   egress:
     enabled: true
@@ -4850,7 +4851,7 @@ mcp:
     #[test]
     fn rejects_mcp_hitl_without_mcp_enabled() {
         let err = PandaConfig::from_yaml_str(
-            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+            "listen: '127.0.0.1:0'\ndefault_backend: 'http://127.0.0.1:11434'\n\
              mcp:\n  hitl:\n    enabled: true\n    approval_url: 'https://a.example/ok'\n    tools: ['x.y']\n",
         )
         .unwrap_err();
@@ -4862,7 +4863,7 @@ mcp:
     #[test]
     fn accepts_mcp_hitl_when_mcp_enabled() {
         let cfg = PandaConfig::from_yaml_str(
-            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+            "listen: '127.0.0.1:0'\ndefault_backend: 'http://127.0.0.1:11434'\n\
              mcp:\n  enabled: true\n  servers:\n    - name: demo\n  hitl:\n    enabled: true\n    approval_url: 'https://a.example/approve'\n    tools: ['demo.drop']\n",
         )
         .unwrap();
@@ -4873,8 +4874,8 @@ mcp:
     #[test]
     fn rejects_rate_limit_fallback_bad_provider() {
         let err = PandaConfig::from_yaml_str(
-            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
-             rate_limit_fallback:\n  enabled: true\n  provider: acme\n  upstream: 'https://api.example'\n  api_key_env: 'K'\n",
+            "listen: '127.0.0.1:0'\ndefault_backend: 'http://127.0.0.1:11434'\n\
+             rate_limit_fallback:\n  enabled: true\n  provider: acme\n  backend_base: 'https://api.example'\n  api_key_env: 'K'\n",
         )
         .unwrap_err();
         assert!(err.to_string().contains("rate_limit_fallback.provider"));
@@ -4883,8 +4884,8 @@ mcp:
     #[test]
     fn rejects_context_management_keep_recent_too_large() {
         let err = PandaConfig::from_yaml_str(
-            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
-             context_management:\n  enabled: true\n  max_messages: 10\n  keep_recent_messages: 10\n  summarizer_upstream: 'https://api.openai.com'\n  summarizer_model: 'gpt-4o-mini'\n",
+            "listen: '127.0.0.1:0'\ndefault_backend: 'http://127.0.0.1:11434'\n\
+             context_management:\n  enabled: true\n  max_messages: 10\n  keep_recent_messages: 10\n  summarizer_backend_base: 'https://api.openai.com'\n  summarizer_model: 'gpt-4o-mini'\n",
         )
         .unwrap_err();
         assert!(err.to_string().contains("keep_recent_messages"));
@@ -4893,7 +4894,7 @@ mcp:
     #[test]
     fn auth_block_merges_jwks_url_and_enforce_on_all_routes() {
         let cfg = PandaConfig::from_yaml_str(
-            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+            "listen: '127.0.0.1:0'\ndefault_backend: 'http://127.0.0.1:11434'\n\
              auth:\n  type: jwt\n  jwks_url: 'https://issuer.example/.well-known/jwks.json'\n  enforce_on_all_routes: true\n",
         )
         .unwrap();
@@ -4907,7 +4908,7 @@ mcp:
     #[test]
     fn rejects_invalid_mcp_proof_of_intent_mode() {
         let err = PandaConfig::from_yaml_str(
-            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+            "listen: '127.0.0.1:0'\ndefault_backend: 'http://127.0.0.1:11434'\n\
              mcp:\n  enabled: true\n  proof_of_intent_mode: strict\n  servers:\n    - name: demo\n",
         )
         .unwrap_err();
@@ -4917,7 +4918,7 @@ mcp:
     #[test]
     fn rejects_empty_mcp_command_when_set() {
         let err = PandaConfig::from_yaml_str(
-            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+            "listen: '127.0.0.1:0'\ndefault_backend: 'http://127.0.0.1:11434'\n\
              mcp:\n  enabled: true\n  servers:\n    - name: demo\n      command: ''\n",
         )
         .unwrap_err();
@@ -4927,7 +4928,7 @@ mcp:
     #[test]
     fn rejects_invalid_mcp_max_tool_rounds() {
         let err = PandaConfig::from_yaml_str(
-            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+            "listen: '127.0.0.1:0'\ndefault_backend: 'http://127.0.0.1:11434'\n\
              mcp:\n  enabled: true\n  max_tool_rounds: 0\n  servers:\n    - name: demo\n",
         )
         .unwrap_err();
@@ -4937,7 +4938,7 @@ mcp:
     #[test]
     fn rejects_invalid_mcp_stream_probe_bytes() {
         let err = PandaConfig::from_yaml_str(
-            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+            "listen: '127.0.0.1:0'\ndefault_backend: 'http://127.0.0.1:11434'\n\
              mcp:\n  enabled: true\n  stream_probe_bytes: 0\n  servers:\n    - name: demo\n",
         )
         .unwrap_err();
@@ -4947,7 +4948,7 @@ mcp:
     #[test]
     fn rejects_invalid_mcp_probe_window_seconds() {
         let err = PandaConfig::from_yaml_str(
-            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+            "listen: '127.0.0.1:0'\ndefault_backend: 'http://127.0.0.1:11434'\n\
              mcp:\n  enabled: true\n  probe_window_seconds: 0\n  servers:\n    - name: demo\n",
         )
         .unwrap_err();
@@ -4957,7 +4958,7 @@ mcp:
     #[test]
     fn rejects_invalid_semantic_cache_threshold() {
         let err = PandaConfig::from_yaml_str(
-            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+            "listen: '127.0.0.1:0'\ndefault_backend: 'http://127.0.0.1:11434'\n\
              semantic_cache:\n  enabled: true\n  similarity_threshold: 1.2\n",
         )
         .unwrap_err();
@@ -4969,7 +4970,7 @@ mcp:
     #[test]
     fn rejects_invalid_semantic_cache_backend() {
         let err = PandaConfig::from_yaml_str(
-            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+            "listen: '127.0.0.1:0'\ndefault_backend: 'http://127.0.0.1:11434'\n\
              semantic_cache:\n  enabled: true\n  backend: dragonfly\n",
         )
         .unwrap_err();
@@ -4980,7 +4981,7 @@ mcp:
     fn accepts_semantic_cache_embedding_minimal() {
         let cfg = PandaConfig::from_yaml_str(
             r#"listen: "127.0.0.1:0"
-upstream: "http://127.0.0.1:11434"
+default_backend: "http://127.0.0.1:11434"
 semantic_cache:
   enabled: true
   embedding_lookup_enabled: true
@@ -4999,7 +5000,7 @@ semantic_cache:
     fn rejects_semantic_cache_embedding_with_redis_backend() {
         let err = PandaConfig::from_yaml_str(
             r#"listen: "127.0.0.1:0"
-upstream: "http://127.0.0.1:11434"
+default_backend: "http://127.0.0.1:11434"
 semantic_cache:
   enabled: true
   backend: redis
@@ -5017,7 +5018,7 @@ semantic_cache:
     #[test]
     fn rejects_invalid_adapter_provider() {
         let err = PandaConfig::from_yaml_str(
-            "listen: '127.0.0.1:0'\nupstream: 'http://127.0.0.1:11434'\n\
+            "listen: '127.0.0.1:0'\ndefault_backend: 'http://127.0.0.1:11434'\n\
              adapter:\n  provider: gemini\n",
         )
         .unwrap_err();
@@ -5025,28 +5026,28 @@ semantic_cache:
     }
 
     #[test]
-    fn parses_routes_and_effective_upstream_longest_prefix() {
+    fn parses_routes_and_effective_backend_base_longest_prefix() {
         let cfg = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://default.example'
+default_backend: 'http://default.example'
 routes:
   - path_prefix: /v1
-    upstream: 'http://v1.example'
+    backend_base: 'http://v1.example'
   - path_prefix: /v1/chat
-    upstream: 'http://chat.example'
+    backend_base: 'http://chat.example'
 "#,
         )
         .unwrap();
         assert_eq!(
-            cfg.effective_upstream_base("/other"),
+            cfg.effective_backend_base("/other"),
             "http://default.example"
         );
         assert_eq!(
-            cfg.effective_upstream_base("/v1/models"),
+            cfg.effective_backend_base("/v1/models"),
             "http://v1.example"
         );
         assert_eq!(
-            cfg.effective_upstream_base("/v1/chat/completions"),
+            cfg.effective_backend_base("/v1/chat/completions"),
             "http://chat.example"
         );
     }
@@ -5055,12 +5056,12 @@ routes:
     fn rejects_duplicate_route_path_prefix() {
         let err = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 routes:
   - path_prefix: /api
-    upstream: 'http://a.example'
+    backend_base: 'http://a.example'
   - path_prefix: /api
-    upstream: 'http://b.example'
+    backend_base: 'http://b.example'
 "#,
         )
         .unwrap_err();
@@ -5071,10 +5072,10 @@ routes:
     fn rejects_route_path_prefix_without_leading_slash() {
         let err = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 routes:
   - path_prefix: api
-    upstream: 'http://a.example'
+    backend_base: 'http://a.example'
 "#,
         )
         .unwrap_err();
@@ -5082,17 +5083,17 @@ routes:
     }
 
     #[test]
-    fn rejects_invalid_route_upstream_url() {
+    fn rejects_invalid_route_backend_base_url() {
         let err = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 routes:
   - path_prefix: /x
-    upstream: 'http://['
+    backend_base: 'http://['
 "#,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("routes.upstream"));
+        assert!(err.to_string().contains("routes.backend_base"));
     }
 
     #[test]
@@ -5101,7 +5102,7 @@ routes:
             r#"server:
   port: 8080
   address: "127.0.0.1"
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 "#,
         )
         .unwrap();
@@ -5115,7 +5116,7 @@ upstream: 'http://127.0.0.1:1'
 server:
   port: 8080
   address: "127.0.0.1"
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 "#,
         )
         .unwrap();
@@ -5129,7 +5130,7 @@ upstream: 'http://127.0.0.1:1'
 server:
   listen: ''
   port: 3000
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 "#,
         )
         .unwrap();
@@ -5140,7 +5141,7 @@ upstream: 'http://127.0.0.1:1'
     fn route_path_alias_and_per_route_overrides() {
         let cfg = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://default'
+default_backend: 'http://default'
 semantic_cache:
   enabled: true
 mcp:
@@ -5149,7 +5150,7 @@ mcp:
     - name: a
 routes:
   - path: /v1/chat
-    upstream: 'http://chat'
+    backend_base: 'http://chat'
     rate_limit:
       rps: 50
     tpm_limit: 9000
@@ -5159,7 +5160,7 @@ routes:
 "#,
         )
         .unwrap();
-        assert_eq!(cfg.effective_upstream_base("/v1/chat/x"), "http://chat");
+        assert_eq!(cfg.effective_backend_base("/v1/chat/x"), "http://chat");
         assert_eq!(cfg.effective_tpm_budget_tokens_per_minute("/v1/chat"), 9000);
         assert!(!cfg.effective_semantic_cache_enabled_for_path("/v1/chat"));
         assert_eq!(cfg.effective_adapter_provider("/v1/chat"), "anthropic");
@@ -5174,10 +5175,10 @@ routes:
     fn route_methods_normalize_and_check_ingress() {
         let cfg = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 routes:
   - path_prefix: /api
-    upstream: 'http://api.example'
+    backend_base: 'http://api.example'
     methods: [GET, POST, PUT, PATCH, DELETE]
 "#,
         )
@@ -5200,7 +5201,7 @@ routes:
     fn route_mcp_advertise_tools_overrides_global() {
         let cfg = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 mcp:
   enabled: true
   advertise_tools: true
@@ -5208,7 +5209,7 @@ mcp:
     - name: a
 routes:
   - path_prefix: /v1/nomcp
-    upstream: 'http://api.example'
+    backend_base: 'http://api.example'
     mcp_advertise_tools: false
 "#,
         )
@@ -5223,7 +5224,7 @@ routes:
     fn route_mcp_advertise_tools_true_when_global_false() {
         let cfg = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 mcp:
   enabled: true
   advertise_tools: false
@@ -5231,7 +5232,7 @@ mcp:
     - name: a
 routes:
   - path_prefix: /v1/chat
-    upstream: 'http://llm.example'
+    backend_base: 'http://llm.example'
     mcp_advertise_tools: true
 "#,
         )
@@ -5244,12 +5245,12 @@ routes:
     fn route_mcp_advertise_tools_true_requires_mcp_enabled() {
         let err = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 mcp:
   enabled: false
 routes:
   - path_prefix: /v1/chat
-    upstream: 'http://x'
+    backend_base: 'http://x'
     mcp_advertise_tools: true
 "#,
         )
@@ -5261,10 +5262,10 @@ routes:
     fn route_methods_rejects_invalid_token() {
         let err = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 routes:
   - path_prefix: /api
-    upstream: 'http://api.example'
+    backend_base: 'http://api.example'
     methods: ["BAD METHOD"]
 "#,
         )
@@ -5276,18 +5277,18 @@ routes:
     fn rejects_routing_semantic_without_master_switch() {
         let err = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 routing:
   enabled: false
   semantic:
     enabled: true
     mode: embed
-    embed_upstream: 'https://api.openai.com/v1'
+    embed_backend_base: 'https://api.openai.com/v1'
     embed_api_key_env: 'OPENAI_API_KEY'
     targets:
       - name: a
         routing_text: test
-        upstream: 'https://api.openai.com/v1'
+        backend_base: 'https://api.openai.com/v1'
 "#,
         )
         .unwrap_err();
@@ -5300,19 +5301,19 @@ routing:
     fn accepts_routing_embed_minimal() {
         let cfg = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 routing:
   enabled: true
   fallback: deny
   semantic:
     enabled: true
     mode: embed
-    embed_upstream: 'https://api.openai.com/v1'
+    embed_backend_base: 'https://api.openai.com/v1'
     embed_api_key_env: 'OPENAI_API_KEY'
     targets:
       - name: general
         routing_text: general questions and chat
-        upstream: 'https://api.openai.com/v1'
+        backend_base: 'https://api.openai.com/v1'
 "#,
         )
         .unwrap();
@@ -5328,24 +5329,24 @@ routing:
     fn accepts_routing_classifier_minimal() {
         let cfg = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 routing:
   enabled: true
   fallback: static
   semantic:
     enabled: true
     mode: classifier
-    router_upstream: 'https://api.openai.com/v1'
+    router_backend_base: 'https://api.openai.com/v1'
     router_api_key_env: 'OPENAI_API_KEY'
     router_model: 'gpt-4o-mini'
     similarity_threshold: 0.7
     targets:
       - name: general
         routing_text: ''
-        upstream: 'https://api.openai.com/v1'
+        backend_base: 'https://api.openai.com/v1'
       - name: coding
         routing_text: programming and debugging tasks
-        upstream: 'https://api.anthropic.com/v1'
+        backend_base: 'https://api.anthropic.com/v1'
 "#,
         )
         .unwrap();
@@ -5357,7 +5358,7 @@ routing:
     fn rejects_bad_routing_fallback() {
         let err = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 routing:
   fallback: maybe
 "#,
@@ -5370,21 +5371,21 @@ routing:
     fn route_routing_overrides_effective_semantic() {
         let cfg = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 routing:
   enabled: true
   semantic:
     enabled: true
     mode: embed
-    embed_upstream: 'https://api.openai.com/v1'
+    embed_backend_base: 'https://api.openai.com/v1'
     embed_api_key_env: 'K'
     targets:
       - name: t1
         routing_text: general
-        upstream: 'https://api.openai.com/v1'
+        backend_base: 'https://api.openai.com/v1'
 routes:
   - path_prefix: /v1/chat
-    upstream: 'http://chat.example'
+    backend_base: 'http://chat.example'
     routing:
       semantic_enabled: false
 "#,
@@ -5398,7 +5399,7 @@ routes:
     fn rejects_mcp_tool_routes_without_mcp_enabled() {
         let err = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 mcp:
   enabled: false
   tool_routes:
@@ -5418,7 +5419,7 @@ mcp:
     fn accepts_mcp_tool_routes_minimal() {
         let cfg = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 mcp:
   enabled: true
   tool_timeout_ms: 1000
@@ -5443,12 +5444,12 @@ mcp:
     fn rejects_route_semantic_enabled_without_global_semantic() {
         let err = PandaConfig::from_yaml_str(
             r#"listen: '127.0.0.1:0'
-upstream: 'http://127.0.0.1:1'
+default_backend: 'http://127.0.0.1:1'
 routing:
   enabled: true
 routes:
   - path_prefix: /v1/chat
-    upstream: 'http://chat.example'
+    backend_base: 'http://chat.example'
     routing:
       semantic_enabled: true
 "#,

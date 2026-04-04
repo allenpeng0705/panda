@@ -73,7 +73,7 @@ pub(crate) fn ingress_entry_from_route(r: &ApiGatewayIngressRoute) -> Option<Ing
         })
         .collect();
     let upstream = r
-        .upstream
+        .backend_base
         .as_ref()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
@@ -327,7 +327,7 @@ impl DynamicIngressRoutes {
                 path_prefix: e.prefix.clone(),
                 backend: e.backend,
                 methods: e.methods.iter().map(|m| m.to_string()).collect(),
-                upstream: e.upstream.clone(),
+                backend_base: e.upstream.clone(),
                 rate_limit: e
                     .ingress_rps
                     .map(|rps| panda_config::RouteRateLimitConfig { rps }),
@@ -509,7 +509,7 @@ mod tests {
                 path_prefix: "/api".to_string(),
                 backend: ApiGatewayIngressBackend::Ai,
                 methods: vec![],
-                upstream: None,
+                backend_base: None,
                 rate_limit: None,
             }],
             ..Default::default()
@@ -537,7 +537,7 @@ mod tests {
                 path_prefix: "/hooks".to_string(),
                 backend: ApiGatewayIngressBackend::Ai,
                 methods: vec!["POST".to_string()],
-                upstream: None,
+                backend_base: None,
                 rate_limit: None,
             }],
             ..Default::default()
@@ -567,7 +567,7 @@ mod tests {
                 path_prefix: "/alt".to_string(),
                 backend: ApiGatewayIngressBackend::Ai,
                 methods: vec![],
-                upstream: Some("https://llm.other.example/v1".to_string()),
+                backend_base: Some("https://llm.other.example/v1".to_string()),
                 rate_limit: None,
             }],
             ..Default::default()
@@ -591,7 +591,7 @@ mod tests {
                 path_prefix: "/api".to_string(),
                 backend: ApiGatewayIngressBackend::Ai,
                 methods: vec![],
-                upstream: None,
+                backend_base: None,
                 rate_limit: None,
             }],
             ..Default::default()
@@ -636,7 +636,7 @@ mod tests {
                 path_prefix: "/x".to_string(),
                 backend: ApiGatewayIngressBackend::Ai,
                 methods: vec![],
-                upstream: None,
+                backend_base: None,
                 rate_limit: None,
             }],
             ..Default::default()

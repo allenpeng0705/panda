@@ -2,7 +2,7 @@
 
 **Purpose:** Canonical **traffic shapes** for Panda’s **all-in-one** design: a **first-class Panda API gateway** that can sit **in front of** the MCP gateway (ingress) **or behind** it (egress toward the corporate API gateway and REST). External L7 (Kong, etc.) remains optional **outside** the whole product.
 
-**See also:** [`panda_scenarios_summary.md`](./panda_scenarios_summary.md) (scenario matrix + top-down diagrams: MCP + API gateway + AI gateway), [`design_api_gateway_and_mcp_gateway.md`](./design_api_gateway_and_mcp_gateway.md) (detailed design), [`implementation_plan_mcp_api_gateway.md`](./implementation_plan_mcp_api_gateway.md) (build plan), [`design_mcp_control_plane_rust.md`](./design_mcp_control_plane_rust.md) §4, [`architecture_two_pillars.md`](./architecture_two_pillars.md), [`kong_handshake.md`](./kong_handshake.md) (when an **additional** edge gateway wraps Panda).
+**See also:** [`panda_scenarios_summary.md`](./panda_scenarios_summary.md) (scenario matrix + top-down diagrams: MCP + API gateway + AI gateway), [`design_api_gateway_and_mcp_gateway.md`](./design_api_gateway_and_mcp_gateway.md) (detailed design), [`implementation_plan_mcp_api_gateway.md`](./implementation_plan_mcp_api_gateway.md) (build plan), [`design_mcp_control_plane_rust.md`](./design_mcp_control_plane_rust.md) §4, [`architecture_two_pillars.md`](./architecture_two_pillars.md), [`kong_handshake.md`](./kong_handshake.md) (when an **additional** edge gateway wraps Panda). **Per-request order of handlers** (`listen` → `dispatch` → optional ingress → `forward_to_upstream`): section **Request dispatch** below.
 
 ---
 
@@ -16,6 +16,102 @@
 Same **Panda API gateway** component, **two configurable positions** — not two different products. You can enable **ingress only**, **egress only**, or **both**.
 
 Optional **external** Kong/NGINX in front of **everything** is still supported for enterprises that already standardize on it.
+
+---
+
+## Request dispatch — from `listen` to response (implementation order)
+
+Every client request hits the HTTP server bound to **`listen`**, then **`dispatch`** in [`crates/panda-proxy/src/lib.rs`](../crates/panda-proxy/src/lib.rs). **Order matters:** an earlier stage may **return** a response; later stages never run.
+
+**Correlation ID:** observability headers are applied at the start of `dispatch` for every request.
+
+### 1. Control plane (optional)
+
+**When:** `control_plane.enabled` **and** the path is under `control_plane.path_prefix` (default logical base `/ops/control/...` if the prefix is empty — see `control_plane_rest_path` in code).
+
+**If the path matches:** authenticate (ops secret, control-plane secrets, API keys, etc.). On failure → **4xx** and stop. On success → handle REST sub-routes (status, API keys, ingress route import/export/CRUD, …) → **JSON** and stop. Unknown sub-path → **404** JSON and stop.
+
+**If the path does not match control plane:** skip this block.
+
+### 2. API gateway ingress (optional)
+
+**When:** `api_gateway.ingress.enabled` **and** the ingress router is built (`ingress_router` is `Some`).
+
+**Classification:** longest-prefix match on **`api_gateway.ingress.routes`** merged with **dynamic** ingress rows and tenant resolution; if **`ingress.routes`** is empty, **built-in defaults** apply (see ingress router in [`ingress.rs`](../crates/panda-proxy/src/api_gateway/ingress.rs)).
+
+| Outcome | HTTP | Reaches `forward_to_upstream`? |
+|--------|------|--------------------------------|
+| No matching prefix | **404** `ingress: no matching route` | No |
+| Method not allowed (per-row `methods`) | **405** + `Allow` | No |
+| Ingress RPS exceeded (if configured) | **429** | No |
+| `backend: deny` | **403** | No |
+| `backend: gone` | **410** | No |
+| `backend: not_found` (tombstone) | **404** | No |
+| `backend: mcp` | MCP HTTP ingress handler (JSON-RPC / streamable HTTP) | No |
+| `backend: ai` | Optional per-row `backend_base` stored as override; **continue** | Yes (unless a later stage returns) |
+| `backend: ops` | **Continue** (no return in ingress) | Yes (unless a later stage returns) |
+
+**Where MCP is selected here:** Ingress picks the **handler kind** for the URL prefix. **`backend: mcp`** is chosen when the request path matches an ingress row whose **`backend`** is **`mcp`** (built-in default: prefix **`/mcp`** — JSON-RPC `initialize`, `tools/list`, `tools/call`, etc.). That branch **returns inside** `mcp_http_ingress` and does **not** go to `forward_to_upstream`. It is independent of **top-level** `mcp.enabled` in the sense that routing is by prefix; the MCP runtime must still be configured for tools to actually work.
+
+**If ingress is disabled:** this entire block is skipped.
+
+**Caveat:** If you use a **non-empty** custom `api_gateway.ingress.routes` that **replaces** the built-in table, you must list every prefix you still need (including `/health` → `ops` if you want health under ingress). Otherwise **`GET /health`** can fail at ingress **before** the hardcoded `/health` handler later in `dispatch`.
+
+### 3. Developer console (`GET /console/...`)
+
+OAuth login/callback (if OIDC enabled), static UI, WebSocket, metadata — or **404** if disabled / unknown path. Can return without proxying.
+
+### 4. Built-in ops and portal endpoints (still in `dispatch`)
+
+Examples: **`GET /health`**, **`GET /ready`**, **`GET /metrics`**, TPM/MCP/plugins/fleet/compliance status, **`GET /portal/*`**. Often require **ops auth** when configured. These run **after** ingress (if ingress ran) and only if the request **reaches** them.
+
+### 5. JWT (optional)
+
+**When:** `identity.require_jwt` (and related settings). Failure → **401** (or configured response) and stop.
+
+### 6. `forward_to_upstream` — AI gateway / HTTP proxy
+
+**When:** nothing above returned.
+
+**Backend base URL:** `effective_backend_base(path)` from top-level **`default_backend`** + **`routes[]`** (longest `path_prefix` wins), unless an ingress **`ai`** row set **`backend_base`**, or agent profile / semantic routing overrides the base.
+
+**MCP on this path (not the ingress `/mcp` route):** If **`mcp.enabled`** and the runtime is present, **`POST /v1/chat/completions`** can **merge MCP tool definitions** into the JSON body (when `routes` / global `mcp_advertise_tools` and headers allow). When the **upstream** returns tool calls, **`McpRuntime`** runs tools (stdio / remote MCP / **egress** HTTP tools) and may issue **follow-up** chat rounds — still inside **`forward_to_upstream`** / follow-up logic. **`POST /mcp` over ingress** (`backend: mcp`) is a **separate** entry: caller sends JSON-RPC **`tools/call`** directly; no LLM is required on that path.
+
+**Inside this function (summary):** prompt safety, route RPS, route method allowlist, WASM/plugins, TPM, PII, MCP tool injection on chat, semantic cache, semantic routing, Anthropic adapter on `POST /v1/chat/completions`, MCP follow-up loops, model failover, HTTP client to upstream, response transforms.
+
+Typical error mappings include **413** (payload), **403** (policy), **429** (TPM / budgets), **405** (top-level route `methods`), **502/503/504** (upstream). Success → proxied response from the backend.
+
+### 7. Two different `routes` tables
+
+| Config | Role |
+|--------|------|
+| **`api_gateway.ingress.routes`** (+ dynamics + built-ins when empty) | **Handler class** when ingress is on: `ai` / `mcp` / `ops` / `deny` / `gone` / `not_found`. |
+| **Top-level `routes` + `default_backend`** | **Outbound HTTP base** and per-path AI options **inside `forward_to_upstream`** (`effective_backend_base`, TPM, MCP advertise, adapter `type`, etc.). |
+
+### Overview diagram
+
+```mermaid
+flowchart TD
+  A[Client to listen] --> B[dispatch]
+  B --> C{control_plane path and enabled?}
+  C -->|yes| CP[Control plane handlers]
+  CP --> Z[Return response]
+  C -->|no| D{ingress enabled?}
+  D -->|no| E[Skip ingress]
+  D -->|yes| IG[Ingress classify_merged]
+  IG -->|backend mcp| MCP[MCP HTTP ingress — JSON-RPC]
+  MCP --> Z
+  IG -->|no match / deny / gone / 404 / 405 / 429| Z
+  IG -->|ai or ops| E
+  E --> F[Console / health / portal / ops GETs]
+  F -->|matched| Z
+  F -->|no| G{require_jwt?}
+  G -->|fail| Z
+  G -->|ok| H[forward_to_upstream — AI proxy; optional MCP on chat]
+  H --> Z
+```
+
+**Legend — two MCP touchpoints:** **`backend: mcp`** (branch to **MCP HTTP ingress**) = MCP **protocol** on **`/mcp`** (or a custom prefix row). **`forward_to_upstream`** = **OpenAI-shaped** proxy; for **`POST /v1/chat/completions`**, **`mcp`** settings may **inject tools** and **`McpRuntime`** may **run tools** after the model returns (separate from the `/mcp` JSON-RPC route).
 
 ---
 
@@ -101,7 +197,7 @@ Optional prefix: **Agent → external Kong →** … when the org puts Kong outs
 
 ## 4. Outbound AI (second pillar)
 
-**OpenAI-shaped** traffic through Panda to **upstream LLMs** (`upstream`, routes, TPM, cache, failover) is the **AI gateway** pillar. It can share listeners and policy context with the paths above; diagram it separately when designing so LLM hops are not confused with corporate REST egress.
+**OpenAI-shaped** traffic through Panda to **upstream LLMs** (`default_backend`, top-level `routes`, TPM, cache, failover) is the **AI gateway** pillar. It can share listeners and policy context with the paths above; diagram it separately when designing so LLM hops are not confused with corporate REST egress.
 
 ---
 
