@@ -954,6 +954,11 @@ pub struct RouteConfig {
     /// Optional overrides for global `routing` (AI routing pipeline).
     #[serde(default)]
     pub routing: Option<RouteRoutingOverrides>,
+    /// When set, overrides global [`crate::McpConfig::advertise_tools`] for `POST /v1/chat/completions`
+    /// on this path prefix (longest-prefix match). Use `false` for pure HTTP proxy routes (no merged MCP
+    /// tool list); `true` to enable advertisement when global is `false`. `None` = inherit global.
+    #[serde(default)]
+    pub mcp_advertise_tools: Option<bool>,
 }
 
 /// On upstream HTTP 429, retry the same logical chat request against a secondary provider.
@@ -3856,6 +3861,12 @@ impl PandaConfig {
                     }
                 }
             }
+            if r.mcp_advertise_tools == Some(true) && !self.mcp.enabled {
+                anyhow::bail!(
+                    "routes.mcp_advertise_tools=true requires mcp.enabled=true (path_prefix={:?})",
+                    r.path_prefix
+                );
+            }
         }
         self.api_gateway.validate()?;
         Ok(())
@@ -3922,6 +3933,18 @@ impl PandaConfig {
             None => global_on,
             Some(false) => false,
             Some(true) => global_on,
+        }
+    }
+
+    /// Effective MCP tool advertisement for `POST /v1/chat/completions`: per-route [`RouteConfig::mcp_advertise_tools`]
+    /// overrides global [`McpConfig::advertise_tools`] when set.
+    pub fn effective_mcp_advertise_tools_for_path(&self, path: &str) -> bool {
+        match self
+            .effective_route_for_path(path)
+            .and_then(|r| r.mcp_advertise_tools)
+        {
+            Some(v) => v,
+            None => self.mcp.advertise_tools,
         }
     }
 
@@ -5171,6 +5194,67 @@ routes:
         assert!(cfg
             .check_ingress_method("/api", &http::Method::OPTIONS)
             .is_err());
+    }
+
+    #[test]
+    fn route_mcp_advertise_tools_overrides_global() {
+        let cfg = PandaConfig::from_yaml_str(
+            r#"listen: '127.0.0.1:0'
+upstream: 'http://127.0.0.1:1'
+mcp:
+  enabled: true
+  advertise_tools: true
+  servers:
+    - name: a
+routes:
+  - path_prefix: /v1/nomcp
+    upstream: 'http://api.example'
+    mcp_advertise_tools: false
+"#,
+        )
+        .unwrap();
+        assert!(cfg.effective_mcp_advertise_tools_for_path("/v1/chat/completions"));
+        assert!(!cfg.effective_mcp_advertise_tools_for_path(
+            "/v1/nomcp/chat/completions"
+        ));
+    }
+
+    #[test]
+    fn route_mcp_advertise_tools_true_when_global_false() {
+        let cfg = PandaConfig::from_yaml_str(
+            r#"listen: '127.0.0.1:0'
+upstream: 'http://127.0.0.1:1'
+mcp:
+  enabled: true
+  advertise_tools: false
+  servers:
+    - name: a
+routes:
+  - path_prefix: /v1/chat
+    upstream: 'http://llm.example'
+    mcp_advertise_tools: true
+"#,
+        )
+        .unwrap();
+        assert!(!cfg.effective_mcp_advertise_tools_for_path("/v1/embeddings"));
+        assert!(cfg.effective_mcp_advertise_tools_for_path("/v1/chat/completions"));
+    }
+
+    #[test]
+    fn route_mcp_advertise_tools_true_requires_mcp_enabled() {
+        let err = PandaConfig::from_yaml_str(
+            r#"listen: '127.0.0.1:0'
+upstream: 'http://127.0.0.1:1'
+mcp:
+  enabled: false
+routes:
+  - path_prefix: /v1/chat
+    upstream: 'http://x'
+    mcp_advertise_tools: true
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("mcp_advertise_tools"));
     }
 
     #[test]

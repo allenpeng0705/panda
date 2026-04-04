@@ -4323,18 +4323,45 @@ fn is_json_request(headers: &HeaderMap) -> bool {
         .is_some_and(|v| v.to_ascii_lowercase().starts_with("application/json"))
 }
 
+/// Client may send `X-Panda-MCP-Advertise: false` (or `0`, `no`, `off`) to skip merging MCP tools for this request
+/// when per-route / global config would otherwise advertise.
+const HEADER_PANDA_MCP_ADVERTISE: &str = "x-panda-mcp-advertise";
+
+fn header_opt_out_mcp_advertise(headers: &HeaderMap) -> bool {
+    headers
+        .get(HEADER_PANDA_MCP_ADVERTISE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| {
+            let t = s.trim().to_ascii_lowercase();
+            t == "0" || t == "false" || t == "no" || t == "off"
+        })
+        .unwrap_or(false)
+}
+
 fn should_advertise_mcp_tools(
     state: &ProxyState,
     method: &hyper::Method,
     path: &str,
     headers: &HeaderMap,
 ) -> bool {
-    state.mcp.is_some()
+    if !(state.mcp.is_some()
         && state.config.mcp.enabled
-        && state.config.mcp.advertise_tools
         && method == hyper::Method::POST
         && path == "/v1/chat/completions"
-        && is_json_request(headers)
+        && is_json_request(headers))
+    {
+        return false;
+    }
+    if !state
+        .config
+        .effective_mcp_advertise_tools_for_path(path)
+    {
+        return false;
+    }
+    if header_opt_out_mcp_advertise(headers) {
+        return false;
+    }
+    true
 }
 
 fn inject_openai_tools_into_chat_body(

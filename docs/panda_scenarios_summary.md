@@ -6,6 +6,26 @@
 
 ---
 
+## Design goals — MCP gateway + API gateway + AI gateway together
+
+**Goal:** One **`panda-server`** process can act as **both** an **MCP gateway** (tools, `POST /mcp`, optional chat tool loops) and a **generic HTTP / API gateway** (path-based **`routes`** to upstreams, ingress table when enabled). Internal services that only need an **LLM** should use the **AI gateway** path **without** automatically merging the full MCP tool catalog into every chat request.
+
+**Verified logic (implementation):**
+
+| Topic | Behavior | Where |
+|-------|----------|--------|
+| **AI gateway vs MCP egress** | **LLM** traffic: client → Panda → **`upstream`** / **`routes`** (`forward_to_upstream`). **Corporate REST for tools:** MCP → **`api_gateway.egress`** only. These are **different** hops. | `lib.rs` `forward_to_upstream` vs `EgressClient` from MCP |
+| **When merged MCP tools are injected** | Only for **`POST /v1/chat/completions`**, JSON body, **`mcp` runtime present**, **`mcp.enabled`**, effective advertise **true**, and **no** opt-out header. | `should_advertise_mcp_tools` |
+| **Effective advertise flag** | **`routes[].mcp_advertise_tools`** (longest prefix) overrides **`mcp.advertise_tools`**; if no route matches, **global** applies. | `effective_mcp_advertise_tools_for_path` |
+| **Per-request opt-out** | **`X-Panda-MCP-Advertise: false`** (or **`0`**, **`no`**, **`off`**) | `header_opt_out_mcp_advertise` |
+| **Client-supplied tools** | Non-empty **`tools`** array in JSON → Panda **does not** overwrite with merged MCP list. | `inject_openai_tools_into_chat_body` |
+| **Internal API → LLM, no injection** | Prefer **`mcp_advertise_tools: false`** on the matching **`routes`** row (or global **`advertise_tools: false`** with **no** conflicting longer prefix), and/or the **opt-out header** on each call. | Same as above |
+| **Ingress enabled** | Unmatched paths → **404** (`ingress: no matching route`); must declare prefixes or use ingress **off** for legacy “catch-all” proxy behavior. | `dispatch` + `ingress.rs` |
+
+**Caveats:** **`mcp_advertise_tools: true`** on a route requires **`mcp.enabled: true`** (config validation). Empty **`tools: []`** still allows injection if advertise is effective—use **route**, **header**, or **non-empty client `tools`** to control behavior.
+
+---
+
 ## 1. Three layers (what each part is)
 
 | Layer | YAML / code area | Responsibility |
@@ -172,3 +192,71 @@ Same process can serve **both** `POST /mcp` and `/v1/chat/completions` depending
 ## 8. Optional external edge
 
 Many deployments place **Kong / NGINX / cloud LB** **above** Panda. That hop is **outside** the diagrams here; Panda still sees **one** northbound HTTP peer. Identity may use **`trusted_gateway`** headers — see [`kong_handshake.md`](./kong_handshake.md).
+
+---
+
+## 9. FAQ — traditional REST routing and internal services calling an LLM
+
+### Q1: Does Panda act like a “traditional” API gateway (ingress → arbitrary REST upstream)?
+
+**Partly — it is HTTP reverse proxy + path routing, not a full Kong-style product.**
+
+| Config | What happens |
+|--------|----------------|
+| **`api_gateway.ingress.enabled: false`** | Requests that are not handled by built-in ops/MCP paths fall through to **`forward_to_upstream`**. The upstream base comes from top-level **`upstream`** and optional **`routes`** (longest **`path_prefix`** wins). That path proxies **generic HTTP** to the chosen base — suitable for **traditional REST** backends. See **`RouteConfig`** in config (`path_prefix` + `upstream`). |
+| **`api_gateway.ingress.enabled: true`** | Every request path must **match an ingress row** (static YAML, built-in defaults when `routes` is empty, or control-plane dynamic routes). **Unmatched paths return 404** (`ingress: no matching route`). To expose a **non-MCP** HTTP API through ingress, add a row whose **`backend`** is **`ai`** (the code path that calls **`forward_to_upstream`**) and set **`upstream`** on that row and/or rely on **`routes`** for base resolution. The name **`ai`** refers to the existing **proxy** stack (chat, embeddings, etc.), not “only LLM.” |
+
+So: **yes**, you can route **ingress → REST** without MCP, but with ingress **on** you must **declare** the prefix; with ingress **off**, **`routes`** + **`upstream`** behave like a **lightweight path-based reverse proxy**.
+
+### Q2: Can an internal company API (or backend job) call an LLM **through** Panda’s AI gateway?
+
+**Yes.** Anything that can send HTTP to Panda can use the **same OpenAI-shaped endpoints** the AI gateway implements — typically **`POST /v1/chat/completions`**, **`/v1/embeddings`**, etc. — depending on your **`routes`** and **`upstream`**. That traffic is handled by **`forward_to_upstream`** and the **outbound** stack (TPM, optional semantic cache, adapters, semantic routing, failover, …), **not** by MCP egress.
+
+```mermaid
+flowchart TD
+  S[Internal service or batch job]
+  P[Panda — AI gateway path]
+  L[Upstream LLM API]
+
+  S -->|HTTPS POST /v1/...| P --> L
+```
+
+**Not** the same path as MCP tools: **`api_gateway.egress`** is for **MCP tool** calls **out** to **corporate REST**. **LLM** calls are **northbound clients → Panda → LLM** via **`upstream`** / **`routes`**.
+
+**Summary:** Internal APIs that need the LLM should call **Panda’s listener** on the **chat/completions (or other AI) paths**, with auth/network policy as you would for any client. They do **not** need to go through **`POST /mcp`** unless you design that flow yourself.
+
+### Q3: Does every `POST /v1/chat/completions` through Panda get **all MCP tools** injected?
+
+**No.** Injection is **conditional** (`should_advertise_mcp_tools` in `panda-proxy`). Roughly: MCP must be on, path must be **`/v1/chat/completions`**, JSON body, and the **effective** advertise flag must be true (see below).
+
+| Condition | Meaning |
+|-----------|---------|
+| **`mcp` runtime present** | `McpRuntime` connected (`mcp.enabled` and at least one enabled server). |
+| **`mcp.enabled: true`** | MCP feature on. |
+| **Effective advertise** | Global **`mcp.advertise_tools`**, overridden by the longest matching **`routes[]`** row **`mcp_advertise_tools`** when set. |
+| **No opt-out header** | **`X-Panda-MCP-Advertise: false`** (or **`0`**, **`no`**, **`off`**) disables injection for that single request. |
+| **`POST`**, path **`/v1/chat/completions`**, JSON **`Content-Type`** | Other paths (e.g. **`/v1/embeddings`**) do not use this inject path. |
+
+**Per-route (`routes[].mcp_advertise_tools`):** Same longest-prefix rules as **`upstream`**. Lets one process mix **plain AI proxy** prefixes ( **`mcp_advertise_tools: false`** ) and **MCP-rich** chat ( **`true`** ). Setting **`mcp_advertise_tools: true`** on a route requires **`mcp.enabled: true`** (config validation).
+
+**Per-request header:** **`X-Panda-MCP-Advertise: false`** when route/global would inject but this call must not (e.g. batch).
+
+**Client `tools` array:** If the body already has a **non-empty** `tools` array, Panda **does not** replace it. **`"tools": []`** does not block injection unless route/header disables it.
+
+**Example:**
+
+```yaml
+mcp:
+  enabled: true
+  advertise_tools: false
+  servers: [ ... ]
+routes:
+  - path_prefix: /v1/internal-chat
+    upstream: "http://internal-llm"
+    mcp_advertise_tools: false
+  - path_prefix: /v1/chat
+    upstream: "https://api.openai.com/v1"
+    mcp_advertise_tools: true
+```
+
+Both prefixes match **`/v1/chat/completions`**; the **longer** matching prefix wins (`/v1/chat` is longer than `/v1` if both exist—order routes so the intended prefix wins; duplicate path_prefixes are rejected at load).

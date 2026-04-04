@@ -110,6 +110,8 @@ upstream: "http://127.0.0.1:5023"
 #     semantic_cache: true
 #     type: openai
 #     mcp_servers: ["local-db"]
+#     # Optional: override global mcp.advertise_tools for POST /v1/chat/completions on this prefix.
+#     # mcp_advertise_tools: false   # plain LLM proxy without merging MCP tool list
 #   - path_prefix: /api/v1/users
 #     upstream: "http://user-service.internal:8080"
 #     methods: [GET, POST, PUT, PATCH, DELETE]
