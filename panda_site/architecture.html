@@ -66,11 +66,11 @@
                 <div class="mermaid-diagram rounded-lg shadow-lg">
                     <div class="mermaid">
 flowchart TD
-  C["Clients and Agent SDKs (core)"]
+  C["Clients and Agent SDKs"]
 
-  subgraph EDGE["Ingress — core: pick a deployment pattern"]
-    E1["Standalone: clients → Panda (core)"]
-    E2["With KONG or edge: AI routes → Panda (core)"]
+  subgraph EDGE["Ingress — Deployment Patterns"]
+    E1["Standalone: clients → Panda"]
+    E2["With KONG or edge: AI routes → Panda"]
   end
 
   C --> E1
@@ -79,22 +79,21 @@ flowchart TD
   E1 --> P
   E2 --> P
 
-  subgraph PANDA["Panda Gateway data plane"]
-    I["Ingress: auth & routing (core)"]
-    S["Safety & policy (core)\nJWT/JWKS, prompt safety, PII, Wasm hooks"]
-    X["AI control (core + optional enterprise)\nTPM, semantic cache, context\nenterprise: hierarchical budgets"]
-    A["Adapter & streaming (core + optional enterprise)\nOpenAI ingress, SSE guards\nenterprise: model failover / parity"]
-    M["MCP orchestration (core)"]
-    I --> S --> X --> A --> M
+  subgraph PANDA["Panda Gateway"]
+    I["Ingress (Mouth)\nAccept connections, normalize protocols"]
+    S["Shield (Bamboo)\nSecurity, PII masking, Identity"]
+    X["Brain (Intelligence)\nIntent routing, semantic cache, MCP"]
+    A["Egress (Hands)\nAdapters, streaming, backends"]
+    I --> S --> X --> A
   end
 
-  P["Panda HTTP listener (core)"] --> I
+  P["Panda HTTP Listener"] --> I
 
-  subgraph STATEFUL["State & observability"]
-    R["Redis (optional)\ncore optional: TPM, semantic cache\nenterprise: hierarchical budgets"]
-    PM["Prometheus (core)\nscrape /metrics"]
-    OT["OTLP (core)\ntraces to your collector"]
-    OPS["Ops HTTP (core)\n/health, /ready, /tpm/status, /mcp/status"]
+  subgraph STATEFUL["State & Observability"]
+    R["Redis (optional)\nTPM, semantic cache"]
+    PM["Prometheus\nMetrics"]
+    OT["OpenTelemetry\nTraces"]
+    OPS["Ops HTTP\n/health, /ready, /mcp/status"]
   end
 
   X <--> R
@@ -102,11 +101,11 @@ flowchart TD
   P --> OT
   P --> OPS
 
-  subgraph PROVIDERS["Model providers (core: single upstream)\nenterprise: ordered failover chain"]
+  subgraph PROVIDERS["Model Providers"]
     OAI["OpenAI / Azure OpenAI"]
-    DS["DeepSeek / Qwen / MiniMax (OpenAI-compatible)"]
-    ANT["Anthropic (adapter or failover hop)"]
-    LOC["Local: Ollama / vLLM / TGI / compatible"]
+    DS["DeepSeek / Qwen / MiniMax"]
+    ANT["Anthropic"]
+    LOC["Local: Ollama / vLLM / TGI"]
   end
 
   A --> OAI
@@ -114,7 +113,7 @@ flowchart TD
   A --> ANT
   A --> LOC
 
-  M --> TOOLS["MCP tool servers (core)\nPostgres, Slack/Discord, RAG, custom"]
+  X --> TOOLS["MCP Tool Servers\nPostgres, Slack, RAG, custom"]
                     </div>
                 </div>
             </div>
@@ -259,6 +258,15 @@ sequenceDiagram
                         <div class="card-body">
                             <h4 class="card-title">panda-proxy</h4>
                             <p class="card-text">Async HTTP server (Tokio + Hyper); streaming reverse proxy; KONG handshake; in-memory TPM hint.</p>
+                            <ul class="list-unstyled mt-2">
+                                <li>• api_gateway/ingress.rs - Ingress pipeline, route table</li>
+                                <li>• api_gateway/egress.rs - Egress client, pools, allowlist</li>
+                                <li>• inbound/mcp.rs - MCP runtime</li>
+                                <li>• inbound/mcp_stdio.rs - Stdio MCP client</li>
+                                <li>• inbound/mcp_http_tool.rs - HTTP tool client</li>
+                                <li>• inbound/mcp_http_remote.rs - Remote MCP client</li>
+                                <li>• inbound/mcp_http_ingress.rs - MCP HTTP ingress</li>
+                            </ul>
                         </div>
                     </div>
                 </div>
@@ -275,22 +283,6 @@ sequenceDiagram
                         <div class="card-body">
                             <h4 class="card-title">panda-wasm</h4>
                             <p class="card-text">Wasmtime-based plugin host and guest ABI for extensibility.</p>
-                        </div>
-                    </div>
-                </div>
-                <div class="col-md-4 mb-6">
-                    <div class="card h-100">
-                        <div class="card-body">
-                            <h4 class="card-title">panda-pdk</h4>
-                            <p class="card-text">Plugin Development Kit for creating Wasm plugins in Rust and Go.</p>
-                        </div>
-                    </div>
-                </div>
-                <div class="col-md-4 mb-6">
-                    <div class="card h-100">
-                        <div class="card-body">
-                            <h4 class="card-title">wasm-plugin-sample</h4>
-                            <p class="card-text">Example Wasm plugins demonstrating different use cases.</p>
                         </div>
                     </div>
                 </div>

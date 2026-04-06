@@ -51,7 +51,7 @@
                 <div class="col-md-6">
                     <h1 class="display-4">Panda AI Gateway</h1>
                     <p class="lead">A high-performance, stateless, intent-aware gateway for LLMs and AI services</p>
-                    <p class="mt-4">Panda is a Rust-based AI gateway that sits between your clients and model providers, adding policy, identity, budgets, MCP tools, caching, safety, and observability in one place.</p>
+                    <p class="mt-4">Panda is a Rust-based unified gateway that combines API gateway capabilities with Model Context Protocol (MCP) tools orchestration. It sits between your clients and model providers, adding policy, identity, budgets, MCP tools, caching, safety, and observability in one place.</p>
                     <div class="mt-5">
                         <a href="quickstart.html" class="btn btn-primary btn-lg">Get Started</a>
                         <a href="architecture.html" class="btn btn-outline-light btn-lg ms-3">Learn More</a>
@@ -68,9 +68,9 @@ flowchart TD
     P --> S[Security]
     
     subgraph Panda[Panda AI Gateway]
-        I[Ingress] --> Sh[Shield]
-        Sh --> Br[Brain]
-        Br --> H[Hands]
+        I[Ingress - Mouth] --> Sh[Shield - Bamboo]
+        Sh --> Br[Brain - Intelligence]
+        Br --> H[Hands - Egress]
     end
     
     classDef default fill:#e1f5fe,stroke:#0288d1,stroke-width:2px;
@@ -96,7 +96,7 @@ flowchart TD
                                 <i class="bi bi-shield-lock" style="font-size: 48px;"></i>
                             </div>
                             <h3 class="card-title">Security & Safety</h3>
-                            <p class="card-text">JWT/JWKS authentication, prompt safety, PII scrubbing, and Wasm plugins for custom security policies.</p>
+                            <p class="card-text">JWT/JWKS authentication, prompt injection firewall, PII masking, Wasm plugins for custom security policies, and proof of intent for tool calls.</p>
                         </div>
                     </div>
                 </div>
@@ -107,7 +107,7 @@ flowchart TD
                                 <i class="bi bi-wallet2" style="font-size: 48px;"></i>
                             </div>
                             <h3 class="card-title">Cost Control</h3>
-                            <p class="card-text">TPM-style token budgets, semantic caching, and detailed usage metrics to optimize AI spending.</p>
+                            <p class="card-text">TPM-style token budgets, semantic caching, detailed usage metrics, and optimized streaming to reduce AI spending.</p>
                         </div>
                     </div>
                 </div>
@@ -118,7 +118,7 @@ flowchart TD
                                 <i class="bi bi-grid-3x3" style="font-size: 48px;"></i>
                             </div>
                             <h3 class="card-title">MCP Tools</h3>
-                            <p class="card-text">Model Context Protocol for tool orchestration, enabling agents to use external services seamlessly.</p>
+                            <p class="card-text">Model Context Protocol for tool orchestration, tool discovery, execution, aggregation, and seamless integration with external services.</p>
                         </div>
                     </div>
                 </div>
@@ -129,7 +129,7 @@ flowchart TD
                                 <i class="bi bi-graph-up" style="font-size: 48px;"></i>
                             </div>
                             <h3 class="card-title">Observability</h3>
-                            <p class="card-text">Prometheus metrics, OpenTelemetry tracing, and structured logs for comprehensive monitoring.</p>
+                            <p class="card-text">Prometheus metrics, OpenTelemetry tracing, structured logs, and intent-aware audit logs for comprehensive monitoring.</p>
                         </div>
                     </div>
                 </div>
@@ -140,7 +140,7 @@ flowchart TD
                                 <i class="bi bi-puzzle" style="font-size: 48px;"></i>
                             </div>
                             <h3 class="card-title">Extensibility</h3>
-                            <p class="card-text">Wasm plugins for custom policy, transforms, and integrations without forking the core.</p>
+                            <p class="card-text">Wasm plugins for custom policy, transforms, and integrations without forking the core, supporting Rust and Go (via TinyGo).</p>
                         </div>
                     </div>
                 </div>
@@ -151,7 +151,40 @@ flowchart TD
                                 <i class="bi bi-lightning-charge" style="font-size: 48px;"></i>
                             </div>
                             <h3 class="card-title">Performance</h3>
-                            <p class="card-text">Rust-based implementation with async I/O, minimal copying, and optimized streaming paths.</p>
+                            <p class="card-text">Rust-based implementation with async I/O, minimal copying, optimized streaming paths, and horizontal scalability.</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-4 mb-6">
+                    <div class="card h-100">
+                        <div class="card-body">
+                            <div class="icon-container mb-4">
+                                <i class="bi bi-router" style="font-size: 48px;"></i>
+                            </div>
+                            <h3 class="card-title">API Gateway</h3>
+                            <p class="card-text">Ingress routing, egress client, load balancing, rate limits, TLS management, and portal integration for comprehensive API management.</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-4 mb-6">
+                    <div class="card h-100">
+                        <div class="card-body">
+                            <div class="icon-container mb-4">
+                                <i class="bi bi-brain" style="font-size: 48px;"></i>
+                            </div>
+                            <h3 class="card-title">Intent-Aware</h3>
+                            <p class="card-text">Intent routing, semantic understanding, and context-aware decisions for optimal model selection and tool use.</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-4 mb-6">
+                    <div class="card h-100">
+                        <div class="card-body">
+                            <div class="icon-container mb-4">
+                                <i class="bi bi-server" style="font-size: 48px;"></i>
+                            </div>
+                            <h3 class="card-title">Deployment Flexibility</h3>
+                            <p class="card-text">Standalone, sidecar, or Kubernetes deployment models with GitOps-friendly configuration and optional Redis for shared state.</p>
                         </div>
                     </div>
                 </div>
@@ -168,11 +201,11 @@ flowchart TD
                     <div class="mermaid-diagram rounded-lg shadow-lg">
                         <div class="mermaid">
 flowchart TD
-  C["Clients and Agent SDKs (core)"]
+  C["Clients and Agent SDKs"]
 
-  subgraph EDGE["Ingress — core: pick a deployment pattern"]
-    E1["Standalone: clients → Panda (core)"]
-    E2["With KONG or edge: AI routes → Panda (core)"]
+  subgraph EDGE["Ingress — Deployment Patterns"]
+    E1["Standalone: clients → Panda"]
+    E2["With KONG or edge: AI routes → Panda"]
   end
 
   C --> E1
@@ -181,22 +214,21 @@ flowchart TD
   E1 --> P
   E2 --> P
 
-  subgraph PANDA["Panda Gateway data plane"]
-    I["Ingress: auth & routing (core)"]
-    S["Safety & policy (core)\nJWT/JWKS, prompt safety, PII, Wasm hooks"]
-    X["AI control (core + optional enterprise)\nTPM, semantic cache, context\nenterprise: hierarchical budgets"]
-    A["Adapter & streaming (core + optional enterprise)\nOpenAI ingress, SSE guards\nenterprise: model failover / parity"]
-    M["MCP orchestration (core)"]
-    I --> S --> X --> A --> M
+  subgraph PANDA["Panda Gateway"]
+    I["Ingress (Mouth)\nAccept connections, normalize protocols"]
+    S["Shield (Bamboo)\nSecurity, PII masking, Identity"]
+    X["Brain (Intelligence)\nIntent routing, semantic cache, MCP"]
+    A["Egress (Hands)\nAdapters, streaming, backends"]
+    I --> S --> X --> A
   end
 
-  P["Panda HTTP listener (core)"] --> I
+  P["Panda HTTP Listener"] --> I
 
-  subgraph STATEFUL["State & observability"]
-    R["Redis (optional)\ncore optional: TPM, semantic cache\nenterprise: hierarchical budgets"]
-    PM["Prometheus (core)\nscrape /metrics"]
-    OT["OTLP (core)\ntraces to your collector"]
-    OPS["Ops HTTP (core)\n/health, /ready, /tpm/status, /mcp/status"]
+  subgraph STATEFUL["State & Observability"]
+    R["Redis (optional)\nTPM, semantic cache"]
+    PM["Prometheus\nMetrics"]
+    OT["OpenTelemetry\nTraces"]
+    OPS["Ops HTTP\n/health, /ready, /mcp/status"]
   end
 
   X <--> R
@@ -204,11 +236,11 @@ flowchart TD
   P --> OT
   P --> OPS
 
-  subgraph PROVIDERS["Model providers (core: single upstream)\nenterprise: ordered failover chain"]
+  subgraph PROVIDERS["Model Providers"]
     OAI["OpenAI / Azure OpenAI"]
-    DS["DeepSeek / Qwen / MiniMax (OpenAI-compatible)"]
-    ANT["Anthropic (adapter or failover hop)"]
-    LOC["Local: Ollama / vLLM / TGI / compatible"]
+    DS["DeepSeek / Qwen / MiniMax"]
+    ANT["Anthropic"]
+    LOC["Local: Ollama / vLLM / TGI"]
   end
 
   A --> OAI
@@ -216,7 +248,7 @@ flowchart TD
   A --> ANT
   A --> LOC
 
-  M --> TOOLS["MCP tool servers (core)\nPostgres, Slack/Discord, RAG, custom"]
+  X --> TOOLS["MCP Tool Servers\nPostgres, Slack, RAG, custom"]
                         </div>
                     </div>
                 </div>

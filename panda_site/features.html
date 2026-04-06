@@ -78,6 +78,21 @@
                 <div class="col-md-6 mb-6">
                     <div class="card h-100">
                         <div class="card-body">
+                            <h3 class="card-title">API Gateway</h3>
+                            <p class="card-text">Comprehensive API gateway capabilities for managing AI and HTTP traffic.</p>
+                            <ul class="list-unstyled mt-4">
+                                <li class="mb-2">• Ingress routing with path prefix matching</li>
+                                <li class="mb-2">• Egress client with load balancing and allowlists</li>
+                                <li class="mb-2">• Rate limits with optional Redis integration</li>
+                                <li class="mb-2">• TLS management with certificate reload</li>
+                                <li class="mb-2">• Portal integration with OpenAPI documentation</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6 mb-6">
+                    <div class="card h-100">
+                        <div class="card-body">
                             <h3 class="card-title">Token-Based Budgeting (TPM)</h3>
                             <p class="card-text">Control costs with token-per-minute (TPM) budgeting and limits.</p>
                             <ul class="list-unstyled mt-4">
@@ -109,10 +124,11 @@
                             <h3 class="card-title">MCP Orchestration</h3>
                             <p class="card-text">Model Context Protocol for tool orchestration and agent capabilities.</p>
                             <ul class="list-unstyled mt-4">
-                                <li class="mb-2">• Tool call interception and execution</li>
-                                <li class="mb-2">• Multi-round follow-ups</li>
-                                <li class="mb-2">• Streaming tool responses</li>
-                                <li class="mb-2">• Unified tool surface for LLMs</li>
+                                <li class="mb-2">• Tool discovery and aggregation</li>
+                                <li class="mb-2">• Tool call execution with timeout and payload bounds</li>
+                                <li class="mb-2">• OpenAI tool mapping with mcp_{server}_{tool} convention</li>
+                                <li class="mb-2">• Multi-round follow-ups with round limits</li>
+                                <li class="mb-2">• Support for stdio, HTTP tool, and remote MCP servers</li>
                             </ul>
                         </div>
                     </div>
@@ -124,9 +140,10 @@
                             <p class="card-text">Comprehensive security features to protect your AI systems.</p>
                             <ul class="list-unstyled mt-4">
                                 <li class="mb-2">• JWT/JWKS authentication</li>
-                                <li class="mb-2">• Prompt safety and injection protection</li>
+                                <li class="mb-2">• Prompt injection firewall</li>
                                 <li class="mb-2">• PII detection and redaction</li>
                                 <li class="mb-2">• Wasm plugins for custom security policies</li>
+                                <li class="mb-2">• Proof of intent for tool calls</li>
                             </ul>
                         </div>
                     </div>
@@ -141,6 +158,21 @@
                                 <li class="mb-2">• OpenTelemetry tracing</li>
                                 <li class="mb-2">• Structured JSON logs</li>
                                 <li class="mb-2">• Health and readiness endpoints</li>
+                                <li class="mb-2">• /mcp/status endpoint for MCP health</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6 mb-6">
+                    <div class="card h-100">
+                        <div class="card-body">
+                            <h3 class="card-title">Intent-Aware</h3>
+                            <p class="card-text">Security and routing that reason about meaning, not only paths.</p>
+                            <ul class="list-unstyled mt-4">
+                                <li class="mb-2">• Intent routing based on prompt classification</li>
+                                <li class="mb-2">• Semantic understanding for better model selection</li>
+                                <li class="mb-2">• Context-aware decisions for tool use</li>
+                                <li class="mb-2">• Embedded ONNX model for prompt classification</li>
                             </ul>
                         </div>
                     </div>
@@ -324,6 +356,11 @@
                         <td>AI-specific protocols</td>
                         <td>✓ OpenAI-compatible, SSE streaming</td>
                         <td>✗ Limited support</td>
+                    </tr>
+                    <tr>
+                        <td>API gateway capabilities</td>
+                        <td>✓ Ingress routing, egress client, rate limits</td>
+                        <td>✓ Basic capabilities</td>
                     </tr>
                     <tr>
                         <td>Token-based budgeting</td>

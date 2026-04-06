@@ -59,15 +59,17 @@
     <section class="mcp-overview py-12">
         <div class="container">
             <h2 class="mb-6">What is MCP?</h2>
-            <p>The Model Context Protocol (MCP) is Panda's mechanism for orchestrating tool calls between AI models and external services. It allows LLMs to use tools to perform actions, access data, and interact with external systems.</p>
+            <p>The Model Context Protocol (MCP) is Panda's mechanism for orchestrating tool calls between AI models and external services. It allows LLMs to use tools to perform actions, access data, and interact with external systems. MCP is integrated directly into the Panda gateway, providing a unified tool surface for AI agents.</p>
             
             <div class="row">
                 <div class="col-md-6 mb-6">
                     <h3>Key Benefits</h3>
                     <ul class="list-unstyled">
                         <li class="mb-2">• <strong>Unified tool surface:</strong> Expose multiple tools to LLMs through a single interface</li>
-                        <li class="mb-2">• <strong>Tool call interception:</strong> Panda intercepts tool calls from models and routes them to the appropriate servers</li>
-                        <li class="mb-2">• <strong>Multi-round follow-ups:</strong> Handle complex tool-use scenarios with multiple rounds of interaction</li>
+                        <li class="mb-2">• <strong>Tool discovery:</strong> Automatic discovery and aggregation of tools from multiple servers</li>
+                        <li class="mb-2">• <strong>Tool call execution:</strong> Dispatch tool calls to the correct servers with timeout and payload bounds</li>
+                        <li class="mb-2">• <strong>OpenAI mapping:</strong> Automatically map MCP tools to OpenAI function calling format</li>
+                        <li class="mb-2">• <strong>Round limits:</strong> Enforce global and per-request round limits for tool use</li>
                         <li class="mb-2">• <strong>Streaming support:</strong> Support for streaming tool responses</li>
                         <li class="mb-2">• <strong>Security:</strong> Validate tool calls against user intent and permissions</li>
                     </ul>
@@ -76,10 +78,10 @@
                     <h3>How It Works</h3>
                     <ol class="list-unstyled">
                         <li class="mb-2">1. Client sends a request to Panda</li>
-                        <li class="mb-2">2. Panda forwards the request to the LLM</li>
-                        <li class="mb-2">3. LLM responds with tool calls</li>
-                        <li class="mb-2">4. Panda intercepts the tool calls</li>
-                        <li class="mb-2">5. Panda executes the tool calls against the appropriate servers</li>
+                        <li class="mb-2">2. Panda aggregates tools from all configured MCP servers</li>
+                        <li class="mb-2">3. Panda forwards the request with available tools to the LLM</li>
+                        <li class="mb-2">4. LLM responds with tool calls</li>
+                        <li class="mb-2">5. Panda intercepts and executes the tool calls</li>
                         <li class="mb-2">6. Panda sends the tool results back to the LLM</li>
                         <li class="mb-2">7. LLM generates a final response based on the tool results</li>
                         <li class="mb-2">8. Panda returns the response to the client</li>
@@ -95,20 +97,42 @@
             <h2 class="text-center mb-8">MCP Architecture</h2>
             
             <div class="mb-8">
-                <div class="placeholder-image mcp-architecture" data-text="MCP Architecture\nClient → LLM → Panda → Tool Servers"></div>
+                <div class="mermaid-diagram rounded-lg shadow-lg">
+                    <div class="mermaid">
+flowchart TD
+    C[Client] --> P[Panda AI Gateway]
+    P --> LLM[LLM Provider]
+    P --> M[MCP Runtime]
+    M --> TS1[Stdio MCP Server]
+    M --> TS2[HTTP Tool Server]
+    M --> TS3[Remote MCP Server]
+    
+    subgraph MCP[MCP Gateway]
+        M
+        TS1
+        TS2
+        TS3
+    end
+    
+    classDef default fill:#e1f5fe,stroke:#0288d1,stroke-width:2px;
+    classDef highlight fill:#0288d1,stroke:#01579b,stroke-width:2px,color:white;
+    
+    class P,M highlight;
+                    </div>
+                </div>
             </div>
             
             <div class="row">
                 <div class="col-md-4 mb-6">
                     <div class="card h-100">
                         <div class="card-body">
-                            <h3 class="card-title">MCP Host</h3>
-                            <p class="card-text">The MCP host in Panda manages connections to tool servers and handles tool call orchestration.</p>
+                            <h3 class="card-title">MCP Runtime</h3>
+                            <p class="card-text">The MCP runtime in Panda manages connections to tool servers and handles tool call orchestration.</p>
                             <ul class="list-unstyled mt-4">
-                                <li class="mb-2">• Maintains connections to tool servers</li>
-                                <li class="mb-2">• Routes tool calls to the appropriate server</li>
-                                <li class="mb-2">• Handles streaming tool responses</li>
-                                <li class="mb-2">• Manages tool call timeouts and retries</li>
+                                <li class="mb-2">• Holds HashMap of Arc&lt;dyn McpClient&gt;</li>
+                                <li class="mb-2">• Implements list_all_tools and call_tool methods</li>
+                                <li class="mb-2">• Manages tool call timeouts and payload bounds</li>
+                                <li class="mb-2">• Enforces round limits for tool use</li>
                             </ul>
                         </div>
                     </div>
@@ -116,13 +140,12 @@
                 <div class="col-md-4 mb-6">
                     <div class="card h-100">
                         <div class="card-body">
-                            <h3 class="card-title">Tool Servers</h3>
-                            <p class="card-text">Tool servers implement specific functionality that LLMs can use.</p>
+                            <h3 class="card-title">MCP Clients</h3>
+                            <p class="card-text">Different client implementations for various tool server types.</p>
                             <ul class="list-unstyled mt-4">
-                                <li class="mb-2">• Expose tools via stdio or SSE</li>
-                                <li class="mb-2">• Process tool calls and return results</li>
-                                <li class="mb-2">• Can be written in any language</li>
-                                <li class="mb-2">• Can access databases, APIs, and other services</li>
+                                <li class="mb-2">• <strong>StdioMcpClient:</strong> JSON-RPC over stdio</li>
+                                <li class="mb-2">• <strong>McpHttpRemoteClient:</strong> Remote MCP over HTTP</li>
+                                <li class="mb-2">• <strong>HttpToolClient:</strong> Declarative REST tools via egress</li>
                             </ul>
                         </div>
                     </div>
@@ -130,13 +153,13 @@
                 <div class="col-md-4 mb-6">
                     <div class="card h-100">
                         <div class="card-body">
-                            <h3 class="card-title">Tool Registry</h3>
-                            <p class="card-text">The tool registry contains pre-built tool servers for common use cases.</p>
+                            <h3 class="card-title">OpenAI Mapping</h3>
+                            <p class="card-text">Maps MCP tools to OpenAI function calling format.</p>
                             <ul class="list-unstyled mt-4">
-                                <li class="mb-2">• Postgres integration</li>
-                                <li class="mb-2">• Slack and Discord notifications</li>
-                                <li class="mb-2">• Local RAG (Retrieval-Augmented Generation)</li>
-                                <li class="mb-2">• GitHub issues management</li>
+                                <li class="mb-2">• Converts MCP tools to OpenAI tools[]</li>
+                                <li class="mb-2">• Uses mcp_{server}_{tool} naming convention</li>
+                                <li class="mb-2">• Handles function name sanitization</li>
+                                <li class="mb-2">• Supports structured tool results</li>
                             </ul>
                         </div>
                     </div>
@@ -158,27 +181,30 @@
   enabled: true
   # Tool servers
   servers:
-    - name: "postgres"
-      type: "stdio"
-      command: ["./panda-mcp-registry/postgres/server.py"]
-      env:
-        - name: "DATABASE_URL"
-          value: "postgres://user:pass@localhost:5432/db"
-    - name: "slack"
-      type: "stdio"
-      command: ["./panda-mcp-registry/slack-discord/server.py"]
-      env:
-        - name: "SLACK_TOKEN"
-          value: "your-slack-token"
+    - name: "stdio_server"
+      enabled: true
+      command: ["./path/to/server.py"]
+      args: ["--option", "value"]
+    - name: "http_tool_server"
+      enabled: true
+      http_tool:
+        egress_profile: internal_rest
+        base_path: /v1/api
+  # Advanced settings
+  fail_open: true
+  tool_timeout_ms: 30000
+  max_tool_payload_bytes: 1048576
+  max_tool_rounds: 10
+  advertise_tools: true
   # Stream probe settings
   stream_probe_bytes: 16384
   probe_window_seconds: 60</code></pre>
                 </div>
                 <div class="col-md-6 mb-6">
-                    <h3>Tool Server Types</h3>
+                    <h3>Tool Execution Types</h3>
                     <ul class="list-unstyled">
                         <li class="mb-3">
-                            <strong>stdio:</strong> Tool server communicates via standard input/output
+                            <strong>Stdio MCP:</strong> Tool server communicates via standard input/output
                             <pre><code># Example stdio tool server
 #!/usr/bin/env python3
 import json
@@ -201,7 +227,10 @@ while True:
     sys.stdout.flush()</code></pre>
                         </li>
                         <li class="mb-3">
-                            <strong>sse:</strong> Tool server communicates via Server-Sent Events over HTTP
+                            <strong>HTTP Tool (REST):</strong> Declarative REST tools via API gateway egress
+                        </li>
+                        <li class="mb-3">
+                            <strong>Remote MCP:</strong> Remote MCP server via HTTP JSON-RPC
                         </li>
                     </ul>
                 </div>
