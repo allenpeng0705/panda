@@ -33,3 +33,4 @@ Panda does not ship a single numeric SLO contract in YAML; operators define targ
 
 - [`../implementation_plan.md`](../implementation_plan.md) — Phase 5 plan and refine loop  
 - [`../deployment.md`](../deployment.md) — deploy patterns  
+- [`ingress_gateway_slo.md`](./ingress_gateway_slo.md) — **API gateway ingress** RPS metrics, PromQL, Grafana import, and **F2** evidence record (complements this runbook’s chat/SSE focus)

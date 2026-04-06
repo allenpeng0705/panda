@@ -165,7 +165,22 @@ Grouped by concern. All use **`test_proxy_state`** + **`dispatch`** unless noted
 | Location | Role |
 |----------|------|
 | `crates/panda-proxy/src/api_gateway/ingress.rs` | Unit tests: ingress table matching, methods, defaults |
-| `crates/panda-proxy/src/api_gateway/egress.rs` | Egress URL resolution, allowlist, retries (see tests in file) |
+| `crates/panda-proxy/src/api_gateway/egress.rs` | Egress URL resolution, allowlist, retries, **RPS** (global + **`per_route`** / **`route_label`**, local vs Redis), **mTLS**, **Prometheus** (`panda_egress_rps_total`, …); see table below |
+
+### Egress client tests — `api_gateway/egress.rs`
+
+| Test | What is verified | Flow |
+|------|------------------|------|
+| `integration_hits_mock_upstream_when_allowed` | Relative URL + allowlist + mock **200** | **EG** → mock HTTP |
+| `corporate_pool_round_robin_two_bases` | **`pool_bases`** round-robin | **EG** ×2 |
+| `allowlist_denies_wrong_path_prefix` | Path allowlist | **EG** → denied before connect |
+| `retries_on_503_then_succeeds` / `retries_on_429_then_succeeds` | Retry policy | **EG** |
+| `default_headers_sent_to_upstream` / `egress_profile_merges_headers_request_wins_on_dup` | Header merge | **EG** |
+| `unknown_egress_profile_is_misconfigured` | Unknown **`egress_profile`** | **EG** → error |
+| `integration_https_mtls_presents_client_cert_to_upstream` | mTLS client cert to upstream | **EG** (HTTPS mock) |
+| `rate_limit_max_rps_denies_excess_requests_in_same_second` | Global **`max_rps`** (local window) + **`panda_egress_rps_total`** | **EG** only |
+| `rate_limit_per_route_rps_metrics_scope` | **`per_route`** cap + Prometheus **`scope=per_route`** | **EG** only |
+| `rate_limit_max_in_flight_blocks_second_concurrent_call` | **`max_in_flight`** semaphore | **EG** concurrent |
 | `crates/panda-proxy/src/api_gateway/control_plane_store.rs` | Store async tests |
 
 ---
@@ -175,5 +190,7 @@ Grouped by concern. All use **`test_proxy_state`** + **`dispatch`** unless noted
 - [`testing_mcp_api_gateway.md`](./testing_mcp_api_gateway.md) — how to run tests, mock contracts, tool naming on ingress.
 - [`panda_data_flow.md`](./panda_data_flow.md) — dispatch order and ingress vs `forward_to_upstream`.
 - [`panda_scenarios_summary.md`](./panda_scenarios_summary.md) — scenario matrix (product view).
+- [`runbooks/ingress_gateway_slo.md`](./runbooks/ingress_gateway_slo.md) — **F2** ingress SLO metrics, PromQL, and GA evidence template.
+- [`security_review_gate.md`](./security_review_gate.md) — **F3** formal security review checklist and sign-off.
 
 When you add a **new** integration test, add one row to the matching table here (or a short subsection) so the catalog stays truthful.

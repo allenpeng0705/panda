@@ -3,7 +3,7 @@
 Panda is organized around **two product targets**:
 
 1. **Inbound — MCP gateway with API gateway (all-in-one):** Panda includes **its own API gateway** as a first-class component. It can run **in front of** the **MCP gateway** (ingress: TLS, routing, auth into MCP/chat) **or behind** the MCP gateway (egress: outbound HTTP toward the **corporate** API gateway and internal REST). **External** Kong/NGINX may still wrap the whole product. **Panda** hosts MCP tool hosting, discovery, execution, and multi-round loops. **Why:** one product for AI ingress, MCP, and governed HTTP egress. Flows: [`panda_data_flow.md`](./panda_data_flow.md), design: [`design_mcp_control_plane_rust.md`](./design_mcp_control_plane_rust.md) §4.
-2. **Outbound — AI gateway:** OpenAI-shaped traffic to upstream LLMs (adapters, streaming, budgets, cache, routing, failover). **Why:** **govern organizational AI use**—who hits which models, **spend and token budgets**, routing, and observable usage.
+2. **Outbound — AI gateway:** Governed traffic to **upstream LLMs and hosted model APIs**—not limited to **OpenAI-compatible** bases alone. **Today:** OpenAI-shaped chat plus **Anthropic** adapter paths; **direction:** **maximum provider coverage** via native request/response adapters (e.g. cloud vendor APIs), passthrough where a provider already speaks OpenAI, and the same **budgets, cache, routing, and failover** across them. **Why:** **govern organizational AI use**—who hits which models, **spend and token budgets**, routing, and observable usage regardless of wire format.
 
 Everything else is **cross-cutting** (identity, ops, policy) or **enterprise** (budget hierarchy, console SSO, model failover chains).
 
@@ -34,7 +34,7 @@ Everything else is **cross-cutting** (identity, ops, policy) or **enterprise** (
 
 ## 2. Outbound — AI gateway
 
-**Goal:** **OpenAI-compatible** ingress to **upstream LLMs** (chat, streaming SSE, embeddings, etc.) with **token budgets**, **semantic cache**, **adapters**, optional **semantic upstream routing**, and **model failover**.
+**Goal:** A **stable client surface** (OpenAI-compatible **`/v1/chat/completions`** and related paths) with **upstream diversity**: route to **many providers**—OpenAI-compatible servers, **Anthropic**-native APIs today, and **additional native adapters** over time—using the same **token budgets**, **semantic cache**, **adapters**, **semantic upstream routing**, and **model failover**. See **`docs/ai_routing_strategy.md` §1.1** (Multi-provider coverage).
 
 | Area | `panda-proxy` layout | Primary `panda.yaml` blocks |
 |------|----------------------|----------------------------|

@@ -2,7 +2,7 @@
 
 **Purpose:** Canonical **traffic shapes** for Panda’s **all-in-one** design: a **first-class Panda API gateway** that can sit **in front of** the MCP gateway (ingress) **or behind** it (egress toward the corporate API gateway and REST). External L7 (Kong, etc.) remains optional **outside** the whole product.
 
-**See also:** [`panda_scenarios_summary.md`](./panda_scenarios_summary.md) (scenario matrix + top-down diagrams: MCP + API gateway + AI gateway), [`testing_scenarios_and_data_flows.md`](./testing_scenarios_and_data_flows.md) (which tests exercise which dispatch stages), [`design_api_gateway_and_mcp_gateway.md`](./design_api_gateway_and_mcp_gateway.md) (detailed design), [`implementation_plan_mcp_api_gateway.md`](./implementation_plan_mcp_api_gateway.md) (build plan), [`design_mcp_control_plane_rust.md`](./design_mcp_control_plane_rust.md) §4, [`architecture_two_pillars.md`](./architecture_two_pillars.md), [`kong_handshake.md`](./kong_handshake.md) (when an **additional** edge gateway wraps Panda). **Per-request order of handlers** (`listen` → `dispatch` → optional ingress → `forward_to_upstream`): section **Request dispatch** below.
+**See also:** [`panda_scenarios_summary.md`](./panda_scenarios_summary.md) (scenario matrix + top-down diagrams: MCP + API gateway + AI gateway), [`testing_scenarios_and_data_flows.md`](./testing_scenarios_and_data_flows.md) (which tests exercise which dispatch stages), [`openai_api_surface_coverage.md`](./openai_api_surface_coverage.md) (chat vs generic `/v1/*` proxy, Anthropic, Realtime gaps), [`design_api_gateway_and_mcp_gateway.md`](./design_api_gateway_and_mcp_gateway.md) (detailed design), [`implementation_plan_mcp_api_gateway.md`](./implementation_plan_mcp_api_gateway.md) (build plan), [`design_mcp_control_plane_rust.md`](./design_mcp_control_plane_rust.md) §4, [`architecture_two_pillars.md`](./architecture_two_pillars.md), [`kong_handshake.md`](./kong_handshake.md) (when an **additional** edge gateway wraps Panda). **Per-request order of handlers** (`listen` → `dispatch` → optional ingress → `forward_to_upstream`): section **Request dispatch** below.
 
 ---
 
@@ -177,6 +177,21 @@ flowchart LR
   PAGE --> CORP[Corporate API gateway]
   CORP --> R[Internal REST]
 ```
+
+### Egress limits, TLS policy, and observability
+
+Corporate REST calls use **`EgressClient`** ([`egress.rs`](../crates/panda-proxy/src/api_gateway/egress.rs)). Configuration is under **`api_gateway.egress`**:
+
+| Concern | Config | Behavior |
+|--------|--------|----------|
+| **Concurrency** | **`rate_limit.max_in_flight`** | Process-local semaphore: fail-fast when concurrent **`request()`** calls (including retries) reach the cap. |
+| **Global RPS** | **`rate_limit.max_rps`** | Fixed **1 second** window. If **`rate_limit.redis.url_env`** resolves to a non-empty Redis URL at process start, the window is enforced **cluster-wide** via Redis **`INCR`** + short TTL; otherwise a **process-local** counter is used (same pattern as ingress RPS Redis). |
+| **Per-target RPS** | **`rate_limit.per_route[]`** | **`route_label`** + **`max_rps`** — caps **`EgressHttpRequest.route_label`** (e.g. MCP **`http_tool`** / **`http_tools`** routes). Redis keys are separate from the global key (`{key_prefix}route:{label}`). |
+| **TLS** | **`egress.tls`** | Optional **mTLS** (`client_cert_pem` / `client_key_pem`), **corporate CA** (`extra_ca_pem`), **`min_protocol_version`** (`tls12` / `tls13`), optional **`cipher_suites`** allowlist (rustls cipher names; empty = default provider suites). Client is built in **`build_egress_http_client`** ([`lib.rs`](../crates/panda-proxy/src/lib.rs)). |
+
+**Metrics** (appended on **`GET /metrics`** when egress is initialized): **`panda_egress_requests_total`**, **`panda_egress_rps_total{scope="global"|"per_route",route,result}`** (allowed/denied at the RPS gates), latency histograms, retries. End-to-end **`rate_limited`** outcomes also appear on **`panda_egress_requests_total`** with **`result=rate_limited`**.
+
+**Operator snapshot:** **`GET /portal/summary.json`** → **`api_gateway.egress`** includes **`rate_limit`** (including whether Redis URL env is set and **`redis_resolved_at_process_start`**, **`per_route_caps_count`**) and **`tls`** (**`cipher_suite_policy`** `default` vs `restricted`, cipher list size, **`min_protocol_version`**) — no secrets.
 
 ---
 

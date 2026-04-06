@@ -17,7 +17,7 @@ use futures_util::StreamExt;
 use panda_config::{ApiGatewayIngressRoute, ControlPlaneConfig, ControlPlaneStoreKind};
 
 #[cfg(feature = "control-plane-sql")]
-use panda_config::{ApiGatewayIngressBackend, RouteRateLimitConfig};
+use panda_config::{ApiGatewayIngressAuthMode, ApiGatewayIngressBackend, RouteRateLimitConfig};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -83,6 +83,27 @@ fn backend_to_token(b: ApiGatewayIngressBackend) -> &'static str {
 }
 
 #[cfg(feature = "control-plane-sql")]
+fn auth_to_token(a: &ApiGatewayIngressAuthMode) -> &'static str {
+    use ApiGatewayIngressAuthMode as M;
+    match a {
+        M::Inherit => "inherit",
+        M::Required => "required",
+        M::Optional => "optional",
+    }
+}
+
+#[cfg(feature = "control-plane-sql")]
+fn auth_from_token(s: &str) -> Result<ApiGatewayIngressAuthMode, String> {
+    use ApiGatewayIngressAuthMode as M;
+    match s.trim() {
+        "inherit" => Ok(M::Inherit),
+        "required" => Ok(M::Required),
+        "optional" => Ok(M::Optional),
+        _ => Err(format!("unknown ingress auth_mode in store: {s:?}")),
+    }
+}
+
+#[cfg(feature = "control-plane-sql")]
 fn backend_from_token(s: &str) -> Result<ApiGatewayIngressBackend, String> {
     use ApiGatewayIngressBackend as B;
     match s.trim() {
@@ -107,6 +128,7 @@ fn route_to_row(
         String,
         Option<String>,
         Option<i64>,
+        String,
         i64,
     ),
     String,
@@ -136,6 +158,7 @@ fn route_to_row(
         .as_ref()
         .map(|rl| rl.rps as i64)
         .filter(|&n| n > 0);
+    let auth_mode = auth_to_token(&r.auth).to_string();
     Ok((
         tenant_id,
         path_prefix,
@@ -143,6 +166,7 @@ fn route_to_row(
         methods_json,
         backend_base,
         rate_limit_rps,
+        auth_mode,
         now_ms(),
     ))
 }
@@ -155,6 +179,7 @@ fn row_to_route(
     methods_json: String,
     backend_base: Option<String>,
     rate_limit_rps: Option<i64>,
+    auth_mode: String,
 ) -> Result<ApiGatewayIngressRoute, String> {
     let backend = backend_from_token(&backend)?;
     let methods: Vec<String> =
@@ -178,6 +203,7 @@ fn row_to_route(
         methods,
         backend_base,
         rate_limit,
+        auth: auth_from_token(&auth_mode)?,
     })
 }
 
@@ -368,13 +394,14 @@ struct SqlControlPlanePersist {
 
 #[cfg(feature = "control-plane-sql")]
 const UPSERT_SQL: &str = r#"
-INSERT INTO panda_control_plane_ingress_route (tenant_id, path_prefix, backend, methods_json, backend_base, rate_limit_rps, updated_at_ms)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+INSERT INTO panda_control_plane_ingress_route (tenant_id, path_prefix, backend, methods_json, backend_base, rate_limit_rps, auth_mode, updated_at_ms)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 ON CONFLICT(tenant_id, path_prefix) DO UPDATE SET
   backend = excluded.backend,
   methods_json = excluded.methods_json,
   backend_base = excluded.backend_base,
   rate_limit_rps = excluded.rate_limit_rps,
+  auth_mode = excluded.auth_mode,
   updated_at_ms = excluded.updated_at_ms
 "#;
 
@@ -429,8 +456,16 @@ impl SqlControlPlanePersist {
     }
 
     async fn insert_or_update(&self, r: &ApiGatewayIngressRoute) -> Result<(), String> {
-        let (tenant_id, path_prefix, backend, methods_json, backend_base, rate_limit_rps, ts) =
-            route_to_row(r)?;
+        let (
+            tenant_id,
+            path_prefix,
+            backend,
+            methods_json,
+            backend_base,
+            rate_limit_rps,
+            auth_mode,
+            ts,
+        ) = route_to_row(r)?;
         match &self.db {
             SqlDb::Sqlite(p) => {
                 sqlx::query(UPSERT_SQL)
@@ -440,6 +475,7 @@ impl SqlControlPlanePersist {
                     .bind(&methods_json)
                     .bind(&backend_base)
                     .bind(rate_limit_rps)
+                    .bind(&auth_mode)
                     .bind(ts)
                     .execute(p)
                     .await
@@ -453,6 +489,7 @@ impl SqlControlPlanePersist {
                     .bind(&methods_json)
                     .bind(&backend_base)
                     .bind(rate_limit_rps)
+                    .bind(&auth_mode)
                     .bind(ts)
                     .execute(p)
                     .await
@@ -506,7 +543,7 @@ impl ControlPlanePersist for SqlControlPlanePersist {
 
     async fn load_all(&self) -> Result<Vec<ApiGatewayIngressRoute>, String> {
         use sqlx::Row;
-        const Q: &str = "SELECT tenant_id, path_prefix, backend, methods_json, backend_base, rate_limit_rps FROM panda_control_plane_ingress_route ORDER BY tenant_id, path_prefix";
+        const Q: &str = "SELECT tenant_id, path_prefix, backend, methods_json, backend_base, rate_limit_rps, auth_mode FROM panda_control_plane_ingress_route ORDER BY tenant_id, path_prefix";
         match &self.db {
             SqlDb::Sqlite(pool) => {
                 let rows = sqlx::query(Q)
@@ -525,6 +562,8 @@ impl ControlPlanePersist for SqlControlPlanePersist {
                         row.try_get("backend_base").map_err(|e| e.to_string())?;
                     let rate_limit_rps: Option<i64> =
                         row.try_get("rate_limit_rps").map_err(|e| e.to_string())?;
+                    let auth_mode: String =
+                        row.try_get("auth_mode").map_err(|e| e.to_string())?;
                     out.push(row_to_route(
                         tenant_id,
                         path_prefix,
@@ -532,6 +571,7 @@ impl ControlPlanePersist for SqlControlPlanePersist {
                         methods_json,
                         backend_base,
                         rate_limit_rps,
+                        auth_mode,
                     )?);
                 }
                 Ok(out)
@@ -553,6 +593,8 @@ impl ControlPlanePersist for SqlControlPlanePersist {
                         row.try_get("backend_base").map_err(|e| e.to_string())?;
                     let rate_limit_rps: Option<i64> =
                         row.try_get("rate_limit_rps").map_err(|e| e.to_string())?;
+                    let auth_mode: String =
+                        row.try_get("auth_mode").map_err(|e| e.to_string())?;
                     out.push(row_to_route(
                         tenant_id,
                         path_prefix,
@@ -560,6 +602,7 @@ impl ControlPlanePersist for SqlControlPlanePersist {
                         methods_json,
                         backend_base,
                         rate_limit_rps,
+                        auth_mode,
                     )?);
                 }
                 Ok(out)
@@ -583,11 +626,12 @@ impl ControlPlanePersist for SqlControlPlanePersist {
                         methods_json,
                         backend_base,
                         rate_limit_rps,
+                        auth_mode,
                         ts,
                     ) = route_to_row(r)?;
                     sqlx::query(
-                        r#"INSERT INTO panda_control_plane_ingress_route (tenant_id, path_prefix, backend, methods_json, backend_base, rate_limit_rps, updated_at_ms)
-                           VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+                        r#"INSERT INTO panda_control_plane_ingress_route (tenant_id, path_prefix, backend, methods_json, backend_base, rate_limit_rps, auth_mode, updated_at_ms)
+                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#,
                     )
                     .bind(&tenant_id)
                     .bind(&path_prefix)
@@ -595,6 +639,7 @@ impl ControlPlanePersist for SqlControlPlanePersist {
                     .bind(&methods_json)
                     .bind(&backend_base)
                     .bind(rate_limit_rps)
+                    .bind(&auth_mode)
                     .bind(ts)
                     .execute(&mut *tx)
                     .await
@@ -616,11 +661,12 @@ impl ControlPlanePersist for SqlControlPlanePersist {
                         methods_json,
                         backend_base,
                         rate_limit_rps,
+                        auth_mode,
                         ts,
                     ) = route_to_row(r)?;
                     sqlx::query(
-                        r#"INSERT INTO panda_control_plane_ingress_route (tenant_id, path_prefix, backend, methods_json, backend_base, rate_limit_rps, updated_at_ms)
-                           VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+                        r#"INSERT INTO panda_control_plane_ingress_route (tenant_id, path_prefix, backend, methods_json, backend_base, rate_limit_rps, auth_mode, updated_at_ms)
+                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#,
                     )
                     .bind(&tenant_id)
                     .bind(&path_prefix)
@@ -628,6 +674,7 @@ impl ControlPlanePersist for SqlControlPlanePersist {
                     .bind(&methods_json)
                     .bind(&backend_base)
                     .bind(rate_limit_rps)
+                    .bind(&auth_mode)
                     .bind(ts)
                     .execute(&mut *tx)
                     .await
@@ -730,29 +777,101 @@ pub fn control_plane_api_key_storage_key(prefix: &str, token: &str) -> String {
     format!("{}{:x}", prefix, h.finalize())
 }
 
-pub async fn control_plane_api_key_valid(
+/// Stored control-plane API key metadata (Redis value; legacy keys use `"1"`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlPlaneApiKeyRecord {
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlPlaneApiKeyAccessLevel {
+    ReadOnly,
+    ReadWrite,
+}
+
+/// Legacy `"1"` or JSON [`ControlPlaneApiKeyRecord`]; returns `None` when the key is missing or invalid.
+pub fn parse_control_plane_api_key_value(v: &str) -> Option<(ControlPlaneApiKeyAccessLevel, Option<String>)> {
+    let v = v.trim();
+    if v == "1" || v.is_empty() {
+        return Some((ControlPlaneApiKeyAccessLevel::ReadWrite, None));
+    }
+    let rec: ControlPlaneApiKeyRecord = serde_json::from_str(v).ok()?;
+    let tenant = rec
+        .tenant_id
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let scopes: Vec<String> = rec
+        .scopes
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if scopes.is_empty() {
+        return Some((ControlPlaneApiKeyAccessLevel::ReadWrite, tenant));
+    }
+    let rw = scopes.iter().any(|s| {
+        let s = s.as_str();
+        s == "write"
+            || s == "*"
+            || s == "control_plane:write"
+            || s.eq_ignore_ascii_case("rw")
+    });
+    let ro = scopes.iter().any(|s| {
+        let s = s.as_str();
+        s == "read" || s == "control_plane:read" || s.eq_ignore_ascii_case("ro")
+    });
+    if rw {
+        Some((ControlPlaneApiKeyAccessLevel::ReadWrite, tenant))
+    } else if ro {
+        Some((ControlPlaneApiKeyAccessLevel::ReadOnly, tenant))
+    } else {
+        None
+    }
+}
+
+pub async fn control_plane_api_key_access(
     conn: &mut redis::aio::ConnectionManager,
     prefix: &str,
     token: &str,
-) -> bool {
+) -> Option<(ControlPlaneApiKeyAccessLevel, Option<String>)> {
     let key = control_plane_api_key_storage_key(prefix, token);
-    conn.exists(&key).await.unwrap_or(0u64) > 0
+    let v: Option<String> = conn.get(&key).await.ok().flatten();
+    let v = v?;
+    parse_control_plane_api_key_value(&v)
 }
 
 pub async fn control_plane_api_key_issue(
     conn: &mut redis::aio::ConnectionManager,
     prefix: &str,
     ttl_seconds: Option<u64>,
+    record: &ControlPlaneApiKeyRecord,
 ) -> Result<String, String> {
     let token = uuid::Uuid::new_v4().to_string();
     let key = control_plane_api_key_storage_key(prefix, &token);
+    let value = if record.scopes.is_empty()
+        && record
+            .tenant_id
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .is_none()
+    {
+        "1".to_string()
+    } else {
+        serde_json::to_string(record).map_err(|e| e.to_string())?
+    };
     match ttl_seconds.filter(|t| *t > 0) {
         Some(t) => conn
-            .set_ex::<_, _, ()>(&key, "1", t)
+            .set_ex::<_, _, ()>(&key, &value, t)
             .await
             .map_err(|e| e.to_string())?,
         None => conn
-            .set::<_, _, ()>(&key, "1")
+            .set::<_, _, ()>(&key, &value)
             .await
             .map_err(|e| e.to_string())?,
     }
@@ -850,6 +969,43 @@ pub async fn import_dynamic_routes(
         n += 1;
     }
     Ok(n)
+}
+
+#[cfg(test)]
+mod api_key_parse_tests {
+    use super::*;
+
+    #[test]
+    fn parse_legacy_and_json_scopes() {
+        assert_eq!(
+            parse_control_plane_api_key_value("1"),
+            Some((ControlPlaneApiKeyAccessLevel::ReadWrite, None))
+        );
+        let ro = r#"{"scopes":["read"],"tenant_id":"acme"}"#;
+        assert_eq!(
+            parse_control_plane_api_key_value(ro),
+            Some((
+                ControlPlaneApiKeyAccessLevel::ReadOnly,
+                Some("acme".to_string())
+            ))
+        );
+        let rw = r#"{"scopes":["write"],"tenant_id":"acme"}"#;
+        assert_eq!(
+            parse_control_plane_api_key_value(rw),
+            Some((
+                ControlPlaneApiKeyAccessLevel::ReadWrite,
+                Some("acme".to_string())
+            ))
+        );
+        assert_eq!(
+            parse_control_plane_api_key_value("{}"),
+            Some((ControlPlaneApiKeyAccessLevel::ReadWrite, None))
+        );
+        assert_eq!(
+            parse_control_plane_api_key_value(r#"{"scopes":["nope"]}"#),
+            None
+        );
+    }
 }
 
 #[cfg(test)]

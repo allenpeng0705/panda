@@ -401,16 +401,57 @@ impl ConsoleOidcRuntime {
         if required_roles.is_empty() {
             return true;
         }
-        let m = mode.to_ascii_lowercase();
-        if m == "all" {
-            required_roles
-                .iter()
-                .all(|r| jwt.roles.iter().any(|x| x == r))
-        } else {
-            required_roles
-                .iter()
-                .any(|r| jwt.roles.iter().any(|x| x == r))
+        roles_match(&jwt.roles, required_roles, mode)
+    }
+
+    /// Resolve control-plane access for a console session: read/write vs read-only from role lists.
+    ///
+    /// - If `required_rw_roles` is non-empty and the session matches, returns read/write.
+    /// - Else if `read_only_roles` is non-empty and the session matches, returns read-only.
+    /// - Else if `required_rw_roles` is non-empty (and the session did not match), returns `None`.
+    /// - Else (no RW requirement), a valid session yields read/write unless it matched read-only above.
+    pub fn control_plane_oidc_access(
+        &self,
+        headers: &HeaderMap,
+        required_rw_roles: &[String],
+        rw_mode: &str,
+        read_only_roles: &[String],
+        read_only_mode: &str,
+    ) -> Option<ControlPlaneOidcAccess> {
+        let jwt = decode_console_session_jwt(self.cfg.as_ref(), headers)?;
+        if !required_rw_roles.is_empty() && roles_match(&jwt.roles, required_rw_roles, rw_mode) {
+            return Some(ControlPlaneOidcAccess::ReadWrite);
         }
+        if !read_only_roles.is_empty() && roles_match(&jwt.roles, read_only_roles, read_only_mode) {
+            return Some(ControlPlaneOidcAccess::ReadOnly);
+        }
+        if !required_rw_roles.is_empty() {
+            return None;
+        }
+        Some(ControlPlaneOidcAccess::ReadWrite)
+    }
+}
+
+/// Control-plane access tier implied by a console OIDC session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlPlaneOidcAccess {
+    ReadWrite,
+    ReadOnly,
+}
+
+fn roles_match(jwt_roles: &[String], required: &[String], mode: &str) -> bool {
+    if required.is_empty() {
+        return false;
+    }
+    let m = mode.to_ascii_lowercase();
+    if m == "all" {
+        required
+            .iter()
+            .all(|r| jwt_roles.iter().any(|x| x == r))
+    } else {
+        required
+            .iter()
+            .any(|r| jwt_roles.iter().any(|x| x == r))
     }
 }
 
@@ -500,6 +541,23 @@ mod tests {
         unsafe {
             std::env::remove_var(secret_env);
         }
+    }
+
+    #[test]
+    fn roles_match_any_and_all() {
+        let jwt = vec!["admin".to_string(), "viewer".to_string()];
+        assert!(roles_match(&jwt, &["admin".to_string()], "any"));
+        assert!(roles_match(&jwt, &["admin".to_string()], "all"));
+        assert!(!roles_match(
+            &jwt,
+            &["admin".to_string(), "missing".to_string()],
+            "all"
+        ));
+        assert!(roles_match(
+            &jwt,
+            &["admin".to_string(), "viewer".to_string()],
+            "all"
+        ));
     }
 
     #[test]

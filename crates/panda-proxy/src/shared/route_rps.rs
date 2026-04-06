@@ -120,6 +120,14 @@ impl RouteRpsLimiters {
         }
     }
 
+    /// Whether [`Self::check_route`] will enforce (not no-op) for this path.
+    pub fn legacy_limit_applies(&self, cfg: &PandaConfig, ingress_path: &str) -> bool {
+        let Some(route) = cfg.effective_route_for_path(ingress_path) else {
+            return false;
+        };
+        route.rate_limit.is_some() && self.legacy_limits.contains_key(&route.path_prefix)
+    }
+
     /// Top-level [`PandaConfig::routes`] `rate_limit` for the longest matching prefix.
     pub async fn check_route(&self, cfg: &PandaConfig, ingress_path: &str) -> Result<(), u32> {
         let Some(route) = cfg.effective_route_for_path(ingress_path) else {

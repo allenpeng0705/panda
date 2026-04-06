@@ -12,7 +12,7 @@ This doc describes **how to test** Panda when **`api_gateway` ingress/egress** a
 |--------|----------------|
 | **Ingress** | Prefix → `backend: mcp` routes accept **POST JSON-RPC** (`initialize`, `tools/list`, `tools/call`); optional **RPS** / **Redis** counters; **portal** paths when ingress is on. |
 | **MCP host** | Tool catalog, `tools/call` execution, **`http_tool`** and allowlist, **`mcp.tool_cache`** / **`mcp.tool_routes`** where configured. |
-| **Egress** | Resolved URL is allowlisted; retries / mTLS / metrics on the egress client (see egress tests). |
+| **Egress** | Allowlisted URL; **`rate_limit`** ( **`max_in_flight`**, **`max_rps`**, optional **Redis** for cluster-wide RPS, **`per_route`** by **`route_label`** ); **`tls`** (mTLS, **`cipher_suites`**, **`min_protocol_version`**); **`panda_egress_*`** on **`/metrics`**; see §2.8 and egress tests. |
 
 End-to-end shape: **HTTP client → Panda (ingress) → MCP → egress → mock corporate HTTP**.
 
@@ -125,6 +125,20 @@ Typical production setups have **multiple MCP server blocks** (different owners,
 
 **Other transports (commented in `panda.yaml`):** **`command`/`args`** (stdio MCP), **`remote_mcp_url`** (MCP over HTTP via egress). Each server uses **at most one** of: `command`, `http_tool`, `http_tools`, or `remote_mcp_url`.
 
+### 2.8 Egress rate limits, Redis, TLS, and metrics
+
+Use this when validating **G3**-style egress policy: cluster RPS, per-route RPS, and TLS cipher posture — you can rely on **`EgressClient`** unit/integration tests without driving full **`POST /mcp`** flows.
+
+| Topic | Config (YAML) | What to check |
+|--------|----------------|---------------|
+| **Global + per-route RPS** | `api_gateway.egress.rate_limit`: `max_rps`, `per_route: [{ route_label, max_rps }]`, optional `redis: { url_env, key_prefix }` | **`cargo test -p panda-proxy api_gateway::egress::tests::rate_limit_`** — local 1s windows; with Redis URL set at process start, limits are shared across replicas (same key prefix pattern as ingress RPS). |
+| **In-flight cap** | `rate_limit.max_in_flight` | **`rate_limit_max_in_flight_blocks_second_concurrent_call`** — second concurrent **`request()`** fails fast with **`RateLimited`**. |
+| **TLS / cipher policy** | `api_gateway.egress.tls.cipher_suites`, `min_protocol_version` | Validated at config load; client built in **`build_egress_http_client`**. Integration-style tests: **`integration_https_mtls_presents_client_cert_to_upstream`**. |
+| **Prometheus** | — | **`panda_egress_rps_total{scope,route,result}`** and **`panda_egress_requests_total`** on **`GET /metrics`**. |
+| **Portal (no secrets)** | — | **`GET /portal/summary.json`** → **`api_gateway.egress.rate_limit`** (Redis env set, resolved flag, per-route count) and **`tls`** (cipher policy summary). |
+
+Example snippets: [`panda.example.yaml`](../panda.example.yaml) (commented **`api_gateway.egress`** block). Backlog row: [`gateway_backlog_progress.md`](./gateway_backlog_progress.md) (G3).
+
 ---
 
 ## 3. In-repo “framework”: Rust integration tests (primary)
@@ -161,7 +175,7 @@ cargo test -p panda-proxy control_plane_and_streamable -- --nocapture
 
 **Ingress routing (unit-level):** `crates/panda-proxy/src/api_gateway/ingress.rs` (`#[test]` on classify / merge).
 
-**Egress client:** `crates/panda-proxy/src/api_gateway/egress.rs` (`integration_hits_mock_upstream_when_allowed`, **`integration_https_mtls_presents_client_cert_to_upstream`**, pool / retry cases).
+**Egress client:** `crates/panda-proxy/src/api_gateway/egress.rs` (`integration_hits_mock_upstream_when_allowed`, **`integration_https_mtls_presents_client_cert_to_upstream`**, pool / retry cases, **`rate_limit_max_rps_*`**, **`rate_limit_per_route_rps_metrics_scope`**, **`rate_limit_max_in_flight_*`** — see §2.8).
 
 **How to run a focused subset:**
 

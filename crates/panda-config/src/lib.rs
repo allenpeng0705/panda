@@ -500,11 +500,14 @@ impl Default for SemanticCacheConfig {
     }
 }
 
-/// Phase 4: universal adapter target provider.
+/// Phase 4: universal adapter target provider (expand toward **maximum upstream coverage**—not only OpenAI-shaped backends).
 #[derive(Debug, Clone, Deserialize)]
 pub struct AdapterConfig {
     /// Backend provider protocol to target from OpenAI-compatible ingress.
-    /// Supported: `openai` (passthrough), `anthropic` (request/response mapping for non-streaming chat).
+    /// **`anthropic`** — native Messages API mapping in `panda-proxy`.
+    /// **Any label in [`OPENAI_SHAPED_ADAPTER_PROVIDER_LABELS`]** — same runtime as `openai` (passthrough to
+    /// `backend_base`); use a **specific label** (e.g. `groq`, `together`) for clarity in ops and docs.
+    /// **Native** non–OpenAI APIs (e.g. some cloud APIs) require new adapters — see `docs/provider_adapters.md`.
     #[serde(default = "default_adapter_provider")]
     pub provider: String,
     /// Anthropic API version header when provider is `anthropic`.
@@ -525,6 +528,95 @@ impl Default for AdapterConfig {
         Self {
             provider: default_adapter_provider(),
             anthropic_version: default_adapter_anthropic_version(),
+        }
+    }
+}
+
+/// Labels for `adapter.provider` and per-route `type` (`adapter_type`) that use **OpenAI-shaped**
+/// HTTP to `backend_base` (passthrough; no request-body mapping). Same idea as multi-provider
+/// gateways (e.g. [Portkey AI Gateway](https://github.com/Portkey-AI/gateway)): one client surface,
+/// many upstreams that speak `/v1/chat/completions`-style JSON.
+///
+/// **`anthropic`** is not listed here: it selects the native Anthropic Messages adapter in `panda-proxy`.
+///
+/// Includes **`gemini`**, **`vertex`**, **`bedrock`** as labels for OpenAI-compatible endpoints documented by
+/// Google/AWS; auth and base URLs are described in **`docs/provider_gemini_bedrock_vertex.md`**.
+pub const OPENAI_SHAPED_ADAPTER_PROVIDER_LABELS: &[&str] = &[
+    "openai",
+    "openai_compatible",
+    "groq",
+    "together",
+    "mistral",
+    "ollama",
+    "openrouter",
+    "perplexity",
+    "fireworks",
+    "deepinfra",
+    "anyscale",
+    "xai",
+    "deepseek",
+    "replicate",
+    "lambda",
+    "moonshot",
+    "hyperbolic",
+    "siliconflow",
+    "novita",
+    "azure_openai",
+    // Gemini / Vertex / Bedrock: passthrough like `openai` when `backend_base` is the vendor's OpenAI-compatible URL — see `docs/provider_gemini_bedrock_vertex.md`.
+    "gemini",
+    "vertex",
+    "bedrock",
+];
+
+fn ensure_adapter_provider_allowed(name: &str) -> anyhow::Result<()> {
+    let n = name.trim();
+    if n.is_empty() {
+        anyhow::bail!("adapter provider must be non-empty");
+    }
+    if n == "anthropic" {
+        return Ok(());
+    }
+    if OPENAI_SHAPED_ADAPTER_PROVIDER_LABELS.contains(&n) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "adapter.provider must be `anthropic` or an OpenAI-shaped label (openai, gemini, vertex, bedrock, ...); see docs/provider_adapters.md and docs/provider_gemini_bedrock_vertex.md"
+    );
+}
+
+/// Tuning for MCP **Streamable HTTP** in-memory sessions and GET listener SSE ([spec](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http)).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct McpStreamableHttpConfig {
+    /// Max SSE `message` events retained per session for `Last-Event-ID` replay on GET listener.
+    #[serde(default = "default_mcp_streamable_sse_ring_max_events")]
+    pub sse_ring_max_events: usize,
+    /// How long idle session metadata and replay buffers may live (seconds).
+    #[serde(default = "default_mcp_streamable_session_ttl_seconds")]
+    pub session_ttl_seconds: u64,
+    /// Interval between SSE comment keepalives on the GET listener stream (seconds).
+    #[serde(default = "default_mcp_streamable_sse_keepalive_interval_seconds")]
+    pub sse_keepalive_interval_seconds: u64,
+}
+
+fn default_mcp_streamable_sse_ring_max_events() -> usize {
+    64
+}
+
+fn default_mcp_streamable_session_ttl_seconds() -> u64 {
+    86_400
+}
+
+fn default_mcp_streamable_sse_keepalive_interval_seconds() -> u64 {
+    20
+}
+
+impl Default for McpStreamableHttpConfig {
+    fn default() -> Self {
+        Self {
+            sse_ring_max_events: default_mcp_streamable_sse_ring_max_events(),
+            session_ttl_seconds: default_mcp_streamable_session_ttl_seconds(),
+            sse_keepalive_interval_seconds: default_mcp_streamable_sse_keepalive_interval_seconds(),
         }
     }
 }
@@ -571,6 +663,9 @@ pub struct McpConfig {
     /// Optional cache for deterministic MCP tool results (allowlist + TTL + identity scope).
     #[serde(default)]
     pub tool_cache: McpToolCacheConfig,
+    /// Streamable HTTP session store / SSE replay (ingress MCP when clients negotiate streamable transport).
+    #[serde(default)]
+    pub streamable_http: McpStreamableHttpConfig,
 }
 
 /// Cache deterministic MCP tool results by `(scope, server.tool, args_hash)` to reduce repeated token/tool cost.
@@ -735,6 +830,7 @@ impl Default for McpConfig {
             hitl: McpHitlConfig::default(),
             tool_routes: McpToolRoutesConfig::default(),
             tool_cache: McpToolCacheConfig::default(),
+            streamable_http: McpStreamableHttpConfig::default(),
         }
     }
 }
@@ -1556,6 +1652,19 @@ pub struct ApiGatewayIngressConfig {
     pub rate_limit_redis: ApiGatewayIngressRateLimitRedisConfig,
 }
 
+/// JWT / bearer policy for a single ingress row (overrides global `identity.require_jwt` for that prefix).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ApiGatewayIngressAuthMode {
+    /// Use global [`crate::IdentityConfig::require_jwt`].
+    #[default]
+    Inherit,
+    /// Require a valid Bearer JWT for this prefix even when global `require_jwt` is false.
+    Required,
+    /// Do not enforce JWT on this prefix even when global `require_jwt` is true (public or internal-only paths).
+    Optional,
+}
+
 /// One row in the ingress route table (`path_prefix` longest match wins).
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct ApiGatewayIngressRoute {
@@ -1574,6 +1683,75 @@ pub struct ApiGatewayIngressRoute {
     /// Optional per-prefix RPS cap (same semantics as top-level `routes[].rate_limit`).
     #[serde(default)]
     pub rate_limit: Option<RouteRateLimitConfig>,
+    /// Per-prefix JWT requirement (see [`ApiGatewayIngressAuthMode`]).
+    #[serde(default)]
+    pub auth: ApiGatewayIngressAuthMode,
+}
+
+impl Default for ApiGatewayIngressRoute {
+    fn default() -> Self {
+        Self {
+            tenant_id: None,
+            path_prefix: String::new(),
+            backend: ApiGatewayIngressBackend::Ai,
+            methods: Vec::new(),
+            backend_base: None,
+            rate_limit: None,
+            auth: ApiGatewayIngressAuthMode::default(),
+        }
+    }
+}
+
+/// Shared validation for [`ApiGatewayIngressRoute`] (static YAML and control-plane HTTP upsert/import).
+pub fn validate_ingress_route_row(r: &ApiGatewayIngressRoute) -> anyhow::Result<()> {
+    let p = r.path_prefix.trim();
+    if p.is_empty() {
+        anyhow::bail!("path_prefix must not be empty");
+    }
+    if !p.starts_with('/') {
+        anyhow::bail!("path_prefix must start with `/`: {:?}", r.path_prefix);
+    }
+    for (j, mth) in r.methods.iter().enumerate() {
+        let m = mth.trim();
+        if m.is_empty() {
+            anyhow::bail!("methods[{j}] must not be empty when methods list is non-empty");
+        }
+        http::Method::from_bytes(m.as_bytes()).map_err(|_| {
+            anyhow::anyhow!("methods[{j}] invalid HTTP method: {:?}", mth)
+        })?;
+    }
+    let u = r
+        .backend_base
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    if let Some(base) = u {
+        if r.backend != ApiGatewayIngressBackend::Ai {
+            anyhow::bail!("backend_base is only valid when backend is `ai`");
+        }
+        let uri: http::Uri = base
+            .parse()
+            .map_err(|e| anyhow::anyhow!("backend_base: invalid URL: {e}"))?;
+        if uri.scheme_str() != Some("https") && uri.scheme_str() != Some("http") {
+            anyhow::bail!("backend_base must use http or https");
+        }
+        if uri.host().is_none() {
+            anyhow::bail!("backend_base must include a host");
+        }
+    }
+    if let Some(ref rl) = r.rate_limit {
+        if rl.rps == 0 {
+            anyhow::bail!("rate_limit.rps must be > 0 when set");
+        }
+    }
+    Ok(())
+}
+
+impl ApiGatewayIngressRoute {
+    /// Validate a single row for control-plane upsert/import (same rules as [`validate_ingress_route_row`]).
+    pub fn validate_for_control_plane(&self) -> anyhow::Result<()> {
+        validate_ingress_route_row(self)
+    }
 }
 
 /// Logical backend for an ingress path (maps to existing dispatch branches in `panda-proxy`).
@@ -1611,6 +1789,9 @@ pub struct ApiGatewayEgressTlsConfig {
     pub reload_on_sighup: bool,
     /// When > 0, poll PEM file mtimes on this interval (ms) and reload the egress HTTPS client if any changed.
     pub watch_reload_ms: u64,
+    /// Optional cipher suite allow-list (IANA / rustls variant names, or `0x1301` hex). Empty = rustls defaults.
+    #[serde(default)]
+    pub cipher_suites: Vec<String>,
 }
 
 impl Default for ApiGatewayEgressTlsConfig {
@@ -1622,6 +1803,7 @@ impl Default for ApiGatewayEgressTlsConfig {
             min_protocol_version: None,
             reload_on_sighup: false,
             watch_reload_ms: 0,
+            cipher_suites: Vec::new(),
         }
     }
 }
@@ -1673,6 +1855,40 @@ fn webpki_root_store_arc() -> std::sync::Arc<rustls::RootCertStore> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     std::sync::Arc::new(roots)
+}
+
+/// Resolve egress TLS cipher names to rustls `SupportedCipherSuite` values (ring provider).
+pub fn resolve_egress_cipher_suite_names(
+    names: &[String],
+) -> anyhow::Result<Vec<rustls::SupportedCipherSuite>> {
+    use rustls::crypto::ring::ALL_CIPHER_SUITES;
+    use rustls::CipherSuite;
+    let mut out = Vec::new();
+    for n in names {
+        let t = n.trim();
+        if t.is_empty() {
+            anyhow::bail!("empty cipher suite entry");
+        }
+        let found: Option<rustls::SupportedCipherSuite> =
+            if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+                let v = u16::from_str_radix(hex, 16)?;
+                let cs = CipherSuite::from(v);
+                ALL_CIPHER_SUITES.iter().find(|s| s.suite() == cs).copied()
+            } else {
+                ALL_CIPHER_SUITES
+                    .iter()
+                    .find(|s| {
+                        s.suite().as_str().map(|x| x == t).unwrap_or(false)
+                            || format!("{:?}", s.suite()).eq_ignore_ascii_case(t)
+                    })
+                    .copied()
+            };
+        let Some(s) = found else {
+            anyhow::bail!("unknown or unsupported cipher suite: {t:?}");
+        };
+        out.push(s);
+    }
+    Ok(out)
 }
 
 impl ApiGatewayEgressTlsConfig {
@@ -1738,11 +1954,21 @@ impl ApiGatewayEgressTlsConfig {
             .map(str::trim)
             .filter(|s| !s.is_empty());
         let has_client_auth = cert.is_some() && key.is_some();
-        if extra_path.is_none() && !has_client_auth {
+        if extra_path.is_none() && !has_client_auth && self.cipher_suites.is_empty() {
             return Ok(());
         }
 
         ensure_rustls_ring_provider_for_validate();
+
+        if !self.cipher_suites.is_empty() {
+            resolve_egress_cipher_suite_names(&self.cipher_suites).map_err(|e| {
+                anyhow::anyhow!("api_gateway.egress.tls.cipher_suites: {e}")
+            })?;
+        }
+
+        if extra_path.is_none() && !has_client_auth {
+            return Ok(());
+        }
 
         if let Some(p) = extra_path {
             let path = std::path::Path::new(p);
@@ -1777,8 +2003,36 @@ impl ApiGatewayEgressTlsConfig {
     }
 }
 
-/// Process-local caps for the corporate egress HTTP client (Phase G3).
-/// Not coordinated across replicas; use per-pod limits or a sidecar if you need cluster-wide throttling.
+/// Redis-backed shared counters for `api_gateway.egress.rate_limit.max_rps` (optional).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ApiGatewayEgressRateLimitRedisConfig {
+    /// Environment variable name that must resolve to a Redis URL when set (same pattern as ingress RPS Redis).
+    pub url_env: Option<String>,
+    pub key_prefix: String,
+}
+
+fn default_api_gateway_egress_rl_redis_prefix() -> String {
+    "panda:gw:egress_rps".to_string()
+}
+
+impl Default for ApiGatewayEgressRateLimitRedisConfig {
+    fn default() -> Self {
+        Self {
+            url_env: None,
+            key_prefix: default_api_gateway_egress_rl_redis_prefix(),
+        }
+    }
+}
+
+/// Per `route_label` (egress HTTP `EgressHttpRequest.route_label`) RPS cap (fixed 1s window).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiGatewayEgressPerRouteRateLimit {
+    pub route_label: String,
+    pub max_rps: u32,
+}
+
+/// Process-local and optional Redis-backed caps for the corporate egress HTTP client (Phase G3).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ApiGatewayEgressRateLimitConfig {
@@ -1786,8 +2040,14 @@ pub struct ApiGatewayEgressRateLimitConfig {
     /// (held from first attempt through final response, including retries). `0` = unlimited.
     /// Fail-fast when the cap is reached (no queue).
     pub max_in_flight: u32,
-    /// Max egress `request` calls per second per process (fixed 1 second window). `0` = unlimited.
+    /// Max egress `request` calls per second (fixed 1 second window). `0` = unlimited.
+    /// When [`ApiGatewayEgressRateLimitRedisConfig::url_env`] resolves, this limit is enforced cluster-wide in Redis.
     pub max_rps: u32,
+    #[serde(default)]
+    pub redis: ApiGatewayEgressRateLimitRedisConfig,
+    /// Additional per-`route_label` RPS caps (local or Redis when `redis` is configured).
+    #[serde(default)]
+    pub per_route: Vec<ApiGatewayEgressPerRouteRateLimit>,
 }
 
 impl Default for ApiGatewayEgressRateLimitConfig {
@@ -1795,6 +2055,8 @@ impl Default for ApiGatewayEgressRateLimitConfig {
         Self {
             max_in_flight: 0,
             max_rps: 0,
+            redis: ApiGatewayEgressRateLimitRedisConfig::default(),
+            per_route: Vec::new(),
         }
     }
 }
@@ -1828,6 +2090,22 @@ pub struct ApiGatewayEgressConfig {
     pub tls: ApiGatewayEgressTlsConfig,
     #[serde(default)]
     pub rate_limit: ApiGatewayEgressRateLimitConfig,
+}
+
+impl ApiGatewayEgressConfig {
+    /// Redis URL when `rate_limit.redis.url_env` names a non-empty environment variable.
+    pub fn effective_rate_limit_redis_url(&self) -> Option<String> {
+        let env_name = self
+            .rate_limit
+            .redis
+            .url_env
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        std::env::var(env_name)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+    }
 }
 
 /// Named egress auth / header profile (referenced by `mcp.servers[].http_tool.egress_profile`).
@@ -1948,16 +2226,9 @@ impl ApiGatewayIngressConfig {
         }
         let mut seen = std::collections::HashSet::new();
         for (i, r) in self.routes.iter().enumerate() {
+            validate_ingress_route_row(r)
+                .map_err(|e| anyhow::anyhow!("api_gateway.ingress.routes[{i}]: {e}"))?;
             let p = r.path_prefix.trim();
-            if p.is_empty() {
-                anyhow::bail!("api_gateway.ingress.routes[{i}].path_prefix must not be empty");
-            }
-            if !p.starts_with('/') {
-                anyhow::bail!(
-                    "api_gateway.ingress.routes[{i}].path_prefix must start with '/': {:?}",
-                    r.path_prefix
-                );
-            }
             let t = r.tenant_id.as_deref().map(str::trim).unwrap_or("").to_string();
             if !seen.insert((t, p.to_string())) {
                 anyhow::bail!(
@@ -1965,48 +2236,6 @@ impl ApiGatewayIngressConfig {
                     r.tenant_id,
                     p
                 );
-            }
-            for (j, mth) in r.methods.iter().enumerate() {
-                let m = mth.trim();
-                if m.is_empty() {
-                    anyhow::bail!(
-                        "api_gateway.ingress.routes[{i}].methods[{j}] must not be empty"
-                    );
-                }
-                http::Method::from_bytes(m.as_bytes()).map_err(|_| {
-                    anyhow::anyhow!(
-                        "api_gateway.ingress.routes[{i}].methods[{j}] invalid HTTP method: {:?}",
-                        mth
-                    )
-                })?;
-            }
-            let u = r.backend_base.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty());
-            if let Some(base) = u {
-                if r.backend != ApiGatewayIngressBackend::Ai {
-                    anyhow::bail!(
-                        "api_gateway.ingress.routes[{i}].backend_base is only valid when backend is `ai`"
-                    );
-                }
-                let uri: http::Uri = base
-                    .parse()
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "api_gateway.ingress.routes[{i}].backend_base: invalid URL: {e}"
-                        )
-                    })?;
-                if uri.scheme_str() != Some("https") && uri.scheme_str() != Some("http") {
-                    anyhow::bail!("api_gateway.ingress.routes[{i}].backend_base must use http or https");
-                }
-                if uri.host().is_none() {
-                    anyhow::bail!("api_gateway.ingress.routes[{i}].backend_base must include a host");
-                }
-            }
-            if let Some(ref rl) = r.rate_limit {
-                if rl.rps == 0 {
-                    anyhow::bail!(
-                        "api_gateway.ingress.routes[{i}].rate_limit.rps must be > 0 when set"
-                    );
-                }
             }
         }
         Ok(())
@@ -2164,6 +2393,39 @@ impl ApiGatewayConfig {
         }
         if self.egress.rate_limit.max_rps > EGRESS_RL_CAP {
             anyhow::bail!("api_gateway.egress.rate_limit.max_rps must be <= {EGRESS_RL_CAP}");
+        }
+        if self
+            .egress
+            .rate_limit
+            .redis
+            .key_prefix
+            .trim()
+            .is_empty()
+        {
+            anyhow::bail!("api_gateway.egress.rate_limit.redis.key_prefix must be non-empty");
+        }
+        let mut rl_seen = std::collections::HashSet::<String>::new();
+        for (i, pr) in self.egress.rate_limit.per_route.iter().enumerate() {
+            let label = pr.route_label.trim();
+            if label.is_empty() {
+                anyhow::bail!("api_gateway.egress.rate_limit.per_route[{i}].route_label must be non-empty");
+            }
+            if !rl_seen.insert(label.to_string()) {
+                anyhow::bail!(
+                    "api_gateway.egress.rate_limit.per_route duplicate route_label: {:?}",
+                    pr.route_label
+                );
+            }
+            if pr.max_rps == 0 {
+                anyhow::bail!(
+                    "api_gateway.egress.rate_limit.per_route[{i}].max_rps must be > 0"
+                );
+            }
+            if pr.max_rps > EGRESS_RL_CAP {
+                anyhow::bail!(
+                    "api_gateway.egress.rate_limit.per_route[{i}].max_rps must be <= {EGRESS_RL_CAP}"
+                );
+            }
         }
         for (i, h) in self.egress.default_headers.iter().enumerate() {
             Self::validate_egress_default_header_entry(
@@ -2351,6 +2613,13 @@ pub struct ControlPlaneAuthConfig {
     /// Request header carrying the raw API key (checked when Redis URL is configured).
     #[serde(default = "default_control_plane_api_key_header")]
     pub api_key_header: String,
+    /// When non-empty, a valid console OIDC session whose roles match **any** (or **all**, see
+    /// [`Self::oidc_read_only_roles_mode`]) of these grants **read-only** control-plane access,
+    /// unless the session already satisfies [`Self::required_console_roles`] for read/write.
+    #[serde(default)]
+    pub oidc_read_only_roles: Vec<String>,
+    #[serde(default = "default_cp_auth_console_roles_mode")]
+    pub oidc_read_only_roles_mode: String,
 }
 
 impl Default for ControlPlaneAuthConfig {
@@ -2362,6 +2631,8 @@ impl Default for ControlPlaneAuthConfig {
             api_keys_redis_url_env: None,
             api_keys_redis_key_prefix: default_control_plane_api_key_prefix(),
             api_key_header: default_control_plane_api_key_header(),
+            oidc_read_only_roles: Vec::new(),
+            oidc_read_only_roles_mode: default_cp_auth_console_roles_mode(),
         }
     }
 }
@@ -3060,6 +3331,22 @@ impl PandaConfig {
             .any(|v| v.trim().is_empty())
         {
             anyhow::bail!("prompt_safety.deny_patterns entries must be non-empty");
+        }
+        {
+            let sh = &self.mcp.streamable_http;
+            if sh.sse_ring_max_events == 0 || sh.sse_ring_max_events > 4096 {
+                anyhow::bail!("mcp.streamable_http.sse_ring_max_events must be 1..=4096");
+            }
+            if sh.session_ttl_seconds < 60 || sh.session_ttl_seconds > 604_800 {
+                anyhow::bail!(
+                    "mcp.streamable_http.session_ttl_seconds must be 60..=604800 (1 minute .. 7 days)"
+                );
+            }
+            if sh.sse_keepalive_interval_seconds < 5 || sh.sse_keepalive_interval_seconds > 300 {
+                anyhow::bail!(
+                    "mcp.streamable_http.sse_keepalive_interval_seconds must be 5..=300"
+                );
+            }
         }
         if self.pii.enabled {
             if self.pii.replacement.trim().is_empty() {
@@ -3801,10 +4088,7 @@ impl PandaConfig {
                 }
             }
         }
-        match self.adapter.provider.as_str() {
-            "openai" | "anthropic" => {}
-            _ => anyhow::bail!("adapter.provider must be one of: openai, anthropic"),
-        }
+        ensure_adapter_provider_allowed(&self.adapter.provider)?;
         if self.adapter.anthropic_version.trim().is_empty() {
             anyhow::bail!("adapter.anthropic_version must be non-empty");
         }
@@ -3843,10 +4127,7 @@ impl PandaConfig {
                 anyhow::bail!("routes.semantic_cache=true requires semantic_cache.enabled=true");
             }
             if let Some(ref t) = r.adapter_type {
-                match t.as_str() {
-                    "openai" | "anthropic" => {}
-                    _ => anyhow::bail!("routes.type must be one of: openai, anthropic"),
-                }
+                ensure_adapter_provider_allowed(t)?;
             }
             if let Some(ref names) = r.mcp_servers {
                 if !names.is_empty() {
@@ -3873,6 +4154,22 @@ impl PandaConfig {
                     "routes.mcp_advertise_tools=true requires mcp.enabled=true (path_prefix={:?})",
                     r.path_prefix
                 );
+            }
+        }
+        if self.api_gateway.ingress.enabled {
+            let has_hs256 = !self.identity.jwt_hs256_secret_env.trim().is_empty();
+            let has_jwks = self
+                .identity
+                .jwks_url
+                .as_ref()
+                .is_some_and(|u| !u.trim().is_empty());
+            let can_validate_jwt = has_hs256 || has_jwks;
+            for (i, r) in self.api_gateway.ingress.routes.iter().enumerate() {
+                if r.auth == ApiGatewayIngressAuthMode::Required && !can_validate_jwt {
+                    anyhow::bail!(
+                        "api_gateway.ingress.routes[{i}].auth=required requires identity.jwt_hs256_secret_env and/or identity.jwks_url (or auth.jwks_url)"
+                    );
+                }
             }
         }
         self.api_gateway.validate()?;
@@ -3955,7 +4252,7 @@ impl PandaConfig {
         }
     }
 
-    /// Adapter provider for an ingress path (`openai` or `anthropic`).
+    /// Adapter provider for an ingress path (see [`OPENAI_SHAPED_ADAPTER_PROVIDER_LABELS`] and `anthropic`).
     pub fn effective_adapter_provider(&self, path: &str) -> &str {
         self.effective_route_for_path(path)
             .and_then(|r| r.adapter_type.as_deref())
@@ -4396,6 +4693,28 @@ api_gateway:
         .unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.api_gateway.ingress.routes[0].methods, vec!["POST".to_string()]);
+    }
+
+    #[test]
+    fn validate_ingress_route_row_for_control_plane() {
+        let ok = ApiGatewayIngressRoute {
+            path_prefix: "/api".to_string(),
+            backend: ApiGatewayIngressBackend::Mcp,
+            methods: vec!["POST".to_string()],
+            ..Default::default()
+        };
+        ok.validate_for_control_plane().unwrap();
+        let bad_prefix = ApiGatewayIngressRoute {
+            path_prefix: "relative".to_string(),
+            ..Default::default()
+        };
+        assert!(bad_prefix.validate_for_control_plane().is_err());
+        let bad_rl = ApiGatewayIngressRoute {
+            path_prefix: "/z".to_string(),
+            rate_limit: Some(RouteRateLimitConfig { rps: 0 }),
+            ..Default::default()
+        };
+        assert!(bad_rl.validate_for_control_plane().is_err());
     }
 
     #[test]
@@ -5025,10 +5344,38 @@ semantic_cache:
     fn rejects_invalid_adapter_provider() {
         let err = PandaConfig::from_yaml_str(
             "listen: '127.0.0.1:0'\ndefault_backend: 'http://127.0.0.1:11434'\n\
-             adapter:\n  provider: gemini\n",
+             adapter:\n  provider: unknown_provider\n",
         )
         .unwrap_err();
         assert!(err.to_string().contains("adapter.provider"));
+    }
+
+    #[test]
+    fn accepts_groq_as_openai_shaped_adapter_label() {
+        let cfg = PandaConfig::from_yaml_str(
+            r#"listen: '127.0.0.1:0'
+default_backend: 'https://api.groq.com/openai/v1'
+adapter:
+  provider: groq
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.effective_adapter_provider("/v1/chat/completions"), "groq");
+    }
+
+    #[test]
+    fn accepts_gemini_vertex_bedrock_labels() {
+        for label in ["gemini", "vertex", "bedrock"] {
+            let yaml = format!(
+                "listen: '127.0.0.1:0'\ndefault_backend: 'http://127.0.0.1:9'\nadapter:\n  provider: {label}\n"
+            );
+            let cfg = PandaConfig::from_yaml_str(&yaml).unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert_eq!(
+                cfg.effective_adapter_provider("/v1/chat/completions"),
+                label,
+                "{label}"
+            );
+        }
     }
 
     #[test]

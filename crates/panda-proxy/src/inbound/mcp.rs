@@ -786,8 +786,9 @@ mcp:
 "#
         );
         let cfg = PandaConfig::from_yaml_str(&yaml).expect("yaml");
-        let egress = EgressClient::try_new(&cfg.api_gateway.egress)
-            .expect("egress try_new")
+        let egress = EgressClient::connect(&cfg.api_gateway.egress)
+            .await
+            .expect("egress connect")
             .expect("egress some");
         let rt = McpRuntime::connect(&cfg, Some(&egress))
             .await

@@ -23,7 +23,7 @@
 
 ## What is Panda?
 
-A **specialized reverse proxy for LLM traffic**: auth, routing, budgets, cache, tools, and policy share one **request context**. You run **`cargo run -p panda-server -- panda.yaml`** (or Docker/K8s); upstreams can be OpenAI, Azure, Anthropic (via adapter/failover), Ollama, vLLM, or any **OpenAI-compatible** base URL.
+A **specialized reverse proxy for LLM traffic**: auth, routing, budgets, cache, tools, and policy share one **request context**. You run **`cargo run -p panda-server -- panda.yaml`** (or Docker/K8s). **Client** traffic stays **OpenAI-compatible** on the paths Panda exposes today; **upstream** targets aim for **broad provider coverage**—OpenAI-compatible bases (Ollama, vLLM, many clouds), **Anthropic-native** APIs via the built-in adapter, and **more native adapters over time** (same budgets, cache, and policy)—see [`docs/ai_routing_strategy.md`](docs/ai_routing_strategy.md) §1.1.
 
 ---
 

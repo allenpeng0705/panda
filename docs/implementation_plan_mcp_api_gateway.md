@@ -139,9 +139,11 @@ Alternative: nest under `shared/` if you prefer fewer top-level mods — choose 
 
 ### 3.6 Security checklist (before GA)
 
+Canonical **process + sign-off template:** [`security_review_gate.md`](./security_review_gate.md) (F3).
+
 - [x] Egress **SSRF** allowlist (**host + path prefix** required when egress enabled; CIDR not implemented).
 - [ ] Secrets **never** logged; header redaction on debug traces (operational review).
-- [x] Ingress **rate limits**: top-level **`routes[].rate_limit`**; **`api_gateway.ingress.routes[].rate_limit`**; optional **`api_gateway.ingress.rate_limit_redis`** (shared counters). **Open:** low-cardinality **metrics** labels per ingress row (design catalog).
+- [x] Ingress **rate limits**: top-level **`routes[].rate_limit`**; **`api_gateway.ingress.routes[].rate_limit`**; optional **`api_gateway.ingress.rate_limit_redis`** (shared counters). **Metrics:** **`panda_gateway_rps_{allowed,denied}_total{layer=…}`** and **`panda_gateway_ingress_rps_total{tenant_id,path_prefix,result}`** (bounded labels; see [`runbooks/ingress_gateway_slo.md`](./runbooks/ingress_gateway_slo.md)).
 - [x] **mTLS** egress to corporate gateway when required (`api_gateway.egress.tls` client cert + key + optional `extra_ca_pem`; integration test in `egress.rs`).
 
 ### 3.7 Testing strategy
@@ -218,22 +220,22 @@ Work in **vertical slices**; each phase is shippable behind config defaults.
 
 **Exit:** Documented in control-plane plan; not blocking Phase D for static YAML.
 
-### Phase F — Hardening — **Partial** (SSRF baseline in B; **F1 shipped**)
+### Phase F — Hardening — **Partial** (SSRF baseline in B; **F1 shipped**; **F2 + F3 methodology in repo**)
 
 | ID | Deliverable |
 |----|-------------|
 | **F1** | mTLS egress option; custom CA bundle. **Done:** `api_gateway.egress.tls` + `build_egress_http_client`; test **`integration_https_mtls_presents_client_cert_to_upstream`**. |
-| **F2** | Load test ingress overhead; document SLO. |
-| **F3** | Security review checklist §3.6 signed off. |
+| **F2** | Ingress SLO methodology + metrics + optional Grafana dashboard. **Done in repo:** [`runbooks/ingress_gateway_slo.md`](./runbooks/ingress_gateway_slo.md), [`grafana/ingress_gateway_slo.json`](./grafana/ingress_gateway_slo.json). **Per-release** latency/error targets and load numbers stay in operator evidence (ticket / release notes). |
+| **F3** | Formal security review gate. **Done in repo:** [`security_review_gate.md`](./security_review_gate.md) (extends §3.6). **Per-release** sign-off stays in your process (external pen test optional). |
 
-### Phase G — Load balancing, rate limits, TLS management — **Partial** (G1 + **G2** + **G3 basic** + **G4 TLS reload/min-version** shipped)
+### Phase G — Load balancing, rate limits, TLS management — **Partial** (see [`gateway_backlog_progress.md`](./gateway_backlog_progress.md) for **G1–G3** line items)
 
 | ID | Deliverable |
 |----|-------------|
 | **G1** | **Egress upstream pools** in config (multiple base URLs + **round-robin** / weighted); metrics per slot. |
-| **G2** | **Ingress rate limits**: **`api_gateway.ingress.routes[].rate_limit.rps`** (1s window); enforced after successful ingress classify for all backends (**429** + **`Retry-After`**). Top-level **`routes[].rate_limit`** unchanged but shares optional **`api_gateway.ingress.rate_limit_redis`** (`url_env`, `key_prefix`) for **Redis `INCR` + 1s TTL** when set. **Open:** Prometheus label cardinality for per-row RL as in [`panda_api_gateway_features.md`](./panda_api_gateway_features.md). |
-| **G3** | **Egress rate caps** (concurrency or RPS per target) to protect corporate APIs. **Basic slice shipped:** **`api_gateway.egress.rate_limit`** — **`max_in_flight`** (fail-fast) + **`max_rps`** (process-local 1s window); **`panda_egress_requests_total{result="rate_limited"}`**; MCP **`http_tool`** maps **`RateLimited` → HTTP 429** in tool result. **Not shipped:** per-target / per-route egress caps, Redis-coordinated caps. |
-| **G4** | **TLS management:** **`api_gateway.egress.tls.min_protocol_version`** (`tls12` \| `tls13`); Unix **`reload_on_sighup`** re-reads PEMs; **`watch_reload_ms`** polls PEM mtimes. **Not shipped:** explicit **cipher** suite configuration (rustls defaults apply). |
+| **G2** | **Ingress rate limits**: **`api_gateway.ingress.routes[].rate_limit.rps`** (1s window); enforced after successful ingress classify for all backends (**429** + **`Retry-After`**). Top-level **`routes[].rate_limit`** unchanged but shares optional **`api_gateway.ingress.rate_limit_redis`** (`url_env`, `key_prefix`) for **Redis `INCR` + 1s TTL** when set. **Prometheus:** **`panda_gateway_rps_*`** + per-row **`panda_gateway_ingress_rps_total`** (bounded labels). |
+| **G3** | **Egress rate caps:** process-local **`max_in_flight` / `max_rps`**; optional **Redis**-backed and **per-route** caps — details and metrics in [`gateway_backlog_progress.md`](./gateway_backlog_progress.md) **G3**. |
+| **G4** | **TLS management:** **`api_gateway.egress.tls.min_protocol_version`** (`tls12` \| `tls13`); optional **`cipher_suites`**; Unix **`reload_on_sighup`**; **`watch_reload_ms`** PEM mtime poll. |
 
 **Exit:** Feature catalog items for LB, rate limit, TLS management have a concrete config + code path.
 

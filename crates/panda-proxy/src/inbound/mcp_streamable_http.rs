@@ -16,13 +16,12 @@ use hyper::{Response, StatusCode};
 use tokio::time::MissedTickBehavior;
 use tokio_stream::wrappers::IntervalStream;
 
+use panda_config::McpStreamableHttpConfig;
+
 use crate::{text_response, BoxBody};
 
 /// HTTP header carrying the MCP session id (case-insensitive; canonical form per spec examples).
 pub const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
-
-/// Max SSE `message` events retained per session for GET listener replay (`Last-Event-ID`).
-const MCP_SSE_RING_CAP: usize = 64;
 
 #[derive(Debug)]
 struct SseEvent {
@@ -47,6 +46,8 @@ impl SessionRecord {
 pub struct McpStreamableSessionStore {
     inner: Mutex<HashMap<String, SessionRecord>>,
     ttl: Duration,
+    ring_cap: usize,
+    keepalive_interval: Duration,
 }
 
 impl Default for McpStreamableSessionStore {
@@ -57,9 +58,23 @@ impl Default for McpStreamableSessionStore {
 
 impl McpStreamableSessionStore {
     pub fn new() -> Self {
+        Self::from_config(&McpStreamableHttpConfig::default())
+    }
+
+    pub fn from_config(cfg: &McpStreamableHttpConfig) -> Self {
+        Self::with_options(
+            cfg.sse_ring_max_events,
+            Duration::from_secs(cfg.session_ttl_seconds),
+            Duration::from_secs(cfg.sse_keepalive_interval_seconds),
+        )
+    }
+
+    pub(crate) fn with_options(ring_cap: usize, ttl: Duration, keepalive: Duration) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
-            ttl: Duration::from_secs(24 * 3600),
+            ttl,
+            ring_cap,
+            keepalive_interval: keepalive,
         }
     }
 
@@ -112,7 +127,7 @@ impl McpStreamableSessionStore {
         rec.next_event_id = rec.next_event_id.saturating_add(1);
         let chunk = format!("id: {id}\nevent: message\ndata: {json_envelope}\n\n");
         let payload = Bytes::copy_from_slice(chunk.as_bytes());
-        if rec.ring.len() >= MCP_SSE_RING_CAP {
+        if rec.ring.len() >= self.ring_cap {
             rec.ring.pop_front();
         }
         rec.ring.push_back(SseEvent {
@@ -204,7 +219,7 @@ pub(crate) fn mcp_streamable_get_listener_response(
     let after_id = parse_last_event_id(last_event_id);
     let replay = store.replay_events_after(session_id, after_id);
     let replay_stream = stream::iter(replay.into_iter().map(|b| Ok::<_, Infallible>(Frame::data(b))));
-    let mut interval = tokio::time::interval(Duration::from_secs(20));
+    let mut interval = tokio::time::interval(store.keepalive_interval);
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let open = stream::once(async {
         Ok::<_, Infallible>(Frame::data(Bytes::from_static(b": mcp-listener\n\n")))
@@ -254,6 +269,21 @@ pub(crate) fn mcp_session_unknown_response() -> Response<BoxBody> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ring_cap_evicts_oldest() {
+        let s = McpStreamableSessionStore::with_options(
+            2,
+            Duration::from_secs(60),
+            Duration::from_secs(20),
+        );
+        let sid = s.create_session();
+        let _ = s.append_sse_message_event(&sid, r#"{"id":1}"#);
+        let _ = s.append_sse_message_event(&sid, r#"{"id":2}"#);
+        let _ = s.append_sse_message_event(&sid, r#"{"id":3}"#);
+        let r = s.replay_events_after(&sid, 0);
+        assert_eq!(r.len(), 2);
+    }
 
     #[test]
     fn append_then_replay_respects_last_event_id() {

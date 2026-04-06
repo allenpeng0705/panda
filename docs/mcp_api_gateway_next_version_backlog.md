@@ -19,9 +19,9 @@
 
 | ID | Item | Notes |
 |----|------|--------|
-| **F2** | **Ingress load / SLO evidence** | Dedicated methodology + numbers (or pointers to repeatable scripts) for **API gateway ingress** overhead, not only general chat/SSE runbooks. |
-| **Catalog** | **Per-route auth** on ingress rows | Design gap vs [`panda_api_gateway_features.md`](./panda_api_gateway_features.md) / completion matrix. |
-| **G2-open** | **Ingress rate-limit observability** | RPS enforcement works (local + optional Redis); **Prometheus** still lacks safe per-prefix / bounded labels (or aggregates) for ingress RL. |
+| **F2** | **Ingress load / SLO evidence** | **In repo:** [`runbooks/ingress_gateway_slo.md`](./runbooks/ingress_gateway_slo.md) + [`grafana/ingress_gateway_slo.json`](./grafana/ingress_gateway_slo.json). **Per GA:** attach measured p99 / 429 rates (ticket or release notes). |
+| **Catalog** | **Per-route auth** on ingress rows | **`auth`** on ingress rows shipped; remaining catalog gaps (split listen, ACME) vs [`panda_api_gateway_features.md`](./panda_api_gateway_features.md). |
+| **G2-open** | *(optional)* **Ingress RL dashboards** | Counters shipped; operators still need to **import** dashboard / wire alerts in **their** Prometheus. |
 | **Catalog** | **Ingress TLS** | Split listen (admin vs public), ACME, advanced cipher policy — beyond top-level `tls` on `listen`. |
 
 ---
@@ -30,9 +30,7 @@
 
 | ID | Item | Notes |
 |----|------|--------|
-| **G3-open** | **Cluster-wide egress rate limits** | `max_in_flight` / `max_rps` are **process-local**. Optional **Redis** (or equivalent) for shared egress caps if multi-replica fairness matters. |
-| **G3-open** | **Per-target / per-route egress caps** | Finer than global egress `rate_limit`. |
-| **G4-open** | **Explicit cipher suite policy** | `min_protocol_version` + rustls defaults today; no config allowlist/denylist. |
+| **G3** | **Cluster / per-route egress caps + cipher policy** | **Shipped** (see [`gateway_backlog_progress.md`](./gateway_backlog_progress.md) **G3**): optional **`egress.rate_limit.redis`**, **`per_route`** caps with **`route_label`**, **`egress.tls.cipher_suites`** + **`min_protocol_version`**, **`panda_egress_rps_total`**. **Residual:** tune alerts per environment; exotic multi-cluster topologies may still need extra design. |
 
 ---
 
@@ -42,8 +40,8 @@
 |----|------|--------|
 | **E partial** | **Multi-tenant RBAC / row-level namespacing** | Control plane exists; **full** tenant isolation and role model still open per plan. |
 | **E** | **MySQL / Azure SQL stores** | Postgres (and file/sqlite/memory) path exists; other SQL backends not implemented. |
-| **E4-open** | **OIDC roles for control plane** | Called out as open in implementation plan. |
-| **E4-open** | **Redis-backed issuance/revocation UI** (if product needs it) | Distinct from static admin secrets. |
+| **E partial** | **OIDC + Redis keys for control plane** | **Shipped (baseline):** console OIDC session for CP when enabled; **`oidc_read_only_roles`** (read-only vs RW); Redis API keys with **`scopes`** + optional **`tenant_id`** for scoped mutations. **Open:** full multi-tenant RBAC UI, richer role matrix — [`control_plane_evolution.md`](./control_plane_evolution.md). |
+| **E4-open** | **Redis-backed issuance/revocation UI** (if product needs it) | HTTP **`POST/DELETE …/v1/api_keys`** exists when Redis configured; a **productized** operator UI is still optional. |
 
 ---
 
@@ -51,7 +49,7 @@
 
 | ID | Item | Notes |
 |----|------|--------|
-| **F3** | **Security review sign-off** | Checklist in [`implementation_plan_mcp_api_gateway.md`](./implementation_plan_mcp_api_gateway.md) §3.6 — needs explicit **done** record when GA-ready. |
+| **F3** | **Security review sign-off** | **In repo:** [`security_review_gate.md`](./security_review_gate.md) (formal gate). **Per GA:** complete checklist + sign-off block in your ticket system. |
 
 ---
 
@@ -75,8 +73,8 @@
 
 ## Suggested ordering (non-binding)
 
-1. **F2 + F3** when you are targeting a **named GA** for the gateway surface.  
-2. **Ingress RL metrics (G2-open)** + **egress caps (G3-open)** when operators need dashboards and multi-replica fairness.  
+1. **F2 + F3 evidence** — fill SLO evidence table + security sign-off when targeting a **named GA** (see runbooks).  
+2. **Dashboards / alerts** — import [`grafana/ingress_gateway_slo.json`](./grafana/ingress_gateway_slo.json) and egress metrics; tune thresholds per environment (**G2/G3** counters already exist).  
 3. **Streamable MCP (full)** when a concrete client or spec milestone requires it.  
 4. **H3** only if product commits to API-key-based access on ingress.  
 5. **E** depth (RBAC, extra stores) when control-plane becomes customer-facing.

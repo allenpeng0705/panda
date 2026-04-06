@@ -19,7 +19,18 @@
 #   # reload_pubsub:
 #   #   redis_url_env: PANDA_REDIS_URL
 #   #   channel: panda:control_plane:ingress_reload
-#   # GET …/v1/status; GET/POST …/ingress/routes; GET …/ingress/routes/export; POST …/ingress/routes/import?mode=merge|replace; DELETE …/routes?path_prefix=
+#   # Auth (see docs/control_plane_evolution.md): shared secret + optional console OIDC session + optional Redis API keys.
+#   # auth:
+#   #   allow_console_oidc_session: false
+#   #   required_console_roles: [panda-cp-admin]
+#   #   required_console_roles_mode: any
+#   #   oidc_read_only_roles: [panda-cp-viewer]
+#   #   oidc_read_only_roles_mode: any
+#   #   api_keys_redis_url_env: PANDA_REDIS_URL
+#   #   api_keys_redis_key_prefix: panda:cp:apikey:
+#   #   api_key_header: x-panda-control-api-key
+#   # POST …/v1/api_keys body: { "ttl_seconds": 3600, "scopes": ["read"], "tenant_id": "acme" } — scopes read|write; tenant_id scopes ingress mutations.
+#   # GET …/v1 — discovery JSON (endpoints + methods); GET …/v1/status; GET/POST …/ingress/routes; GET …/ingress/routes/export; POST …/ingress/routes/import?mode=merge|replace; DELETE …/routes?path_prefix=
 #   store:
 #     kind: memory   # memory | json_file | sqlite | postgres
 #     # postgres_listen: true   # only with kind: postgres + control-plane-sql — LISTEN panda_cp_ingress; writers NOTIFY after changes
@@ -51,6 +62,7 @@
 #     #     backend: mcp
 #     #     rate_limit:
 #     #       rps: 80
+#     #     # auth: inherit | required | optional   # per-prefix JWT vs global identity.require_jwt
 #     # Optional: shared RPS counters across replicas (also applies to top-level routes[].rate_limit when set).
 #     # Process-local 1s windows if url_env unset or Redis errors (warn + local fallback).
 #     # rate_limit_redis:
@@ -71,15 +83,22 @@
 #     # mcp.servers[].remote_mcp_url: full https://host/path for JSON-RPC MCP client via egress (mutually exclusive with command/http_tool).
 #     # default_headers: [{ name: Authorization, value_env: CORP_API_TOKEN }]
 #     # retry: { max_retries: 2, initial_backoff_ms: 50, max_backoff_ms: 2000 }
-#     # Process-local caps (not shared across replicas): fail-fast concurrency + 1s RPS window
+#     # Process-local caps + optional Redis for cluster-wide 1s RPS windows (same pattern as ingress RPS Redis).
 #     # rate_limit:
 #     #   max_in_flight: 32    # 0 = unlimited; concurrent egress request() ops including retries
-#     #   max_rps: 200         # 0 = unlimited
+#     #   max_rps: 200         # 0 = unlimited; when redis.url_env resolves, shared across replicas
+#     #   redis:
+#     #     url_env: PANDA_GW_EGRESS_RPS_REDIS_URL
+#     #     key_prefix: panda:gw:egress_rps
+#     #   per_route:           # extra cap by MCP/http_tool route_label (EgressHttpRequest.route_label)
+#     #     - { route_label: corp_inventory, max_rps: 50 }
 #     # Optional egress HTTPS client TLS (mTLS + private PKI):
 #     # tls:
 #     #   client_cert_pem: "/path/to/client-fullchain.pem"
 #     #   client_key_pem: "/path/to/client-key.pem"
 #     #   extra_ca_pem: "/path/to/corporate-root-or-intermediate.pem"
+#     #   # Optional cipher allowlist (rustls names, e.g. TLS13_AES_256_GCM_SHA384); empty = default provider list
+#     #   # cipher_suites: [TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256]
 #     #   min_protocol_version: tls12   # or tls13 (TLS 1.3 only); omit for rustls default (1.2+)
 #     #   reload_on_sighup: true        # Unix: re-read PEMs and rebuild client on SIGHUP
 #     #   watch_reload_ms: 60000        # poll PEM mtimes; rebuild client when any changes (>0)
@@ -408,7 +427,11 @@ default_backend: "http://127.0.0.1:5023"
 
 # Phase 4: universal adapter (OpenAI ingress -> backend protocol).
 # adapter:
-#   provider: "openai"   # "openai" or "anthropic"
+#   provider: "openai"   # "anthropic" = native Messages API mapping; otherwise OpenAI-shaped HTTP to backend_base.
+#   # Other allowed labels (same runtime as openai; for clarity in ops): groq, together, mistral, ollama,
+#   # openrouter, perplexity, fireworks, deepinfra, anyscale, xai, deepseek, replicate, lambda, moonshot,
+#   # hyperbolic, siliconflow, novita, azure_openai, openai_compatible, gemini, vertex, bedrock — see
+#   # docs/provider_adapters.md and docs/provider_gemini_bedrock_vertex.md (API keys + base URLs).
 #   anthropic_version: "2023-06-01"
 # Notes:
 # - Anthropic non-streaming chat is mapped to OpenAI chat completion format.

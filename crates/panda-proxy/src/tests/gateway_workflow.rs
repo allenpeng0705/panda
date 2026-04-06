@@ -183,7 +183,8 @@ mcp:
           tool_name: from_a
 "#;
     let cfg = Arc::new(PandaConfig::from_yaml_str(yaml).expect("yaml"));
-    let egress = EgressClient::try_new(&cfg.api_gateway.egress)
+    let egress = EgressClient::connect(&cfg.api_gateway.egress)
+        .await
         .expect("egress")
         .expect("some");
     let ingress = crate::api_gateway::ingress::IngressRouter::try_new(&cfg.api_gateway.ingress)
@@ -271,7 +272,8 @@ mcp:
 "#
     );
     let cfg = Arc::new(PandaConfig::from_yaml_str(&yaml).expect("yaml"));
-    let egress = EgressClient::try_new(&cfg.api_gateway.egress)
+    let egress = EgressClient::connect(&cfg.api_gateway.egress)
+            .await
         .expect("egress try_new")
         .expect("egress some");
     let ingress = crate::api_gateway::ingress::IngressRouter::try_new(&cfg.api_gateway.ingress)
@@ -392,7 +394,8 @@ mcp:
 "#
     );
     let cfg = Arc::new(PandaConfig::from_yaml_str(&yaml).expect("yaml"));
-    let egress = EgressClient::try_new(&cfg.api_gateway.egress)
+    let egress = EgressClient::connect(&cfg.api_gateway.egress)
+        .await
         .expect("egress")
         .expect("some");
     let ingress = crate::api_gateway::ingress::IngressRouter::try_new(&cfg.api_gateway.ingress)
@@ -536,7 +539,8 @@ mcp:
 "#
     );
     let cfg = Arc::new(PandaConfig::from_yaml_str(&yaml).expect("yaml"));
-    let egress = EgressClient::try_new(&cfg.api_gateway.egress)
+    let egress = EgressClient::connect(&cfg.api_gateway.egress)
+        .await
         .expect("egress")
         .expect("some");
     let ingress = crate::api_gateway::ingress::IngressRouter::try_new(&cfg.api_gateway.ingress)

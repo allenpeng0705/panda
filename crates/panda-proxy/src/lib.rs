@@ -276,6 +276,10 @@ struct OpsMetrics {
     /// Keys `server\x1ftool\x1foutcome` (`ok`, `tool_error`, `timeout`, `error`).
     mcp_tool_call_counts: std::sync::Mutex<HashMap<String, u64>>,
     model_failover_midstream_retry_total: std::sync::Mutex<u64>,
+    /// Keys: `ingress_allowed`, `ingress_denied`, `legacy_allowed`, `legacy_denied` (HTTP RPS limiters).
+    gateway_rps: std::sync::Mutex<HashMap<String, u64>>,
+    /// Keys `tenant_id\x1fpath_prefix\x1fallowed|denied` for [`panda_gateway_ingress_rps_total`].
+    gateway_ingress_rps_detail: std::sync::Mutex<HashMap<String, u64>>,
 }
 
 impl OpsMetrics {
@@ -359,6 +363,33 @@ impl OpsMetrics {
     fn inc_model_failover_midstream_retry(&self) {
         if let Ok(mut n) = self.model_failover_midstream_retry_total.lock() {
             *n = n.saturating_add(1);
+        }
+    }
+
+    /// `layer`: `ingress` (API gateway ingress row) or `legacy` (top-level `routes[].rate_limit`).
+    fn inc_gateway_rps(&self, layer: &str, denied: bool) {
+        let key = format!(
+            "{}_{}",
+            layer,
+            if denied { "denied" } else { "allowed" }
+        );
+        if let Ok(mut g) = self.gateway_rps.lock() {
+            *g.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    fn inc_gateway_ingress_rps_row(&self, tenant_id: &str, path_prefix: &str, denied: bool) {
+        let tid = if tenant_id.is_empty() {
+            "-"
+        } else {
+            tenant_id
+        };
+        let key = format!(
+            "{tid}\x1f{path_prefix}\x1f{}",
+            if denied { "denied" } else { "allowed" }
+        );
+        if let Ok(mut g) = self.gateway_ingress_rps_detail.lock() {
+            *g.entry(key).or_insert(0) += 1;
         }
     }
 
@@ -920,6 +951,39 @@ impl OpsMetrics {
                 let outcome = prometheus_escape_label_value(p.next().unwrap_or("-"));
                 out.push_str(&format!(
                     "panda_mcp_tool_calls_total{{server=\"{server}\",tool=\"{tool}\",outcome=\"{outcome}\"}} {count}\n",
+                ));
+            }
+        }
+        out.push_str("# HELP panda_gateway_rps_allowed_total HTTP RPS limiter checks that passed (only when a limit applies).\n");
+        out.push_str("# TYPE panda_gateway_rps_allowed_total counter\n");
+        out.push_str("# HELP panda_gateway_rps_denied_total HTTP RPS limiter checks that returned 429.\n");
+        out.push_str("# TYPE panda_gateway_rps_denied_total counter\n");
+        if let Ok(g) = self.gateway_rps.lock() {
+            for layer in ["ingress", "legacy"] {
+                let a = *g.get(&format!("{layer}_allowed")).unwrap_or(&0);
+                let d = *g.get(&format!("{layer}_denied")).unwrap_or(&0);
+                out.push_str(&format!(
+                    "panda_gateway_rps_allowed_total{{layer=\"{layer}\"}} {a}\n"
+                ));
+                out.push_str(&format!(
+                    "panda_gateway_rps_denied_total{{layer=\"{layer}\"}} {d}\n"
+                ));
+            }
+        }
+        out.push_str(
+            "# HELP panda_gateway_ingress_rps_total Ingress RPS limiter outcomes per matched row (tenant_id, path_prefix).\n",
+        );
+        out.push_str("# TYPE panda_gateway_ingress_rps_total counter\n");
+        if let Ok(g) = self.gateway_ingress_rps_detail.lock() {
+            let mut entries: Vec<(&String, &u64)> = g.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            for (key, count) in entries {
+                let mut p = key.splitn(3, '\x1f');
+                let tenant_id = prometheus_escape_label_value(p.next().unwrap_or("-"));
+                let path_prefix = prometheus_escape_label_value(p.next().unwrap_or("-"));
+                let result = prometheus_escape_label_value(p.next().unwrap_or("-"));
+                out.push_str(&format!(
+                    "panda_gateway_ingress_rps_total{{tenant_id=\"{tenant_id}\",path_prefix=\"{path_prefix}\",result=\"{result}\"}} {count}\n",
                 ));
             }
         }
@@ -1761,7 +1825,8 @@ pub async fn run(config: Arc<PandaConfig>) -> anyhow::Result<()> {
         None
     };
 
-    let egress_client = api_gateway::egress::EgressClient::try_new(&config.api_gateway.egress)?;
+    let egress_client =
+        api_gateway::egress::EgressClient::connect(&config.api_gateway.egress).await?;
     let mcp = mcp::McpRuntime::connect(config.as_ref(), egress_client.as_ref()).await?;
     let mcp_tool_cache = McpToolCacheRuntime::from_config(&config.mcp.tool_cache).map(Arc::new);
     if let Some(ref m) = mcp {
@@ -1883,7 +1948,9 @@ pub async fn run(config: Arc<PandaConfig>) -> anyhow::Result<()> {
         },
         control_plane_api_keys_redis,
         mcp_streamable_sessions: Arc::new(
-            inbound::mcp_streamable_http::McpStreamableSessionStore::new(),
+            inbound::mcp_streamable_http::McpStreamableSessionStore::from_config(
+                &config.mcp.streamable_http,
+            ),
         ),
     });
 
@@ -2178,6 +2245,37 @@ fn tls_pem_mtime_fingerprint(tls: &panda_config::ApiGatewayEgressTlsConfig) -> u
     h
 }
 
+fn egress_rustls_client_config(
+    roots: Arc<rustls::RootCertStore>,
+    cert_path: Option<&str>,
+    key_path: Option<&str>,
+    versions: &[&'static rustls::SupportedProtocolVersion],
+    crypto: Arc<rustls::crypto::CryptoProvider>,
+) -> anyhow::Result<rustls::ClientConfig> {
+    use anyhow::Context;
+    use std::path::Path;
+
+    let builder = rustls::ClientConfig::builder_with_provider(crypto)
+        .with_protocol_versions(versions)
+        .context("egress TLS: protocol versions vs cipher suites")?;
+    let builder = builder.with_root_certificates(Arc::clone(&roots));
+    match (cert_path, key_path) {
+        (Some(cp), Some(kp)) => {
+            let certs = load_pem_certificate_chain(Path::new(cp))
+                .context("api_gateway.egress.tls.client_cert_pem")?;
+            let key = load_pem_private_key(Path::new(kp))
+                .context("api_gateway.egress.tls.client_key_pem")?;
+            builder
+                .with_client_auth_cert(certs, key)
+                .context("egress TLS client certificate")
+        }
+        (None, None) => Ok(builder.with_no_client_auth()),
+        _ => anyhow::bail!(
+            "egress TLS: client_cert_pem and client_key_pem must both be set or both unset"
+        ),
+    }
+}
+
 /// HTTPS-capable client for API gateway egress: WebPKI roots, optional corporate CA PEM, optional mTLS identity.
 pub(crate) fn build_egress_http_client(
     pool_idle_timeout: Option<Duration>,
@@ -2229,67 +2327,35 @@ pub(crate) fn build_egress_http_client(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_ascii_lowercase());
     let roots = Arc::new(roots);
+    let crypto: Arc<rustls::crypto::CryptoProvider> = if tls.cipher_suites.is_empty() {
+        Arc::new(rustls::crypto::ring::default_provider())
+    } else {
+        let mut p = rustls::crypto::ring::default_provider();
+        p.cipher_suites = panda_config::resolve_egress_cipher_suite_names(&tls.cipher_suites)?;
+        Arc::new(p)
+    };
     let tls_config = match min.as_deref() {
-        Some("tls13") => {
-            let builder =
-                rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-                    .with_root_certificates(Arc::clone(&roots));
-            match (cert_path, key_path) {
-                (Some(cp), Some(kp)) => {
-                    let certs = load_pem_certificate_chain(Path::new(cp))
-                        .context("api_gateway.egress.tls.client_cert_pem")?;
-                    let key = load_pem_private_key(Path::new(kp))
-                        .context("api_gateway.egress.tls.client_key_pem")?;
-                    builder
-                        .with_client_auth_cert(certs, key)
-                        .context("egress TLS client certificate")?
-                }
-                (None, None) => builder.with_no_client_auth(),
-                _ => anyhow::bail!(
-                    "egress TLS: client_cert_pem and client_key_pem must both be set or both unset"
-                ),
-            }
-        }
-        Some("tls12") => {
-            let builder = rustls::ClientConfig::builder_with_protocol_versions(&[
-                &rustls::version::TLS12,
-                &rustls::version::TLS13,
-            ])
-            .with_root_certificates(Arc::clone(&roots));
-            match (cert_path, key_path) {
-                (Some(cp), Some(kp)) => {
-                    let certs = load_pem_certificate_chain(Path::new(cp))
-                        .context("api_gateway.egress.tls.client_cert_pem")?;
-                    let key = load_pem_private_key(Path::new(kp))
-                        .context("api_gateway.egress.tls.client_key_pem")?;
-                    builder
-                        .with_client_auth_cert(certs, key)
-                        .context("egress TLS client certificate")?
-                }
-                (None, None) => builder.with_no_client_auth(),
-                _ => anyhow::bail!(
-                    "egress TLS: client_cert_pem and client_key_pem must both be set or both unset"
-                ),
-            }
-        }
-        _ => {
-            let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
-            match (cert_path, key_path) {
-                (Some(cp), Some(kp)) => {
-                    let certs = load_pem_certificate_chain(Path::new(cp))
-                        .context("api_gateway.egress.tls.client_cert_pem")?;
-                    let key = load_pem_private_key(Path::new(kp))
-                        .context("api_gateway.egress.tls.client_key_pem")?;
-                    builder
-                        .with_client_auth_cert(certs, key)
-                        .context("egress TLS client certificate")?
-                }
-                (None, None) => builder.with_no_client_auth(),
-                _ => anyhow::bail!(
-                    "egress TLS: client_cert_pem and client_key_pem must both be set or both unset"
-                ),
-            }
-        }
+        Some("tls13") => egress_rustls_client_config(
+            Arc::clone(&roots),
+            cert_path,
+            key_path,
+            &[&rustls::version::TLS13],
+            Arc::clone(&crypto),
+        )?,
+        Some("tls12") => egress_rustls_client_config(
+            Arc::clone(&roots),
+            cert_path,
+            key_path,
+            &[&rustls::version::TLS12, &rustls::version::TLS13],
+            Arc::clone(&crypto),
+        )?,
+        _ => egress_rustls_client_config(
+            Arc::clone(&roots),
+            cert_path,
+            key_path,
+            rustls::DEFAULT_VERSIONS,
+            Arc::clone(&crypto),
+        )?,
     };
 
     let https = hyper_rustls::HttpsConnectorBuilder::new()
@@ -2439,6 +2505,15 @@ fn ingress_backend_label(b: panda_config::ApiGatewayIngressBackend) -> &'static 
     }
 }
 
+fn ingress_auth_label(mode: panda_config::ApiGatewayIngressAuthMode) -> &'static str {
+    use panda_config::ApiGatewayIngressAuthMode as M;
+    match mode {
+        M::Inherit => "inherit",
+        M::Required => "required",
+        M::Optional => "optional",
+    }
+}
+
 fn control_plane_status_json(state: &ProxyState) -> serde_json::Value {
     use panda_config::ControlPlaneStoreKind as Csk;
     let cp = &state.config.control_plane;
@@ -2483,6 +2558,8 @@ fn control_plane_status_json(state: &ProxyState) -> serde_json::Value {
                 "allow_console_oidc_session": auth.allow_console_oidc_session,
                 "required_console_roles_mode": auth.required_console_roles_mode,
                 "required_console_roles_count": auth.required_console_roles.len(),
+                "oidc_read_only_roles_mode": auth.oidc_read_only_roles_mode,
+                "oidc_read_only_roles_count": auth.oidc_read_only_roles.len(),
                 "api_key_header_set": !auth.api_key_header.trim().is_empty(),
                 "api_keys_redis_configured": auth
                     .api_keys_redis_url_env
@@ -2499,6 +2576,7 @@ fn control_plane_status_json(state: &ProxyState) -> serde_json::Value {
             },
         },
         "capabilities": [
+            "discovery",
             "status",
             "ingress_routes_read",
             "ingress_routes_export",
@@ -2506,8 +2584,15 @@ fn control_plane_status_json(state: &ProxyState) -> serde_json::Value {
             "ingress_routes_upsert",
             "ingress_routes_delete",
             "api_keys_issue",
-            "api_keys_revoke"
+            "api_keys_revoke",
+            "runtime_summary",
+            "mcp_config_read"
         ],
+        "api_gateway": {
+            "ingress_enabled": state.config.api_gateway.ingress.enabled,
+            "egress_enabled": state.config.api_gateway.egress.enabled,
+            "ingress_router_built": state.ingress_router.is_some(),
+        },
         "dynamic_routes": {
             "overlay": true,
             "in_memory_count": state.dynamic_ingress.route_count(),
@@ -2536,6 +2621,7 @@ fn ingress_dynamic_entry_wire(
         "backend": ingress_backend_label(e.backend),
         "methods": e.methods.iter().map(|m| m.as_str()).collect::<Vec<_>>(),
         "backend_base": e.upstream,
+        "auth": ingress_auth_label(e.auth),
     })
 }
 
@@ -2552,6 +2638,7 @@ fn control_plane_ingress_routes_json(state: &ProxyState) -> serde_json::Value {
                 "backend": ingress_backend_label(r.backend),
                 "methods": r.methods,
                 "backend_base": r.backend_base,
+                "auth": ingress_auth_label(r.auth),
             })
         })
         .collect();
@@ -2570,6 +2657,36 @@ fn control_plane_ingress_routes_json(state: &ProxyState) -> serde_json::Value {
     })
 }
 
+/// Machine-readable index of control-plane routes (paths relative to `control_plane.path_prefix`).
+fn control_plane_discovery_json(state: &ProxyState) -> serde_json::Value {
+    let raw = state.config.control_plane.path_prefix.trim();
+    let base = if raw.is_empty() {
+        "/ops/control"
+    } else {
+        raw.trim_end_matches('/')
+    };
+    serde_json::json!({
+        "panda_control_plane_api": "1",
+        "path_prefix": base,
+        "title": "Panda control plane HTTP API",
+        "documentation": "docs/control_plane_evolution.md",
+        "endpoints": [
+            { "path": "/v1", "methods": ["GET"], "description": "This discovery document (no secrets)." },
+            { "path": "/v1/status", "methods": ["GET"], "description": "Store, auth flags, ingress counts — no secrets." },
+            { "path": "/v1/runtime/summary", "methods": ["GET"], "description": "MCP + api_gateway effective snapshot (no secrets; like portal summary subset)." },
+            { "path": "/v1/mcp/config", "methods": ["GET"], "description": "MCP YAML summary: transports and counts only (no URLs or commands)." },
+            { "path": "/v1/api_gateway/ingress/routes", "methods": ["GET"], "description": "List YAML + dynamic ingress routes." },
+            { "path": "/v1/api_gateway/ingress/routes", "methods": ["POST"], "description": "Upsert one dynamic ingress route (JSON body)." },
+            { "path": "/v1/api_gateway/ingress/routes", "methods": ["DELETE"], "description": "Remove dynamic route (?path_prefix= & optional tenant_id=)." },
+            { "path": "/v1/api_gateway/ingress/routes/export", "methods": ["GET"], "description": "Export dynamic routes as JSON." },
+            { "path": "/v1/api_gateway/ingress/routes/import", "methods": ["POST"], "description": "Import routes (?mode=merge|replace)." },
+            { "path": "/v1/api_keys", "methods": ["POST"], "description": "Issue API key (optional ttl_seconds, scopes, tenant_id)." },
+            { "path": "/v1/api_keys", "methods": ["DELETE"], "description": "Revoke API key (?token=)." }
+        ],
+        "note": "Authenticate with observability.admin_auth_header and configured secrets, or control_plane.auth (OIDC session / Redis API key header). Mutating routes may require matching tenant when using a tenant-scoped API key. Ingress POST/import rows are validated with the same rules as static YAML (path_prefix, methods, backend_base, rate_limit)."
+    })
+}
+
 async fn dispatch(
     mut req: Request<Incoming>,
     state: Arc<ProxyState>,
@@ -2585,7 +2702,7 @@ async fn dispatch(
     if let Some(rest) = control_plane_rest_path(&path, &state.config) {
         let corr_ops = ops_log_correlation_id(req.headers(), &state.config);
         let bucket = ops_bucket_for_path(&path, req.headers(), state.as_ref()).await;
-        let cp_access = match enforce_control_plane_auth_async(
+        let cp_ctx = match enforce_control_plane_auth_async(
             req.headers(),
             &state.config,
             state.console_oidc.as_ref(),
@@ -2600,7 +2717,8 @@ async fn dispatch(
                 return Ok(resp);
             }
         };
-        if cp_access == ControlPlaneAccess::ReadOnly && control_plane_route_is_mutating(rest, &method)
+        if cp_ctx.access == ControlPlaneAccess::ReadOnly
+            && control_plane_route_is_mutating(rest, &method)
         {
             state.ops_metrics.inc_ops_auth_denied(&path);
             log_ops_access(&path, "deny_read_only_mutate", &corr_ops, bucket.as_deref());
@@ -2643,6 +2761,25 @@ async fn dispatch(
         };
 
         match rest {
+            "/v1" => {
+                if method != hyper::Method::GET {
+                    trace_request(
+                        &path,
+                        &method,
+                        &corr,
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        started.elapsed().as_millis(),
+                    );
+                    let mut resp = text_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "control plane: only GET for /v1",
+                    );
+                    resp.headers_mut()
+                        .insert(header::ALLOW, HeaderValue::from_static("GET"));
+                    return Ok(resp);
+                }
+                return cp_finish_ok(state.as_ref(), control_plane_discovery_json(state.as_ref()));
+            }
             "/v1/api_keys" => match method {
                 hyper::Method::POST => {
                     let Some(mut rconn) = state.control_plane_api_keys_redis.clone() else {
@@ -2658,8 +2795,14 @@ async fn dispatch(
                         Ok(b) => b,
                         Err(e) => return Ok(proxy_error_response(e)),
                     };
-                    let ttl: Option<u64> = if bytes.is_empty() {
-                        None
+                    let (ttl, record) = if bytes.is_empty() {
+                        (
+                            None,
+                            api_gateway::control_plane_store::ControlPlaneApiKeyRecord {
+                                scopes: vec!["write".to_string()],
+                                tenant_id: None,
+                            },
+                        )
                     } else {
                         let v: serde_json::Value = match serde_json::from_slice(&bytes) {
                             Ok(v) => v,
@@ -2670,7 +2813,32 @@ async fn dispatch(
                                 ));
                             }
                         };
-                        v.get("ttl_seconds").and_then(|x| x.as_u64())
+                        let ttl = v.get("ttl_seconds").and_then(|x| x.as_u64());
+                        let mut scopes: Vec<String> = v
+                            .get("scopes")
+                            .and_then(|x| x.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if scopes.is_empty() {
+                            scopes.push("write".to_string());
+                        }
+                        let tenant_id = v
+                            .get("tenant_id")
+                            .and_then(|x| x.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string());
+                        (
+                            ttl,
+                            api_gateway::control_plane_store::ControlPlaneApiKeyRecord {
+                                scopes,
+                                tenant_id,
+                            },
+                        )
                     };
                     let prefix = state
                         .config
@@ -2679,7 +2847,7 @@ async fn dispatch(
                         .api_keys_redis_key_prefix
                         .as_str();
                     match api_gateway::control_plane_store::control_plane_api_key_issue(
-                        &mut rconn, prefix, ttl,
+                        &mut rconn, prefix, ttl, &record,
                     )
                     .await
                     {
@@ -2774,6 +2942,41 @@ async fn dispatch(
                 }
                 return cp_finish_ok(state.as_ref(), control_plane_status_json(state.as_ref()));
             }
+            "/v1/runtime/summary" => {
+                if method != hyper::Method::GET {
+                    trace_request(
+                        &path,
+                        &method,
+                        &corr,
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        started.elapsed().as_millis(),
+                    );
+                    return Ok(text_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "control plane: only GET for /v1/runtime/summary",
+                    ));
+                }
+                return cp_finish_ok(
+                    state.as_ref(),
+                    control_plane_runtime_summary_json(state.as_ref()),
+                );
+            }
+            "/v1/mcp/config" => {
+                if method != hyper::Method::GET {
+                    trace_request(
+                        &path,
+                        &method,
+                        &corr,
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        started.elapsed().as_millis(),
+                    );
+                    return Ok(text_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "control plane: only GET for /v1/mcp/config",
+                    ));
+                }
+                return cp_finish_ok(state.as_ref(), control_plane_mcp_config_json(state.as_ref()));
+            }
             "/v1/api_gateway/ingress/routes/export" => {
                 if method != hyper::Method::GET {
                     trace_request(
@@ -2852,6 +3055,20 @@ async fn dispatch(
                         ));
                     }
                 };
+                if let Some(ref kt) = cp_ctx.api_key_tenant_id {
+                    let kt = kt.as_str();
+                    for r in &routes {
+                        let rt = r.tenant_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+                        if !control_plane_api_key_tenant_allows_route_str(Some(kt), rt) {
+                            return Ok(json_response(
+                                StatusCode::FORBIDDEN,
+                                serde_json::json!({
+                                    "error": "tenant-scoped API key cannot import routes for other tenants"
+                                }),
+                            ));
+                        }
+                    }
+                }
                 match api_gateway::control_plane_store::import_dynamic_routes(
                     state.dynamic_ingress.as_ref(),
                     routes,
@@ -2940,6 +3157,21 @@ async fn dispatch(
                             ));
                         }
                     };
+                    if let Some(ref kt) = cp_ctx.api_key_tenant_id {
+                        let rt = route
+                            .tenant_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty());
+                        if !control_plane_api_key_tenant_allows_route_str(Some(kt.as_str()), rt) {
+                            return Ok(json_response(
+                                StatusCode::FORBIDDEN,
+                                serde_json::json!({
+                                    "error": "tenant-scoped API key cannot upsert routes for other tenants"
+                                }),
+                            ));
+                        }
+                    }
                     match state.dynamic_ingress.upsert_route_persisted(&route).await {
                         Ok(()) => {
                             control_plane_publish_redis_reload(&state.config).await;
@@ -2999,6 +3231,22 @@ async fn dispatch(
                     let raw_tenant = query_param_first(req.uri(), "tenant_id")
                         .map(|s| s.trim().to_string())
                         .unwrap_or_default();
+                    if let Some(ref kt) = cp_ctx.api_key_tenant_id {
+                        let rt = raw_tenant.as_str().trim();
+                        let rt_opt = if rt.is_empty() {
+                            None
+                        } else {
+                            Some(rt)
+                        };
+                        if !control_plane_api_key_tenant_allows_route_str(Some(kt.as_str()), rt_opt) {
+                            return Ok(json_response(
+                                StatusCode::FORBIDDEN,
+                                serde_json::json!({
+                                    "error": "tenant-scoped API key cannot delete routes for other tenants"
+                                }),
+                            ));
+                        }
+                    }
                     match state
                         .dynamic_ingress
                         .remove_route_persisted(&raw_tenant, &raw_p)
@@ -3086,6 +3334,7 @@ async fn dispatch(
         let api_gateway::ingress::IngressClassifyMerged {
             classify,
             ingress_rps,
+            auth_mode,
         } = api_gateway::ingress::classify_merged(
             router.as_ref(),
             &dynamic,
@@ -3164,8 +3413,13 @@ async fn dispatch(
                     .unwrap());
             }
             IngressClassify::Allow { backend, upstream } => {
+                req.extensions_mut().insert(IngressDispatchAuth { mode: auth_mode });
                 if let (Some(lim), Some(ik)) = (&state.rps, ingress_rps.as_ref()) {
                     if let Err(cap) = lim.check_ingress(ik).await {
+                        state.ops_metrics.inc_gateway_rps("ingress", true);
+                        state
+                            .ops_metrics
+                            .inc_gateway_ingress_rps_row(&ik.tenant_id, &ik.path_prefix, true);
                         trace_request(
                             &path,
                             &method,
@@ -3200,6 +3454,12 @@ async fn dispatch(
                             h.insert(HeaderName::from_static("x-panda-rps-limit"), v);
                         }
                         return Ok(resp);
+                    }
+                    if ik.rps > 0 {
+                        state.ops_metrics.inc_gateway_rps("ingress", false);
+                        state
+                            .ops_metrics
+                            .inc_gateway_ingress_rps_row(&ik.tenant_id, &ik.path_prefix, false);
                     }
                 }
                 match backend {
@@ -3279,6 +3539,16 @@ async fn dispatch(
                         return Ok(text_response(StatusCode::NOT_FOUND, "ingress: not found"));
                     }
                     Igb::Mcp => {
+                        if let Err(resp) = enforce_jwt_effective(&req, state.as_ref()).await {
+                            trace_request(
+                                &path,
+                                &method,
+                                &corr,
+                                resp.status(),
+                                started.elapsed().as_millis(),
+                            );
+                            return Ok(resp);
+                        }
                         let resp = inbound::mcp_http_ingress::handle_mcp_ingress_http(
                             req,
                             state.as_ref(),
@@ -3648,7 +3918,7 @@ async fn dispatch(
         return Ok(json_response(StatusCode::OK, json));
     }
 
-    if let Err(resp) = enforce_jwt_if_required(&req, state.as_ref()).await {
+    if let Err(resp) = enforce_jwt_effective(&req, state.as_ref()).await {
         trace_request(
             &path,
             &method,
@@ -3762,6 +4032,33 @@ async fn enforce_jwt_if_required(
     Ok(())
 }
 
+async fn enforce_jwt_effective(
+    req: &Request<Incoming>,
+    state: &ProxyState,
+) -> Result<(), Response<BoxBody>> {
+    use panda_config::ApiGatewayIngressAuthMode as M;
+    let mode = req
+        .extensions()
+        .get::<IngressDispatchAuth>()
+        .map(|a| a.mode)
+        .unwrap_or(M::Inherit);
+    match mode {
+        M::Optional => Ok(()),
+        M::Required => {
+            if let Err(msg) = validate_bearer_jwt(req.headers(), req.uri().path(), state).await {
+                let status = if msg.starts_with("forbidden:") {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::UNAUTHORIZED
+                };
+                return Err(text_response(status, msg));
+            }
+            Ok(())
+        }
+        M::Inherit => enforce_jwt_if_required(req, state).await,
+    }
+}
+
 fn enforce_ops_auth_if_configured(
     headers: &HeaderMap,
     cfg: &PandaConfig,
@@ -3809,10 +4106,32 @@ enum ControlPlaneAccess {
     ReadOnly,
 }
 
+#[derive(Clone)]
+struct ControlPlaneAuthContext {
+    access: ControlPlaneAccess,
+    /// Set when auth is a Redis API key with an optional tenant scope (ingress mutations must match).
+    api_key_tenant_id: Option<String>,
+}
+
+fn control_plane_api_key_tenant_allows_route_str(
+    key_tenant: Option<&str>,
+    route_tenant: Option<&str>,
+) -> bool {
+    let kt = key_tenant.map(str::trim).filter(|s| !s.is_empty());
+    let rt = route_tenant.map(str::trim).filter(|s| !s.is_empty());
+    match kt {
+        None => true,
+        Some(k) => rt == Some(k),
+    }
+}
+
 /// True for routes that change dynamic ingress, API keys, or other mutable control-plane state.
 fn control_plane_route_is_mutating(rest: &str, method: &hyper::Method) -> bool {
     match rest {
+        "/v1" => method != &hyper::Method::GET,
         "/v1/status" => method != &hyper::Method::GET,
+        "/v1/runtime/summary" => method != &hyper::Method::GET,
+        "/v1/mcp/config" => method != &hyper::Method::GET,
         "/v1/api_gateway/ingress/routes/export" => method != &hyper::Method::GET,
         "/v1/api_gateway/ingress/routes" => method != &hyper::Method::GET,
         "/v1/api_gateway/ingress/routes/import" => true,
@@ -3914,19 +4233,39 @@ async fn enforce_control_plane_auth_async(
     cfg: &PandaConfig,
     console_oidc: Option<&Arc<console_oidc::ConsoleOidcRuntime>>,
     cp_redis: Option<&redis::aio::ConnectionManager>,
-) -> Result<ControlPlaneAccess, Response<BoxBody>> {
+) -> Result<ControlPlaneAuthContext, Response<BoxBody>> {
     if try_control_plane_secrets(headers, cfg) {
-        return Ok(ControlPlaneAccess::ReadWrite);
+        return Ok(ControlPlaneAuthContext {
+            access: ControlPlaneAccess::ReadWrite,
+            api_key_tenant_id: None,
+        });
     }
     if try_control_plane_read_only_secrets(headers, cfg) {
-        return Ok(ControlPlaneAccess::ReadOnly);
+        return Ok(ControlPlaneAuthContext {
+            access: ControlPlaneAccess::ReadOnly,
+            api_key_tenant_id: None,
+        });
     }
     let a = &cfg.control_plane.auth;
     if a.allow_console_oidc_session {
         if let Some(oc) = console_oidc {
-            let mode = a.required_console_roles_mode.as_str();
-            if oc.control_plane_session_authorized(headers, &a.required_console_roles, mode) {
-                return Ok(ControlPlaneAccess::ReadWrite);
+            let rw_mode = a.required_console_roles_mode.as_str();
+            let ro_mode = a.oidc_read_only_roles_mode.as_str();
+            if let Some(tier) = oc.control_plane_oidc_access(
+                headers,
+                &a.required_console_roles,
+                rw_mode,
+                &a.oidc_read_only_roles,
+                ro_mode,
+            ) {
+                let access = match tier {
+                    console_oidc::ControlPlaneOidcAccess::ReadWrite => ControlPlaneAccess::ReadWrite,
+                    console_oidc::ControlPlaneOidcAccess::ReadOnly => ControlPlaneAccess::ReadOnly,
+                };
+                return Ok(ControlPlaneAuthContext {
+                    access,
+                    api_key_tenant_id: None,
+                });
             }
         }
     }
@@ -3940,14 +4279,25 @@ async fn enforce_control_plane_auth_async(
                 .filter(|s| !s.is_empty())
             {
                 let mut c = conn.clone();
-                if api_gateway::control_plane_store::control_plane_api_key_valid(
+                if let Some((level, tenant)) = api_gateway::control_plane_store::control_plane_api_key_access(
                     &mut c,
                     a.api_keys_redis_key_prefix.as_str(),
                     tok,
                 )
                 .await
                 {
-                    return Ok(ControlPlaneAccess::ReadWrite);
+                    let access = match level {
+                        api_gateway::control_plane_store::ControlPlaneApiKeyAccessLevel::ReadWrite => {
+                            ControlPlaneAccess::ReadWrite
+                        }
+                        api_gateway::control_plane_store::ControlPlaneApiKeyAccessLevel::ReadOnly => {
+                            ControlPlaneAccess::ReadOnly
+                        }
+                    };
+                    return Ok(ControlPlaneAuthContext {
+                        access,
+                        api_key_tenant_id: tenant,
+                    });
                 }
             }
         }
@@ -5729,6 +6079,15 @@ fn api_gateway_status_json(state: &ProxyState) -> serde_json::Value {
         .as_deref()
         .map(str::trim)
         .is_some_and(|s| !s.is_empty());
+    let rl = &eg.rate_limit;
+    let redis_env_set = rl
+        .redis
+        .url_env
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty());
+    let redis_effective = eg.effective_rate_limit_redis_url().is_some();
+    let cipher_restricted = !tls.cipher_suites.is_empty();
     serde_json::json!({
         "ingress": {
             "enabled": ing.enabled,
@@ -5745,10 +6104,207 @@ fn api_gateway_status_json(state: &ProxyState) -> serde_json::Value {
             "tls": {
                 "client_auth_configured": client_auth,
                 "extra_ca_configured": extra_ca,
+                "cipher_suite_policy": if cipher_restricted { "restricted" } else { "default" },
+                "cipher_suites_configured_count": tls.cipher_suites.len(),
+                "min_protocol_version": tls.min_protocol_version.as_deref().map(str::trim).filter(|s| !s.is_empty()),
             },
             "rate_limit": {
-                "max_in_flight": eg.rate_limit.max_in_flight,
-                "max_rps": eg.rate_limit.max_rps,
+                "max_in_flight": rl.max_in_flight,
+                "max_rps": rl.max_rps,
+                "redis_url_env_set": redis_env_set,
+                "redis_key_prefix": rl.redis.key_prefix.trim(),
+                "redis_resolved_at_process_start": redis_effective,
+                "per_route_caps_count": rl.per_route.len(),
+            },
+        },
+    })
+}
+
+/// Read-only snapshot for control-plane auth (MCP + API gateway egress/ingress effective flags; no secrets).
+fn control_plane_runtime_summary_json(state: &ProxyState) -> serde_json::Value {
+    let cfg = state.config.as_ref();
+    let (mcp_runtime, mcp_enabled_servers) = match state.mcp.as_ref() {
+        Some(rt) => (true, rt.enabled_server_count()),
+        None => (false, 0),
+    };
+    let redis_env_nonempty = std::env::var("PANDA_REDIS_URL")
+        .ok()
+        .is_some_and(|s| !s.trim().is_empty());
+    let tpm_redis_yaml = cfg
+        .tpm
+        .redis_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some();
+    let tpm_redis_configured = tpm_redis_yaml || redis_env_nonempty;
+    let bh = &cfg.budget_hierarchy;
+    let bh_redis_explicit = bh
+        .redis_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some();
+    // Same fallback order as runtime: `budget_hierarchy.redis_url` else `tpm.redis_url` / `PANDA_REDIS_URL`.
+    let budget_hierarchy_redis_configured = bh_redis_explicit || tpm_redis_configured;
+    serde_json::json!({
+        "kind": "panda_control_plane_runtime_summary",
+        "version": env!("CARGO_PKG_VERSION"),
+        "note": "Read-only snapshot for automation (no secrets). Subset aligned with /portal/summary.json.",
+        "listener": {
+            "configured_listen": cfg.listen.trim(),
+            "tls_terminator_enabled": cfg.tls.is_some(),
+        },
+        "routing": {
+            "default_backend_configured": !cfg.default_backend.trim().is_empty(),
+            "path_routes_count": cfg.routes.len(),
+        },
+        "identity": {
+            "require_jwt": cfg.identity.require_jwt,
+            "jwks_url_configured": cfg
+                .identity
+                .jwks_url
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty()),
+        },
+        "mcp": {
+            "config_enabled": cfg.mcp.enabled,
+            "servers_configured": cfg.mcp.servers.len(),
+            "runtime_connected": mcp_runtime,
+            "enabled_servers_runtime": mcp_enabled_servers,
+            "advertise_tools": cfg.mcp.advertise_tools,
+        },
+        "plugins": {
+            "wasm_runtime_loaded": state.plugins.is_some(),
+        },
+        "semantic_cache": {
+            "config_enabled": cfg.semantic_cache.enabled,
+            "runtime_active": state.semantic_cache.is_some(),
+        },
+        "agent_sessions": {
+            "enabled": cfg.agent_sessions.enabled,
+        },
+        "model_failover": {
+            "enabled": cfg.model_failover.enabled,
+            "groups_configured": cfg.model_failover.groups.len(),
+        },
+        "budget_hierarchy": {
+            "enabled": bh.enabled,
+            "jwt_claim": bh.jwt_claim.trim(),
+            "departments_configured": bh.departments.len(),
+            "org_prompt_tokens_per_minute_configured": bh.org_prompt_tokens_per_minute.is_some(),
+            "redis_url_configured": budget_hierarchy_redis_configured,
+            "fail_open": bh.fail_open,
+            "runtime_active": state.budget_hierarchy.is_some(),
+            "usd_per_million_prompt_tokens_configured": bh.usd_per_million_prompt_tokens.is_some(),
+        },
+        "tpm": {
+            "enforce_budget": cfg.tpm.enforce_budget,
+            "budget_tokens_per_minute": cfg.tpm.budget_tokens_per_minute,
+            "redis_url_configured": tpm_redis_configured,
+            "retry_after_seconds_configured": cfg.tpm.retry_after_seconds.is_some(),
+            "redis_unavailable_degraded_limits": cfg.tpm.redis_unavailable_degraded_limits,
+            "redis_command_error_degraded_limits": cfg.tpm.redis_command_error_degraded_limits,
+            "redis_degraded_limit_ratio": cfg.tpm.redis_degraded_limit_ratio,
+        },
+        "api_gateway": api_gateway_status_json(state),
+    })
+}
+
+/// Non-secret MCP YAML summary for control-plane automation (no command lines, URLs, or env values).
+fn control_plane_mcp_config_json(state: &ProxyState) -> serde_json::Value {
+    let m = &state.config.mcp;
+    let sh = &m.streamable_http;
+    let hitl = &m.hitl;
+    let tr = &m.tool_routes;
+    let tc = &m.tool_cache;
+    let servers: Vec<serde_json::Value> = m
+        .servers
+        .iter()
+        .map(|s| {
+            let transport =
+                if s
+                    .remote_mcp_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|x| !x.is_empty())
+                    .is_some()
+                {
+                    "remote_mcp"
+                } else if s
+                    .command
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|x| !x.is_empty())
+                    .is_some()
+                {
+                    "command"
+                } else if s.http_tool.is_some() {
+                    "http_tool"
+                } else if !s.http_tools.is_empty() {
+                    "http_tools"
+                } else {
+                    "none"
+                };
+            serde_json::json!({
+                "name": s.name.trim(),
+                "enabled": s.enabled,
+                "transport": transport,
+                "remote_mcp_egress_profile_configured": s
+                    .remote_mcp_egress_profile
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|x| !x.is_empty())
+                    .is_some(),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "kind": "panda_control_plane_mcp_config",
+        "version": env!("CARGO_PKG_VERSION"),
+        "note": "Non-secret MCP config summary. Command lines, remote URLs, and HITL approval URLs are omitted.",
+        "mcp": {
+            "enabled": m.enabled,
+            "fail_open": m.fail_open,
+            "advertise_tools": m.advertise_tools,
+            "proof_of_intent_mode": m.proof_of_intent_mode.trim(),
+            "tool_timeout_ms": m.tool_timeout_ms,
+            "max_tool_payload_bytes": m.max_tool_payload_bytes,
+            "max_tool_rounds": m.max_tool_rounds,
+            "stream_probe_bytes": m.stream_probe_bytes,
+            "probe_window_seconds": m.probe_window_seconds,
+            "intent_tool_policies_count": m.intent_tool_policies.len(),
+            "servers": servers,
+            "hitl": {
+                "enabled": hitl.enabled,
+                "approval_url_configured": !hitl.approval_url.trim().is_empty(),
+                "tools_count": hitl.tools.len(),
+                "fail_open": hitl.fail_open,
+                "bearer_token_env_configured": hitl
+                    .bearer_token_env
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .is_some(),
+            },
+            "tool_routes": {
+                "enabled": tr.enabled,
+                "rules_count": tr.rules.len(),
+                "unmatched": tr.unmatched.trim(),
+            },
+            "tool_cache": {
+                "enabled": tc.enabled,
+                "backend": tc.backend.trim(),
+                "default_ttl_seconds": tc.default_ttl_seconds,
+                "max_value_bytes": tc.max_value_bytes,
+                "compliance_log_misses": tc.compliance_log_misses,
+                "allow_rules_count": tc.allow.len(),
+            },
+            "streamable_http": {
+                "sse_ring_max_events": sh.sse_ring_max_events,
+                "session_ttl_seconds": sh.session_ttl_seconds,
+                "sse_keepalive_interval_seconds": sh.sse_keepalive_interval_seconds,
             },
         },
     })
@@ -5789,8 +6345,23 @@ fn portal_management_links(cfg: &PandaConfig) -> Vec<serde_json::Value> {
         };
         if !base.is_empty() {
             v.push(serde_json::json!({
+                "title": "Control plane API discovery",
+                "href": format!("{base}/v1"),
+                "auth": "ops_or_control_plane_secret"
+            }));
+            v.push(serde_json::json!({
                 "title": "Control plane API status",
                 "href": format!("{base}/v1/status"),
+                "auth": "ops_or_control_plane_secret"
+            }));
+            v.push(serde_json::json!({
+                "title": "Control plane runtime summary (MCP + API gateway)",
+                "href": format!("{base}/v1/runtime/summary"),
+                "auth": "ops_or_control_plane_secret"
+            }));
+            v.push(serde_json::json!({
+                "title": "Control plane MCP config (non-secret)",
+                "href": format!("{base}/v1/mcp/config"),
                 "auth": "ops_or_control_plane_secret"
             }));
         }
@@ -6102,7 +6673,10 @@ fn fleet_status_json(state: &ProxyState) -> serde_json::Value {
             raw.trim_end_matches('/').to_string()
         };
         if !base.is_empty() {
+            ops_endpoints.push(format!("{base}/v1"));
             ops_endpoints.push(format!("{base}/v1/status"));
+            ops_endpoints.push(format!("{base}/v1/runtime/summary"));
+            ops_endpoints.push(format!("{base}/v1/mcp/config"));
             ops_endpoints.push(format!("{base}/v1/api_gateway/ingress/routes"));
             ops_endpoints.push(format!("{base}/v1/api_gateway/ingress/routes/export"));
             ops_endpoints.push(format!("{base}/v1/api_gateway/ingress/routes/import"));
@@ -6491,6 +7065,12 @@ fn is_sse(headers: &HeaderMap) -> bool {
 #[derive(Clone, Debug)]
 struct IngressAiUpstreamOverride(String);
 
+/// Per-request ingress JWT policy from the winning [`api_gateway::ingress::IngressClassifyMerged::auth_mode`].
+#[derive(Clone, Copy, Debug)]
+struct IngressDispatchAuth {
+    mode: panda_config::ApiGatewayIngressAuthMode,
+}
+
 async fn forward_to_upstream(
     mut req: Request<Incoming>,
     state: &ProxyState,
@@ -6532,8 +7112,15 @@ async fn forward_to_upstream(
             .to_string()
     };
     if let Some(ref rps) = state.rps {
+        let legacy_tracks = rps.legacy_limit_applies(state.config.as_ref(), &ingress_path);
         if let Err(limit) = rps.check_route(state.config.as_ref(), &ingress_path).await {
+            if legacy_tracks {
+                state.ops_metrics.inc_gateway_rps("legacy", true);
+            }
             return Err(ProxyError::RpsLimited { rps: limit });
+        }
+        if legacy_tracks {
+            state.ops_metrics.inc_gateway_rps("legacy", false);
         }
     }
 
@@ -9651,8 +10238,9 @@ mcp:
 "#
         );
         let cfg = Arc::new(PandaConfig::from_yaml_str(&yaml).expect("yaml"));
-        let egress = EgressClient::try_new(&cfg.api_gateway.egress)
-            .expect("egress try_new")
+        let egress = EgressClient::connect(&cfg.api_gateway.egress)
+            .await
+            .expect("egress connect")
             .expect("egress some");
         let ingress = crate::api_gateway::ingress::IngressRouter::try_new(&cfg.api_gateway.ingress)
             .expect("ingress router");
@@ -10517,6 +11105,10 @@ control_plane:
             super::control_plane_rest_path("/admin/cp/v1/api_gateway/ingress/routes", &cfg),
             Some("/v1/api_gateway/ingress/routes")
         );
+        assert_eq!(
+            super::control_plane_rest_path("/admin/cp/v1", &cfg),
+            Some("/v1")
+        );
         assert!(super::control_plane_rest_path("/ops/control/v1/status", &cfg).is_none());
         let off =
             PandaConfig::from_yaml_str("listen: '127.0.0.1:0'\ndefault_backend: 'http://127.0.0.1:1'\n")
@@ -10597,7 +11189,7 @@ control_plane:
         let addr = listener.local_addr().unwrap();
         let st = Arc::clone(&state);
         let server = tokio::spawn(async move {
-            for _ in 0..2 {
+            for _ in 0..4 {
                 let (stream, _) = listener.accept().await.unwrap();
                 let io = TokioIo::new(stream);
                 let st2 = Arc::clone(&st);
@@ -10636,6 +11228,42 @@ control_plane:
         assert!(
             r2.contains("\"phase\":\"e5\"") || r2.contains("\"phase\": \"e5\""),
             "expected control plane status JSON: {r2}"
+        );
+
+        let mut c3 = TcpStream::connect(addr).await.unwrap();
+        c3.write_all(
+            b"GET /ops/control/v1 HTTP/1.1\r\nHost: panda\r\nConnection: close\r\nx-panda-admin-secret: cp-secret\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut b3 = Vec::new();
+        c3.read_to_end(&mut b3).await.unwrap();
+        let r3 = String::from_utf8_lossy(&b3);
+        assert!(r3.contains("200 OK"), "expected 200 for discovery: {r3}");
+        assert!(
+            r3.contains("panda_control_plane_api") && r3.contains("/v1/status"),
+            "expected discovery JSON: {r3}"
+        );
+        assert!(
+            r3.contains("/v1/runtime/summary") && r3.contains("/v1/mcp/config"),
+            "expected discovery to list new read endpoints: {r3}"
+        );
+
+        let mut c4 = TcpStream::connect(addr).await.unwrap();
+        c4.write_all(
+            b"GET /ops/control/v1/runtime/summary HTTP/1.1\r\nHost: panda\r\nConnection: close\r\nx-panda-admin-secret: cp-secret\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut b4 = Vec::new();
+        c4.read_to_end(&mut b4).await.unwrap();
+        let r4 = String::from_utf8_lossy(&b4);
+        assert!(r4.contains("200 OK"), "expected 200 for runtime summary: {r4}");
+        assert!(
+            r4.contains("panda_control_plane_runtime_summary")
+                && r4.contains("\"identity\"")
+                && r4.contains("\"tpm\""),
+            "expected runtime summary with identity + tpm: {r4}"
         );
 
         server.await.ok();
@@ -10785,7 +11413,20 @@ control_plane:
         m.inc_mcp_agent_intent_call_enforce_denied();
         m.inc_mcp_agent_intent_audit_mismatch();
         m.record_semantic_routing_resolve_latency_ms(40);
+        m.inc_gateway_rps("ingress", false);
+        m.inc_gateway_rps("ingress", true);
+        m.inc_gateway_rps("legacy", false);
+        m.inc_gateway_rps("legacy", true);
+        m.inc_gateway_ingress_rps_row("acme", "/api/v1", false);
+        m.inc_gateway_ingress_rps_row("acme", "/api/v1", true);
         let s = m.ops_auth_prometheus_text();
+        assert!(s.contains("panda_gateway_rps_allowed_total{layer=\"ingress\"} 1"));
+        assert!(s.contains("panda_gateway_rps_denied_total{layer=\"ingress\"} 1"));
+        assert!(s.contains("panda_gateway_rps_allowed_total{layer=\"legacy\"} 1"));
+        assert!(s.contains("panda_gateway_rps_denied_total{layer=\"legacy\"} 1"));
+        assert!(s.contains("panda_gateway_ingress_rps_total"));
+        assert!(s.contains("tenant_id=\"acme\""));
+        assert!(s.contains("path_prefix=\"/api/v1\""));
         assert!(s.contains("panda_ops_auth_allowed_total"));
         assert!(s.contains("panda_ops_auth_denied_total"));
         assert!(s.contains("panda_ops_auth_deny_ratio"));

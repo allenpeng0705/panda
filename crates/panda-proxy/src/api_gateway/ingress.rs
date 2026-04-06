@@ -3,10 +3,14 @@
 //! Dynamic overlay (Epic E): [`DynamicIngressRoutes`] merges with the static table; longest prefix wins,
 //! with ties resolved in favor of the dynamic row.
 
+use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
 use hyper::Method;
-use panda_config::{ApiGatewayIngressBackend, ApiGatewayIngressConfig, ApiGatewayIngressRoute};
+use panda_config::{
+    ApiGatewayIngressAuthMode, ApiGatewayIngressBackend, ApiGatewayIngressConfig,
+    ApiGatewayIngressRoute,
+};
 
 use super::control_plane_store::ControlPlanePersist;
 
@@ -24,6 +28,8 @@ pub(crate) struct IngressClassifyMerged {
     pub classify: IngressClassify,
     /// Set when the matched static or dynamic row defines `rate_limit`.
     pub ingress_rps: Option<IngressRpsKey>,
+    /// JWT policy for the winning ingress row (built-in defaults use [`ApiGatewayIngressAuthMode::Inherit`]).
+    pub auth_mode: ApiGatewayIngressAuthMode,
 }
 
 /// Result of classifying a request path + method against the ingress table.
@@ -52,6 +58,8 @@ pub(crate) struct IngressEntry {
     pub(crate) upstream: Option<String>,
     /// When set, enforce RPS for this row (ingress + optional Redis in `RouteRpsLimiters`).
     pub(crate) ingress_rps: Option<u32>,
+    /// Per-prefix JWT policy vs global `identity.require_jwt`.
+    pub(crate) auth: ApiGatewayIngressAuthMode,
 }
 
 /// Convert a YAML/config row into a router entry (`None` when `path_prefix` is empty after trim).
@@ -91,6 +99,7 @@ pub(crate) fn ingress_entry_from_route(r: &ApiGatewayIngressRoute) -> Option<Ing
         methods,
         upstream,
         ingress_rps,
+        auth: r.auth,
     })
 }
 
@@ -137,6 +146,7 @@ pub(crate) fn classify_merged(
             return IngressClassifyMerged {
                 classify: IngressClassify::NoMatch,
                 ingress_rps: None,
+                auth_mode: ApiGatewayIngressAuthMode::Inherit,
             };
         }
         (Some(x), None) => x,
@@ -156,8 +166,10 @@ pub(crate) fn classify_merged(
         return IngressClassifyMerged {
             classify: IngressClassify::MethodNotAllowed { allow },
             ingress_rps: None,
+            auth_mode: ApiGatewayIngressAuthMode::Inherit,
         };
     }
+    let auth_mode = chosen.auth;
     let ingress_rps = chosen.ingress_rps.map(|rps| IngressRpsKey {
         tenant_id: chosen.tenant_id.clone(),
         path_prefix: chosen.prefix.clone(),
@@ -169,6 +181,7 @@ pub(crate) fn classify_merged(
             upstream: chosen.upstream.clone(),
         },
         ingress_rps,
+        auth_mode,
     }
 }
 
@@ -220,6 +233,8 @@ impl DynamicIngressRoutes {
 
     /// Memory only (used after import has already written the backing store).
     pub fn upsert_route_memory_only(&self, r: &ApiGatewayIngressRoute) -> Result<(), String> {
+        r.validate_for_control_plane()
+            .map_err(|e| e.to_string())?;
         let e = ingress_entry_from_route(r)
             .ok_or_else(|| "path_prefix must be non-empty".to_string())?;
         if !e.prefix.starts_with('/') {
@@ -260,12 +275,23 @@ impl DynamicIngressRoutes {
         &self,
         routes: Vec<ApiGatewayIngressRoute>,
     ) -> Result<(), String> {
+        let mut seen = HashSet::new();
         let mut v = Vec::new();
         for r in routes {
+            r.validate_for_control_plane()
+                .map_err(|e| e.to_string())?;
             let e = ingress_entry_from_route(&r)
                 .ok_or_else(|| format!("invalid route (empty path_prefix): {:?}", r.path_prefix))?;
             if !e.prefix.starts_with('/') {
                 return Err(format!("path_prefix must start with `/`: {}", e.prefix));
+            }
+            let tid = e.tenant_id.as_str();
+            if !seen.insert((tid.to_string(), e.prefix.clone())) {
+                return Err(format!(
+                    "duplicate (tenant_id, path_prefix) in import batch: tenant={:?} path={}",
+                    tid,
+                    e.prefix
+                ));
             }
             v.push(e);
         }
@@ -331,6 +357,7 @@ impl DynamicIngressRoutes {
                 rate_limit: e
                     .ingress_rps
                     .map(|rps| panda_config::RouteRateLimitConfig { rps }),
+                auth: e.auth,
             })
             .collect()
     }
@@ -400,6 +427,7 @@ fn entry(prefix: &str, backend: ApiGatewayIngressBackend, methods: Vec<Method>) 
         methods,
         upstream: None,
         ingress_rps: None,
+        auth: ApiGatewayIngressAuthMode::Inherit,
     }
 }
 
@@ -511,6 +539,7 @@ mod tests {
                 methods: vec![],
                 backend_base: None,
                 rate_limit: None,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -539,6 +568,7 @@ mod tests {
                 methods: vec!["POST".to_string()],
                 backend_base: None,
                 rate_limit: None,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -569,6 +599,7 @@ mod tests {
                 methods: vec![],
                 backend_base: Some("https://llm.other.example/v1".to_string()),
                 rate_limit: None,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -593,6 +624,7 @@ mod tests {
                 methods: vec![],
                 backend_base: None,
                 rate_limit: None,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -604,6 +636,7 @@ mod tests {
             methods: vec![],
             upstream: None,
             ingress_rps: None,
+            auth: ApiGatewayIngressAuthMode::Inherit,
         }];
         assert_eq!(
             classify_merged(r.as_ref(), &dynamic, "/api/v2/x", &Method::GET, None),
@@ -613,6 +646,7 @@ mod tests {
                     upstream: None,
                 },
                 ingress_rps: None,
+                auth_mode: ApiGatewayIngressAuthMode::Inherit,
             }
         );
         assert_eq!(
@@ -623,6 +657,7 @@ mod tests {
                     upstream: None,
                 },
                 ingress_rps: None,
+                auth_mode: ApiGatewayIngressAuthMode::Inherit,
             }
         );
     }
@@ -638,6 +673,7 @@ mod tests {
                 methods: vec![],
                 backend_base: None,
                 rate_limit: None,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -649,6 +685,7 @@ mod tests {
             methods: vec![],
             upstream: None,
             ingress_rps: None,
+            auth: ApiGatewayIngressAuthMode::Inherit,
         }];
         assert_eq!(
             classify_merged(r.as_ref(), &dynamic, "/x/y", &Method::GET, None),
@@ -658,6 +695,7 @@ mod tests {
                     upstream: None,
                 },
                 ingress_rps: None,
+                auth_mode: ApiGatewayIngressAuthMode::Inherit,
             }
         );
     }

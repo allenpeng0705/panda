@@ -16,6 +16,24 @@
 
 Kong’s AI Gateway excels at **plugin breadth** and **control-plane UX**. Panda’s bet is **depth on the AI data plane**: the same *categories* of features (routing, governance, cache, observability) with **finer-grained AI semantics** and **better hot-path behavior**.
 
+### 1.1 Multi-provider coverage (product direction)
+
+Panda should support **maximum upstream provider coverage**, not only **OpenAI-compatible** HTTP bases (Ollama, vLLM, many clouds’ “OpenAI API” modes). That means:
+
+| Tier | Meaning | Role in Panda |
+|------|---------|----------------|
+| **Passthrough** | Upstream already implements OpenAI-style `/v1/chat/completions` (and related) | Default path: `adapter.provider: openai`, minimal transformation |
+| **Native adapters** | Vendor uses a different URL, headers, or JSON shape (Anthropic Messages, AWS/GCP/Azure hosted models, etc.) | **Per-provider** modules in `outbound::adapter` (and streaming peers): map **ingress** OpenAI-shaped requests to **upstream** wire format and map responses back |
+| **Proxy escape hatch** | Rare APIs or previews | Optional raw **`/v1/*` proxy** patterns or dedicated routes—still behind the same auth, TPM, and observability |
+
+**Today:** `adapter.provider` validates **`openai`** and **`anthropic`** for chat; semantic routing’s optional “router” model assumes an OpenAI-compatible **`/v1/chat/completions`** unless extended.
+
+**Direction:** Add validated providers and adapters incrementally (config + tests + docs), reusing one **request context** so TPM, MCP, cache, and policy stay unified. Prefer **native** adapters when passthrough would lose capabilities (auth, streaming quirks, tool formats); prefer **passthrough** when the vendor is already OpenAI-compatible.
+
+This is the same **“Phase 4: universal adapter target provider”** thread already called out on [`AdapterConfig`](../crates/panda-config/src/lib.rs) in `panda-config`.
+
+**Practical guides:** [Provider adapters — Portkey-style patterns](provider_adapters.md) (passthrough labels vs native Rust adapters, checklist). **Gemini / Vertex / Bedrock:** [API keys and base URLs](provider_gemini_bedrock_vertex.md).
+
 ---
 
 ## 2. Pluggable feature model (Kong-like, Panda-shaped)

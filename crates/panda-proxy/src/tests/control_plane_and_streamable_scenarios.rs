@@ -10,7 +10,7 @@
 //!
 //! | ID | What we verify | Pass criteria |
 //! |----|------------------|---------------|
-//! | **CP-RO-1** | Read-only secret (`read_only_secret_envs`) | GET `/v1/status`, `/v1/api_gateway/ingress/routes`, `/v1/api_gateway/ingress/routes/export` → **200** |
+//! | **CP-RO-1** | Read-only secret (`read_only_secret_envs`) | GET `/v1/status`, `/v1/runtime/summary`, `/v1/mcp/config`, `/v1/api_gateway/ingress/routes`, `/v1/api_gateway/ingress/routes/export` → **200** |
 //! | **CP-RO-2** | Same creds cannot mutate | POST routes, POST import, DELETE routes → **403** |
 //! | **CP-RW-1** | Full admin secret still mutates | POST dynamic route with **write** secret → **200** |
 //! | **TN-1** | `tenant_id` on dynamic row | Without `tenant_resolution_header` value → row ignored (**404** vs scoped path) |
@@ -103,8 +103,8 @@ api_gateway:
     state.ingress_router = Some(ingress);
     let state = Arc::new(state);
 
-    // 7 connections: 3 GETs (read-only OK), 3 mutating attempts (403), 1 write POST (200).
-    let (addr, server) = spawn_dispatch_stack(Arc::clone(&state), 7).await;
+    // 9 connections: 5 GETs (read-only OK), 3 mutating attempts (403), 1 write POST (200).
+    let (addr, server) = spawn_dispatch_stack(Arc::clone(&state), 9).await;
 
     let ro = "read-secret";
     let rw = "write-secret";
@@ -143,6 +143,33 @@ api_gateway:
     assert!(
         r_export.contains("200 OK") && r_export.contains("routes"),
         "CP-RO-1 export: {r_export}"
+    );
+
+    let r_runtime = tcp_exchange(
+        addr,
+        &format!(
+            "GET /ops/control/v1/runtime/summary HTTP/1.1\r\nHost: z\r\nConnection: close\r\nx-panda-admin-secret: {ro}\r\n\r\n"
+        ),
+    )
+    .await;
+    assert!(
+        r_runtime.contains("200 OK")
+            && r_runtime.contains("panda_control_plane_runtime_summary")
+            && r_runtime.contains("\"identity\"")
+            && r_runtime.contains("\"tpm\""),
+        "CP-RO-1 runtime summary: {r_runtime}"
+    );
+
+    let r_mcp_cfg = tcp_exchange(
+        addr,
+        &format!(
+            "GET /ops/control/v1/mcp/config HTTP/1.1\r\nHost: z\r\nConnection: close\r\nx-panda-admin-secret: {ro}\r\n\r\n"
+        ),
+    )
+    .await;
+    assert!(
+        r_mcp_cfg.contains("200 OK") && r_mcp_cfg.contains("panda_control_plane_mcp_config"),
+        "CP-RO-1 mcp config: {r_mcp_cfg}"
     );
 
     let post_body = br#"{"path_prefix":"/z-ro-deny","backend":"gone"}"#;

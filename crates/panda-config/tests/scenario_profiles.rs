@@ -1,4 +1,4 @@
-//! Scenario YAML profiles aligned with `docs/panda_scenarios_summary.md`.
+//! Scenario YAML profiles aligned with `docs/panda_scenarios_summary.md` and `docs/panda_use_cases.md`.
 //! Ensures representative configs parse and `effective_*` helpers behave as documented.
 
 use panda_config::PandaConfig;
@@ -156,5 +156,185 @@ fn scenario_d_repo_root_panda_yaml_parses() {
             && enabled_servers.contains(&"inventory")
             && enabled_servers.contains(&"edge"),
         "expected four REST MCP servers: {enabled_servers:?}"
+    );
+}
+
+#[test]
+fn scenario_pure_api_gateway() {
+    let cfg = PandaConfig::from_yaml_str(
+        r#"listen: '127.0.0.1:0'
+default_backend: 'http://127.0.0.1:8080'
+routes:
+  - path_prefix: /api/users
+    backend_base: 'http://user-service:8081'
+  - path_prefix: /api/products
+    backend_base: 'http://product-service:8082'
+api_gateway:
+  ingress:
+    enabled: true
+    routes:
+      - path_prefix: /api
+        backend: ai
+        methods: [GET, POST, PUT, DELETE]
+      - path_prefix: /health
+        backend: ops
+        methods: [GET]
+mcp:
+  enabled: false
+"#,
+    )
+    .unwrap();
+    assert!(!cfg.mcp.enabled);
+    assert!(cfg.api_gateway.ingress.enabled);
+    assert_eq!(
+        cfg.effective_backend_base("/api/users/123"),
+        "http://user-service:8081"
+    );
+    assert_eq!(
+        cfg.effective_backend_base("/api/products/456"),
+        "http://product-service:8082"
+    );
+}
+
+#[test]
+fn scenario_mcp_gateway_only() {
+    let cfg = PandaConfig::from_yaml_str(
+        r#"listen: '127.0.0.1:0'
+default_backend: 'http://127.0.0.1:5023'
+api_gateway:
+  ingress:
+    enabled: true
+    routes:
+      - path_prefix: /mcp
+        backend: mcp
+        methods: [POST]
+      - path_prefix: /health
+        backend: ops
+        methods: [GET]
+  egress:
+    enabled: true
+    corporate:
+      default_base: 'http://internal-api:8080'
+    allowlist:
+      allow_hosts: ['internal-api:8080']
+      allow_path_prefixes: ['/api']
+mcp:
+  enabled: true
+  advertise_tools: false
+  servers:
+    - name: corpapi
+      enabled: true
+      http_tool:
+        path: /api/data
+        method: GET
+        tool_name: fetch
+    - name: crm
+      enabled: true
+      remote_mcp_url: 'http://crm-mcp:8082/mcp'
+"#,
+    )
+    .unwrap();
+    assert!(cfg.mcp.enabled);
+    assert!(cfg.api_gateway.ingress.enabled);
+    assert!(cfg.api_gateway.egress.enabled);
+    let enabled_servers: Vec<_> = cfg
+        .mcp
+        .servers
+        .iter()
+        .filter(|s| s.enabled)
+        .map(|s| s.name.as_str())
+        .collect();
+    assert!(
+        enabled_servers.contains(&"corpapi") && enabled_servers.contains(&"crm")
+    );
+}
+
+#[test]
+fn scenario_full_stack_all_components() {
+    let cfg = PandaConfig::from_yaml_str(
+        r#"listen: '127.0.0.1:0'
+default_backend: 'https://api.openai.com/v1'
+routes:
+  - path_prefix: /v1/chat
+    backend_base: 'https://api.openai.com/v1'
+    mcp_advertise_tools: true
+  - path_prefix: /v1/embeddings
+    backend_base: 'https://api.openai.com/v1'
+    mcp_advertise_tools: false
+api_gateway:
+  ingress:
+    enabled: true
+    routes:
+      - path_prefix: /mcp
+        backend: mcp
+        methods: [POST]
+      - path_prefix: /v1
+        backend: ai
+        methods: [POST, GET]
+      - path_prefix: /health
+        backend: ops
+        methods: [GET]
+      - path_prefix: /metrics
+        backend: ops
+        methods: [GET]
+  egress:
+    enabled: true
+    corporate:
+      default_base: 'http://internal-api:8080'
+    allowlist:
+      allow_hosts: ['internal-api:8080']
+      allow_path_prefixes: ['/api']
+mcp:
+  enabled: true
+  advertise_tools: false
+  servers:
+    - name: corpapi
+      enabled: true
+      http_tool:
+        path: /api/data
+        method: GET
+        tool_name: fetch
+    - name: crm
+      enabled: true
+      remote_mcp_url: 'http://crm-mcp:8082/mcp'
+  intent_tool_policies:
+    - intent: data_read
+      allowed_tools:
+        - mcp_corpapi_fetch
+        - mcp_crm_search
+    - intent: data_write
+      allowed_tools:
+        - mcp_crm_update
+  proof_of_intent_mode: enforce
+tpm:
+  enforce_budget: true
+  budget_tokens_per_minute: 10000
+semantic_cache:
+  enabled: true
+  backend: memory
+identity:
+  require_jwt: true
+  jwt_jwks_url: 'https://auth.example.com/.well-known/jwks.json'
+  jwt_audience: 'panda-api'
+"#,
+    )
+    .unwrap();
+    assert!(cfg.mcp.enabled);
+    assert!(cfg.api_gateway.ingress.enabled);
+    assert!(cfg.api_gateway.egress.enabled);
+    assert!(cfg.tpm.enforce_budget);
+    assert!(cfg.semantic_cache.enabled);
+    assert!(cfg.identity.require_jwt);
+    assert!(cfg.effective_mcp_advertise_tools_for_path("/v1/chat/completions"));
+    assert!(!cfg.effective_mcp_advertise_tools_for_path("/v1/embeddings"));
+    let enabled_servers: Vec<_> = cfg
+        .mcp
+        .servers
+        .iter()
+        .filter(|s| s.enabled)
+        .map(|s| s.name.as_str())
+        .collect();
+    assert!(
+        enabled_servers.contains(&"corpapi") && enabled_servers.contains(&"crm")
     );
 }

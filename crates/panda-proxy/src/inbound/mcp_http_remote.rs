@@ -375,7 +375,8 @@ mcp:
 "#
         );
         let cfg = PandaConfig::from_yaml_str(&yaml).expect("yaml");
-        let egress = EgressClient::try_new(&cfg.api_gateway.egress)
+        let egress = EgressClient::connect(&cfg.api_gateway.egress)
+            .await
             .expect("egress")
             .expect("some");
         let client = McpHttpRemoteClient::new(

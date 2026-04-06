@@ -12,6 +12,7 @@ use hyper::{Method, Request, Uri};
 use panda_config::{
     ApiGatewayEgressConfig, ApiGatewayEgressDefaultHeader, ApiGatewayEgressProfile,
 };
+use redis::AsyncCommands;
 use tokio::sync::{RwLock, Semaphore};
 
 use crate::{build_egress_http_client, HttpClient};
@@ -75,6 +76,8 @@ struct EgressMetricsInner {
     duration_bucket: HashMap<String, u64>,
     /// Key: route label — attempts after the first toward the same logical request.
     retries: HashMap<String, u64>,
+    /// Key: `scope\x1froute\x1fallowed|denied` for [`panda_egress_rps_total`] (global + per-route gates).
+    rps_gate: HashMap<String, u64>,
 }
 
 #[derive(Clone, Default)]
@@ -83,6 +86,16 @@ pub struct EgressMetrics {
 }
 
 impl EgressMetrics {
+    /// `scope`: `global` or `per_route`; `route` is `-` for global.
+    fn record_rps_gate(&self, scope: &str, route: &str, denied: bool) {
+        let r = if route.is_empty() { "-" } else { route };
+        let result = if denied { "denied" } else { "allowed" };
+        let key = format!("{scope}\x1f{r}\x1f{result}");
+        if let Ok(mut g) = self.inner.lock() {
+            *g.rps_gate.entry(key).or_insert(0) += 1;
+        }
+    }
+
     fn record_retry(&self, route: &str) {
         let route = if route.is_empty() { "-" } else { route };
         if let Ok(mut g) = self.inner.lock() {
@@ -176,6 +189,23 @@ impl EgressMetrics {
                 ));
             }
         }
+        out.push_str(
+            "# HELP panda_egress_rps_total Egress RPS limiter outcomes (global cap and per-route_label caps; Redis when configured).\n",
+        );
+        out.push_str("# TYPE panda_egress_rps_total counter\n");
+        if let Ok(g) = self.inner.lock() {
+            let mut entries: Vec<(&String, &u64)> = g.rps_gate.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            for (key, count) in entries {
+                let mut p = key.splitn(3, '\x1f');
+                let scope = esc(p.next().unwrap_or("-"));
+                let route = esc(p.next().unwrap_or("-"));
+                let result = esc(p.next().unwrap_or("-"));
+                out.push_str(&format!(
+                    "panda_egress_rps_total{{scope=\"{scope}\",route=\"{route}\",result=\"{result}\"}} {count}\n",
+                ));
+            }
+        }
         out
     }
 }
@@ -206,13 +236,23 @@ pub struct EgressClient {
     metrics: EgressMetrics,
     /// When set, limits concurrent `request` calls (fail-fast `try_acquire`).
     in_flight: Option<Arc<Semaphore>>,
-    /// When set, `(max_rps, 1s window counter)` for process-local RPS cap.
-    rps: Option<(u32, Mutex<(Instant, u32)>)>,
+    /// Global egress RPS cap (`api_gateway.egress.rate_limit.max_rps`). `0` = none.
+    rps_global_cap: u32,
+    /// Process-local 1s window for global cap when Redis is not configured.
+    rps_global_local: Mutex<(Instant, u32)>,
+    /// Optional Redis for cluster-wide RPS (global + per-route).
+    rps_redis: Option<redis::aio::ConnectionManager>,
+    /// Normalized `api_gateway.egress.rate_limit.redis.key_prefix` (ends with `:`).
+    rps_redis_prefix: String,
+    /// Per `route_label` RPS caps.
+    rps_per_route_caps: HashMap<String, u32>,
+    /// Process-local 1s windows for per-route caps when Redis is not configured.
+    rps_per_route_local: Mutex<HashMap<String, (Instant, u32)>>,
 }
 
 impl EgressClient {
     /// Returns `None` when egress is disabled in config.
-    pub fn try_new(cfg: &ApiGatewayEgressConfig) -> anyhow::Result<Option<Arc<Self>>> {
+    pub async fn connect(cfg: &ApiGatewayEgressConfig) -> anyhow::Result<Option<Arc<Self>>> {
         if !cfg.enabled {
             return Ok(None);
         }
@@ -270,11 +310,24 @@ impl EgressClient {
         } else {
             None
         };
-        let rps = if cfg.rate_limit.max_rps > 0 {
-            Some((cfg.rate_limit.max_rps, Mutex::new((Instant::now(), 0u32))))
+        let mut rps_redis_prefix = cfg.rate_limit.redis.key_prefix.trim().to_string();
+        if !rps_redis_prefix.ends_with(':') {
+            rps_redis_prefix.push(':');
+        }
+        let rps_redis = if let Some(url) = cfg.effective_rate_limit_redis_url() {
+            let client = redis::Client::open(url.as_str())?;
+            Some(redis::aio::ConnectionManager::new(client).await?)
         } else {
             None
         };
+        let mut rps_per_route_caps = HashMap::new();
+        for pr in &cfg.rate_limit.per_route {
+            let label = pr.route_label.trim().to_string();
+            if !label.is_empty() && pr.max_rps > 0 {
+                rps_per_route_caps.insert(label, pr.max_rps);
+            }
+        }
+        let rps_global_cap = cfg.rate_limit.max_rps;
         Ok(Some(Arc::new(Self {
             client,
             pool_idle,
@@ -291,7 +344,12 @@ impl EgressClient {
             retry_max_backoff,
             metrics: EgressMetrics::default(),
             in_flight,
-            rps,
+            rps_global_cap,
+            rps_global_local: Mutex::new((Instant::now(), 0u32)),
+            rps_redis,
+            rps_redis_prefix,
+            rps_per_route_caps,
+            rps_per_route_local: Mutex::new(HashMap::new()),
         })))
     }
 
@@ -345,7 +403,7 @@ impl EgressClient {
                 }
             },
         };
-        if let Err(e) = self.consume_rps() {
+        if let Err(e) = self.consume_rps(route).await {
             self.record_final_error_metrics(route, &e, 0, pool_slot.as_str());
             return Err(e);
         }
@@ -516,21 +574,110 @@ impl EgressClient {
         })
     }
 
-    fn consume_rps(&self) -> Result<(), EgressError> {
-        let Some((cap, m)) = &self.rps else {
-            return Ok(());
-        };
-        let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+    fn rps_local_fixed(lock: &Mutex<(Instant, u32)>, cap: u32) -> Result<(), EgressError> {
+        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         let (window_start, count) = &mut *g;
         if now.duration_since(*window_start) >= Duration::from_secs(1) {
             *window_start = now;
             *count = 0;
         }
-        if *count >= *cap {
+        if *count >= cap {
             return Err(EgressError::RateLimited);
         }
         *count += 1;
+        Ok(())
+    }
+
+    fn rps_local_map(
+        lock: &Mutex<HashMap<String, (Instant, u32)>>,
+        key: &str,
+        cap: u32,
+    ) -> Result<(), EgressError> {
+        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let e = g.entry(key.to_string()).or_insert((now, 0u32));
+        if now.duration_since(e.0) >= Duration::from_secs(1) {
+            e.0 = now;
+            e.1 = 0;
+        }
+        if e.1 >= cap {
+            return Err(EgressError::RateLimited);
+        }
+        e.1 += 1;
+        Ok(())
+    }
+
+    async fn egress_rps_redis_or_local<F>(
+        conn: &redis::aio::ConnectionManager,
+        full_key: &str,
+        cap: u32,
+        local: F,
+    ) -> Result<(), EgressError>
+    where
+        F: FnOnce() -> Result<(), EgressError>,
+    {
+        let mut c = conn.clone();
+        match c.incr::<_, _, i64>(full_key, 1i64).await {
+            Ok(n) => {
+                if n == 1 {
+                    let _: redis::RedisResult<()> = c.expire(full_key, 1).await;
+                }
+                if n > cap as i64 {
+                    return Err(EgressError::RateLimited);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(target: "panda::egress_rps", "redis egress RPS incr failed, using local window: {e}");
+                local()
+            }
+        }
+    }
+
+    async fn consume_rps(&self, route: &str) -> Result<(), EgressError> {
+        if self.rps_global_cap == 0 && self.rps_per_route_caps.is_empty() {
+            return Ok(());
+        }
+        if self.rps_global_cap > 0 {
+            let full_key = format!("{}global", self.rps_redis_prefix);
+            let r = if let Some(ref conn) = self.rps_redis {
+                Self::egress_rps_redis_or_local(conn, &full_key, self.rps_global_cap, || {
+                    Self::rps_local_fixed(&self.rps_global_local, self.rps_global_cap)
+                })
+                .await
+            } else {
+                Self::rps_local_fixed(&self.rps_global_local, self.rps_global_cap)
+            };
+            match r {
+                Ok(()) => self.metrics.record_rps_gate("global", "-", false),
+                Err(e) => {
+                    self.metrics.record_rps_gate("global", "-", true);
+                    return Err(e);
+                }
+            }
+        }
+        if let Some(cap) = self.rps_per_route_caps.get(route).copied() {
+            if cap > 0 {
+                let route_label = route.to_string();
+                let full_key = format!("{}route:{route_label}", self.rps_redis_prefix);
+                let r = if let Some(ref conn) = self.rps_redis {
+                    Self::egress_rps_redis_or_local(conn, &full_key, cap, || {
+                        Self::rps_local_map(&self.rps_per_route_local, route_label.as_str(), cap)
+                    })
+                    .await
+                } else {
+                    Self::rps_local_map(&self.rps_per_route_local, route_label.as_str(), cap)
+                };
+                match r {
+                    Ok(()) => self.metrics.record_rps_gate("per_route", route, false),
+                    Err(e) => {
+                        self.metrics.record_rps_gate("per_route", route, true);
+                        return Err(e);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -803,7 +950,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let client = EgressClient::try_new(&cfg).expect("new").expect("some");
+        let client = EgressClient::connect(&cfg).await.expect("new").expect("some");
         let mut headers = HeaderMap::new();
         headers.insert(
             header::USER_AGENT,
@@ -878,7 +1025,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let client = EgressClient::try_new(&cfg).expect("new").expect("some");
+        let client = EgressClient::connect(&cfg).await.expect("new").expect("some");
         let headers = HeaderMap::new();
         let r1 = client
             .request(EgressHttpRequest {
@@ -925,7 +1072,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let client = EgressClient::try_new(&cfg).expect("new").expect("some");
+        let client = EgressClient::connect(&cfg).await.expect("new").expect("some");
         let err = client
             .request(EgressHttpRequest {
                 method: Method::GET,
@@ -988,7 +1135,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let client = EgressClient::try_new(&cfg).expect("new").expect("some");
+        let client = EgressClient::connect(&cfg).await.expect("new").expect("some");
         let res = client
             .request(EgressHttpRequest {
                 method: Method::GET,
@@ -1048,7 +1195,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let client = EgressClient::try_new(&cfg).expect("new").expect("some");
+        let client = EgressClient::connect(&cfg).await.expect("new").expect("some");
         client
             .request(EgressHttpRequest {
                 method: Method::GET,
@@ -1110,7 +1257,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let client = EgressClient::try_new(&cfg).expect("new").expect("some");
+        let client = EgressClient::connect(&cfg).await.expect("new").expect("some");
         let res = client
             .request(EgressHttpRequest {
                 method: Method::GET,
@@ -1180,7 +1327,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let client = EgressClient::try_new(&cfg).expect("new").expect("some");
+        let client = EgressClient::connect(&cfg).await.expect("new").expect("some");
         let mut headers = HeaderMap::new();
         headers.insert(
             http::HeaderName::from_static("x-global"),
@@ -1215,7 +1362,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let client = EgressClient::try_new(&cfg).expect("new").expect("some");
+        let client = EgressClient::connect(&cfg).await.expect("new").expect("some");
         let err = client
             .request(EgressHttpRequest {
                 method: Method::GET,
@@ -1343,7 +1490,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let client = EgressClient::try_new(&cfg).expect("new").expect("some");
+        let client = EgressClient::connect(&cfg).await.expect("new").expect("some");
         let res = client
             .request(EgressHttpRequest {
                 method: Method::GET,
@@ -1386,6 +1533,7 @@ mod tests {
             rate_limit: panda_config::ApiGatewayEgressRateLimitConfig {
                 max_in_flight: 0,
                 max_rps: 2,
+                ..Default::default()
             },
             corporate: ApiGatewayEgressCorporateConfig {
                 default_base: Some(format!("http://{addr}")),
@@ -1397,7 +1545,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let client = EgressClient::try_new(&cfg).expect("new").expect("some");
+        let client = EgressClient::connect(&cfg).await.expect("new").expect("some");
         let headers = HeaderMap::new();
         for i in 0..2 {
             client
@@ -1426,6 +1574,9 @@ mod tests {
         assert!(matches!(err, EgressError::RateLimited));
         let prom = client.prometheus_text();
         assert!(prom.contains("rate_limited"));
+        assert!(prom.contains("panda_egress_rps_total"));
+        assert!(prom.contains("scope=\"global\""));
+        assert!(prom.contains("result=\"denied\""));
     }
 
     #[tokio::test]
@@ -1459,6 +1610,7 @@ mod tests {
             rate_limit: panda_config::ApiGatewayEgressRateLimitConfig {
                 max_in_flight: 1,
                 max_rps: 0,
+                ..Default::default()
             },
             corporate: ApiGatewayEgressCorporateConfig {
                 default_base: Some(format!("http://{addr}")),
@@ -1470,7 +1622,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let client = Arc::new(EgressClient::try_new(&cfg).expect("new").expect("some"));
+        let client = Arc::new(EgressClient::connect(&cfg).await.expect("new").expect("some"));
         let c1 = Arc::clone(&client);
         let j1 = tokio::spawn(async move {
             c1.request(EgressHttpRequest {
@@ -1498,5 +1650,81 @@ mod tests {
         assert!(matches!(err, EgressError::RateLimited));
         proceed.notify_one();
         j1.await.expect("join").expect("first request ok");
+    }
+
+    #[tokio::test]
+    async fn rate_limit_per_route_rps_metrics_scope() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 16_384];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await;
+            }
+        });
+
+        let cfg = ApiGatewayEgressConfig {
+            enabled: true,
+            timeout_ms: 5_000,
+            pool_idle_timeout_ms: 0,
+            rate_limit: panda_config::ApiGatewayEgressRateLimitConfig {
+                max_in_flight: 0,
+                max_rps: 0,
+                per_route: vec![panda_config::ApiGatewayEgressPerRouteRateLimit {
+                    route_label: "per_route_only".to_string(),
+                    max_rps: 1,
+                }],
+                ..Default::default()
+            },
+            corporate: ApiGatewayEgressCorporateConfig {
+                default_base: Some(format!("http://{addr}")),
+                ..Default::default()
+            },
+            allowlist: panda_config::ApiGatewayEgressAllowlistConfig {
+                allow_hosts: vec![format!("127.0.0.1:{}", addr.port())],
+                allow_path_prefixes: vec!["/allowed".to_string()],
+            },
+            ..Default::default()
+        };
+        let client = EgressClient::connect(&cfg).await.expect("new").expect("some");
+        let headers = HeaderMap::new();
+        client
+            .request(EgressHttpRequest {
+                method: Method::GET,
+                target: "/allowed/one".to_string(),
+                route_label: "per_route_only".to_string(),
+                egress_profile: None,
+                headers: headers.clone(),
+                body: None,
+            })
+            .await
+            .expect("first");
+        let err = client
+            .request(EgressHttpRequest {
+                method: Method::GET,
+                target: "/allowed/two".to_string(),
+                route_label: "per_route_only".to_string(),
+                egress_profile: None,
+                headers,
+                body: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EgressError::RateLimited));
+        let prom = client.prometheus_text();
+        assert!(prom.contains("panda_egress_rps_total"));
+        assert!(prom.contains("scope=\"per_route\""));
+        assert!(prom.contains("route=\"per_route_only\""));
+        assert!(prom.contains("result=\"allowed\""));
+        assert!(prom.contains("result=\"denied\""));
     }
 }
