@@ -6,3 +6,4 @@ community-plugins/**/Cargo.lock
 **/*.rs.bk
 .DS_Store
 artifacts/
+/docs/internal_docs
