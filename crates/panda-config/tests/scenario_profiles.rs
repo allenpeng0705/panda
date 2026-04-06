@@ -124,10 +124,37 @@ mcp:
 fn scenario_d_repo_root_panda_yaml_parses() {
     let yaml = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../panda.yaml"));
     let cfg = PandaConfig::from_yaml_str(yaml).expect("repo panda.yaml must parse");
+    assert_eq!(cfg.listen.trim(), "127.0.0.1:8080");
+    assert_eq!(cfg.default_backend.trim(), "http://127.0.0.1:5023");
+    assert_eq!(cfg.observability.correlation_header, "x-request-id");
+    assert_eq!(cfg.observability.admin_auth_header, "x-panda-admin-secret");
+    assert!(!cfg.control_plane.enabled);
     assert!(cfg.mcp.enabled);
     assert!(cfg.api_gateway.ingress.enabled);
     assert!(cfg.api_gateway.egress.enabled);
     assert!(!cfg.mcp.advertise_tools);
     assert!(!cfg.effective_mcp_advertise_tools_for_path("/v1/embeddings"));
     assert!(cfg.effective_mcp_advertise_tools_for_path("/v1/chat/completions"));
+    assert_eq!(
+        cfg.effective_backend_base("/v1/chat/completions"),
+        "http://127.0.0.1:5023"
+    );
+    assert_eq!(
+        cfg.effective_backend_base("/v1/embeddings"),
+        "http://127.0.0.1:5023"
+    );
+    let enabled_servers: Vec<_> = cfg
+        .mcp
+        .servers
+        .iter()
+        .filter(|s| s.enabled)
+        .map(|s| s.name.as_str())
+        .collect();
+    assert!(
+        enabled_servers.contains(&"corpapi")
+            && enabled_servers.contains(&"corp")
+            && enabled_servers.contains(&"inventory")
+            && enabled_servers.contains(&"edge"),
+        "expected four REST MCP servers: {enabled_servers:?}"
+    );
 }

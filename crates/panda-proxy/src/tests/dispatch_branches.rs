@@ -7,6 +7,7 @@
 //!
 //! Related tests in `lib.rs`: `control_plane_status_requires_ops_secret_when_configured` (secret → 200),
 //! `ingress_enabled_tcp_unknown_path_404_health_200`, `backend_routing_and_proxy::*`.
+//! **Read-only CP + tenant ingress + SSE replay:** [`control_plane_and_streamable_scenarios`](./control_plane_and_streamable_scenarios.rs).
 
 use std::sync::Arc;
 

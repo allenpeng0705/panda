@@ -2388,6 +2388,11 @@ pub struct ControlPlaneConfig {
     /// against dynamic rows that set [`ApiGatewayIngressRoute::tenant_id`]. When unset, only global dynamic rows apply for tenant scoping.
     #[serde(default)]
     pub tenant_resolution_header: Option<String>,
+    /// Environment variable names whose values match [`crate::ObservabilityConfig::admin_auth_header`] for **read-only**
+    /// control-plane access (GET status, GET ingress routes, GET export). Mutations require the primary ops secret,
+    /// [`Self::additional_admin_secret_envs`], OIDC session, or Redis API keys.
+    #[serde(default)]
+    pub read_only_secret_envs: Vec<String>,
     /// OIDC session + Redis API keys for control-plane routes.
     #[serde(default)]
     pub auth: ControlPlaneAuthConfig,
@@ -2406,6 +2411,7 @@ impl Default for ControlPlaneConfig {
             reload_from_store_ms: None,
             additional_admin_secret_envs: Vec::new(),
             tenant_resolution_header: None,
+            read_only_secret_envs: Vec::new(),
             auth: ControlPlaneAuthConfig::default(),
             reload_pubsub: None,
             store: ControlPlaneStoreConfig::default(),

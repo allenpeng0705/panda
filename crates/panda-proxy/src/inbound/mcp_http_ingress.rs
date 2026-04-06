@@ -109,11 +109,23 @@ fn inject_mcp_session_header(resp: &mut Response<crate::BoxBody>, session_id: &s
 }
 
 fn jsonrpc_result(
+    state: &ProxyState,
     accept_sse: bool,
     id: Value,
     result: Value,
     new_session: Option<&str>,
+    parts: &http::request::Parts,
 ) -> Response<crate::BoxBody> {
+    let session_for_buffer = new_session
+        .map(|s| s.to_string())
+        .or_else(|| read_session_id(&parts.headers));
+    let buf = if accept_sse {
+        session_for_buffer
+            .as_deref()
+            .map(|s| (state.mcp_streamable_sessions.as_ref(), s))
+    } else {
+        None
+    };
     let mut r = mcp_ingress_emit_jsonrpc_envelope(
         accept_sse,
         StatusCode::OK,
@@ -122,6 +134,7 @@ fn jsonrpc_result(
             "id": id,
             "result": result,
         }),
+        buf,
     );
     if let Some(s) = new_session {
         inject_mcp_session_header(&mut r, s);
@@ -130,12 +143,21 @@ fn jsonrpc_result(
 }
 
 fn jsonrpc_error_status(
+    state: &ProxyState,
     accept_sse: bool,
     status: StatusCode,
     id: Value,
     code: i32,
     message: &str,
+    mcp_session_id: Option<String>,
 ) -> Response<crate::BoxBody> {
+    let buf = if accept_sse {
+        mcp_session_id
+            .as_deref()
+            .map(|s| (state.mcp_streamable_sessions.as_ref(), s))
+    } else {
+        None
+    };
     mcp_ingress_emit_jsonrpc_envelope(
         accept_sse,
         status,
@@ -144,6 +166,7 @@ fn jsonrpc_error_status(
             "id": id,
             "error": { "code": code, "message": message }
         }),
+        buf,
     )
 }
 
@@ -217,11 +240,13 @@ async fn dispatch_jsonrpc_object(
     if obj.get("jsonrpc").and_then(|x| x.as_str()) != Some("2.0") {
         let id = obj.get("id").cloned().unwrap_or(Value::Null);
         return Ok(jsonrpc_error_status(
+            state,
             accept_sse,
             StatusCode::BAD_REQUEST,
             id,
             -32600,
             "jsonrpc must be \"2.0\"",
+            read_session_id(&parts.headers),
         ));
     }
 
@@ -234,11 +259,13 @@ async fn dispatch_jsonrpc_object(
     if method.is_empty() {
         let id = obj.get("id").cloned().unwrap_or(Value::Null);
         return Ok(jsonrpc_error_status(
+            state,
             accept_sse,
             StatusCode::BAD_REQUEST,
             id,
             -32600,
             "missing method",
+            read_session_id(&parts.headers),
         ));
     }
 
@@ -252,11 +279,13 @@ async fn dispatch_jsonrpc_object(
         }
         "notifications/initialized" | "notifications/cancelled" => {
             return Ok(jsonrpc_error_status(
+                state,
                 accept_sse,
                 StatusCode::BAD_REQUEST,
                 id,
                 -32600,
                 "notifications must omit id",
+                read_session_id(&parts.headers),
             ));
         }
         _ => {}
@@ -281,9 +310,16 @@ async fn dispatch_jsonrpc_object(
             let sid = new_session_for_initialize
                 .map(std::string::ToString::to_string)
                 .unwrap_or_else(|| state.mcp_streamable_sessions.create_session());
-            Ok(jsonrpc_result(sse, id, result, Some(sid.as_str())))
+            Ok(jsonrpc_result(
+                state,
+                sse,
+                id,
+                result,
+                Some(sid.as_str()),
+                parts,
+            ))
         }
-        "ping" => Ok(jsonrpc_result(sse, id, json!({}), None)),
+        "ping" => Ok(jsonrpc_result(state, sse, id, json!({}), None, parts)),
         "tools/list" => match rt.list_all_tools().await {
             Ok(tools) => {
                 let mcp_tools: Vec<Value> = tools
@@ -297,44 +333,59 @@ async fn dispatch_jsonrpc_object(
                         })
                     })
                     .collect();
-                Ok(jsonrpc_result(sse, id, json!({ "tools": mcp_tools }), None))
+                Ok(jsonrpc_result(
+                    state,
+                    sse,
+                    id,
+                    json!({ "tools": mcp_tools }),
+                    None,
+                    parts,
+                ))
             }
             Err(e) => Ok(jsonrpc_error_status(
+                state,
                 sse,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 id,
                 -32603,
                 &format!("tools/list failed: {e:#}"),
+                read_session_id(&parts.headers),
             )),
         },
         "tools/call" => {
             let Some(params_o) = params.as_object() else {
                 return Ok(jsonrpc_error_status(
+                    state,
                     sse,
                     StatusCode::BAD_REQUEST,
                     id,
                     -32602,
                     "params must be an object",
+                    read_session_id(&parts.headers),
                 ));
             };
             let Some(tool_name) = params_o.get("name").and_then(|n| n.as_str()) else {
                 return Ok(jsonrpc_error_status(
+                    state,
                     sse,
                     StatusCode::BAD_REQUEST,
                     id,
                     -32602,
                     "missing params.name",
+                    read_session_id(&parts.headers),
                 ));
             };
             let Some((server, tool)) =
                 mcp::parse_openai_function_name(tool_name, &state.config.mcp.servers)
             else {
                 return Ok(jsonrpc_error_status(
+                    state,
                     sse,
                     StatusCode::BAD_REQUEST,
                     id,
                     -32602,
                     "unknown tool (expected mcp_{server}_{tool} name)",
+                    read_session_id(&parts.headers),
                 ));
             };
             let arguments = params_o
@@ -359,17 +410,34 @@ async fn dispatch_jsonrpc_object(
                 arguments,
                 id,
                 sse,
+                read_session_id(&parts.headers),
             )
             .await)
         }
-        "resources/list" => Ok(jsonrpc_result(sse, id, json!({ "resources": [] }), None)),
-        "prompts/list" => Ok(jsonrpc_result(sse, id, json!({ "prompts": [] }), None)),
+        "resources/list" => Ok(jsonrpc_result(
+            state,
+            sse,
+            id,
+            json!({ "resources": [] }),
+            None,
+            parts,
+        )),
+        "prompts/list" => Ok(jsonrpc_result(
+            state,
+            sse,
+            id,
+            json!({ "prompts": [] }),
+            None,
+            parts,
+        )),
         _ => Ok(jsonrpc_error_status(
+            state,
             sse,
             StatusCode::OK,
             id,
             -32601,
             "Method not found",
+            read_session_id(&parts.headers),
         )),
     }
 }
@@ -385,11 +453,13 @@ async fn handle_post_batch(
 ) -> Result<Response<crate::BoxBody>, Infallible> {
     if arr.is_empty() {
         return Ok(jsonrpc_error_status(
+            state,
             accept_sse,
             StatusCode::BAD_REQUEST,
             Value::Null,
             -32600,
             "empty JSON-RPC batch",
+            read_session_id(&parts.headers),
         ));
     }
 
@@ -400,11 +470,13 @@ async fn handle_post_batch(
     });
     if has_initialize && arr.len() > 1 {
         return Ok(jsonrpc_error_status(
+            state,
             accept_sse,
             StatusCode::BAD_REQUEST,
             Value::Null,
             -32600,
             "batch must not mix initialize with other JSON-RPC messages",
+            read_session_id(&parts.headers),
         ));
     }
 
@@ -418,11 +490,13 @@ async fn handle_post_batch(
         for v in arr {
             let Some(obj) = v.as_object() else {
                 return Ok(jsonrpc_error_status(
+                    state,
                     accept_sse,
                     StatusCode::BAD_REQUEST,
                     Value::Null,
                     -32600,
                     "batch elements must be JSON objects",
+                    read_session_id(&parts.headers),
                 ));
             };
             if jsonrpc_object_is_request_with_id(obj) {
@@ -435,11 +509,13 @@ async fn handle_post_batch(
                 continue;
             }
             return Ok(jsonrpc_error_status(
+                state,
                 accept_sse,
                 StatusCode::BAD_REQUEST,
                 Value::Null,
                 -32600,
                 "invalid JSON-RPC batch element",
+                read_session_id(&parts.headers),
             ));
         }
         return Ok(empty_accepted_response());
@@ -452,11 +528,13 @@ async fn handle_post_batch(
     for v in arr {
         let Some(obj) = v.as_object() else {
             return Ok(jsonrpc_error_status(
+                state,
                 accept_sse,
                 StatusCode::BAD_REQUEST,
                 Value::Null,
                 -32600,
                 "batch elements must be JSON objects",
+                read_session_id(&parts.headers),
             ));
         };
 
@@ -466,11 +544,13 @@ async fn handle_post_batch(
 
         if !jsonrpc_object_is_request_with_id(obj) {
             return Ok(jsonrpc_error_status(
+                state,
                 accept_sse,
                 StatusCode::BAD_REQUEST,
                 Value::Null,
                 -32600,
                 "invalid JSON-RPC batch element",
+                read_session_id(&parts.headers),
             ));
         }
 
@@ -561,7 +641,11 @@ pub(crate) async fn handle_mcp_ingress_http(
                 return Ok(mcp_session_unknown_response());
             }
             let leid = last_event_id_header(req.headers());
-            Ok(mcp_streamable_get_listener_response(leid))
+            Ok(mcp_streamable_get_listener_response(
+                state.mcp_streamable_sessions.as_ref(),
+                sid.as_str(),
+                leid,
+            ))
         }
         Method::POST => {
             if let Err(resp) = enforce_jwt_if_required(&req, state).await {
@@ -575,11 +659,13 @@ pub(crate) async fn handle_mcp_ingress_http(
 
             let Some(rt) = state.mcp.as_ref() else {
                 return Ok(jsonrpc_error_status(
+                    state,
                     accept_sse,
                     StatusCode::SERVICE_UNAVAILABLE,
                     Value::Null,
                     -32000,
                     "MCP runtime not available (mcp.enabled false or no connected servers)",
+                    None,
                 ));
             };
 
@@ -589,20 +675,24 @@ pub(crate) async fn handle_mcp_ingress_http(
                 Ok(b) => b,
                 Err(ProxyError::PayloadTooLarge(_)) => {
                     return Ok(jsonrpc_error_status(
+                        state,
                         accept_sse,
                         StatusCode::PAYLOAD_TOO_LARGE,
                         Value::Null,
                         -32600,
                         "request body exceeds configured limit",
+                        read_session_id(&parts.headers),
                     ));
                 }
                 Err(_) => {
                     return Ok(jsonrpc_error_status(
+                        state,
                         accept_sse,
                         StatusCode::BAD_REQUEST,
                         Value::Null,
                         -32700,
                         "failed to read body",
+                        read_session_id(&parts.headers),
                     ));
                 }
             };
@@ -611,11 +701,13 @@ pub(crate) async fn handle_mcp_ingress_http(
                 Ok(v) => v,
                 Err(_) => {
                     return Ok(jsonrpc_error_status(
+                        state,
                         accept_sse,
                         StatusCode::BAD_REQUEST,
                         Value::Null,
                         -32700,
                         "parse error",
+                        read_session_id(&parts.headers),
                     ));
                 }
             };
@@ -635,11 +727,13 @@ pub(crate) async fn handle_mcp_ingress_http(
 
             let Some(obj) = v.as_object() else {
                 return Ok(jsonrpc_error_status(
+                    state,
                     accept_sse,
                     StatusCode::BAD_REQUEST,
                     Value::Null,
                     -32600,
                     "invalid request",
+                    read_session_id(&parts.headers),
                 ));
             };
 

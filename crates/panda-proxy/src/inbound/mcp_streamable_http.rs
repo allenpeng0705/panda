@@ -1,7 +1,8 @@
 //! MCP **Streamable HTTP** transport helpers ([spec 2025-03-26](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http)):
-//! in-memory session IDs, Origin checks, and GET listener SSE (keepalive).
+//! in-memory session IDs, Origin checks, GET listener SSE (keepalive + optional replay), and per-session
+//! SSE event buffers for `Last-Event-ID` reconnect.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -20,9 +21,31 @@ use crate::{text_response, BoxBody};
 /// HTTP header carrying the MCP session id (case-insensitive; canonical form per spec examples).
 pub const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 
+/// Max SSE `message` events retained per session for GET listener replay (`Last-Event-ID`).
+const MCP_SSE_RING_CAP: usize = 64;
+
+#[derive(Debug)]
+struct SseEvent {
+    id: u64,
+    payload: Bytes,
+}
+
+#[derive(Debug)]
+struct SessionRecord {
+    touched: Instant,
+    next_event_id: u64,
+    ring: VecDeque<SseEvent>,
+}
+
+impl SessionRecord {
+    fn touch(&mut self) {
+        self.touched = Instant::now();
+    }
+}
+
 #[derive(Debug)]
 pub struct McpStreamableSessionStore {
-    inner: Mutex<HashMap<String, Instant>>,
+    inner: Mutex<HashMap<String, SessionRecord>>,
     ttl: Duration,
 }
 
@@ -40,16 +63,23 @@ impl McpStreamableSessionStore {
         }
     }
 
-    fn prune(&self, map: &mut HashMap<String, Instant>) {
+    fn prune(&self, map: &mut HashMap<String, SessionRecord>) {
         let now = Instant::now();
-        map.retain(|_, t| now.duration_since(*t) < self.ttl);
+        map.retain(|_, rec| now.duration_since(rec.touched) < self.ttl);
     }
 
     pub fn create_session(&self) -> String {
         let id = uuid::Uuid::new_v4().to_string();
         let mut g = self.inner.lock().expect("mcp session mutex");
         self.prune(&mut g);
-        g.insert(id.clone(), Instant::now());
+        g.insert(
+            id.clone(),
+            SessionRecord {
+                touched: Instant::now(),
+                next_event_id: 1,
+                ring: VecDeque::new(),
+            },
+        );
         id
     }
 
@@ -63,12 +93,46 @@ impl McpStreamableSessionStore {
     pub fn validate_and_touch(&self, id: &str) -> bool {
         let mut g = self.inner.lock().expect("mcp session mutex");
         self.prune(&mut g);
-        if g.contains_key(id) {
-            g.insert(id.to_string(), Instant::now());
+        if let Some(rec) = g.get_mut(id) {
+            rec.touch();
             true
         } else {
             false
         }
+    }
+
+    /// Append one SSE `message` event (JSON-RPC envelope as `data:`) for GET listener replay.
+    /// Returns the exact bytes to send on the POST response (same as buffered for GET replay).
+    pub fn append_sse_message_event(&self, session_id: &str, json_envelope: &str) -> Option<Bytes> {
+        let mut g = self.inner.lock().expect("mcp session mutex");
+        self.prune(&mut g);
+        let rec = g.get_mut(session_id)?;
+        rec.touch();
+        let id = rec.next_event_id;
+        rec.next_event_id = rec.next_event_id.saturating_add(1);
+        let chunk = format!("id: {id}\nevent: message\ndata: {json_envelope}\n\n");
+        let payload = Bytes::copy_from_slice(chunk.as_bytes());
+        if rec.ring.len() >= MCP_SSE_RING_CAP {
+            rec.ring.pop_front();
+        }
+        rec.ring.push_back(SseEvent {
+            id,
+            payload: payload.clone(),
+        });
+        Some(payload)
+    }
+
+    /// Events with id strictly greater than `after_id` (for `Last-Event-ID` reconnect).
+    pub fn replay_events_after(&self, session_id: &str, after_id: u64) -> Vec<Bytes> {
+        let g = self.inner.lock().expect("mcp session mutex");
+        let Some(rec) = g.get(session_id) else {
+            return Vec::new();
+        };
+        rec.ring
+            .iter()
+            .filter(|e| e.id > after_id)
+            .map(|e| e.payload.clone())
+            .collect()
     }
 }
 
@@ -123,11 +187,23 @@ pub(crate) fn validate_origin_for_streamable<B>(
     Ok(())
 }
 
-/// Long-lived SSE stream for GET listener (keepalive only; server-push can be added later).
+fn parse_last_event_id(last_event_id: Option<&str>) -> u64 {
+    last_event_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Long-lived SSE stream for GET listener: optional replay of buffered POST responses, then keepalive.
 pub(crate) fn mcp_streamable_get_listener_response(
+    store: &McpStreamableSessionStore,
+    session_id: &str,
     last_event_id: Option<&str>,
 ) -> Response<BoxBody> {
-    let _ = last_event_id;
+    let after_id = parse_last_event_id(last_event_id);
+    let replay = store.replay_events_after(session_id, after_id);
+    let replay_stream = stream::iter(replay.into_iter().map(|b| Ok::<_, Infallible>(Frame::data(b))));
     let mut interval = tokio::time::interval(Duration::from_secs(20));
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let open = stream::once(async {
@@ -135,7 +211,7 @@ pub(crate) fn mcp_streamable_get_listener_response(
     });
     let pings = IntervalStream::new(interval)
         .map(|_| Ok::<_, Infallible>(Frame::data(Bytes::from_static(b": ping\n\n"))));
-    let stream = open.chain(pings);
+    let stream = replay_stream.chain(open).chain(pings);
     let body = StreamBody::new(stream)
         .map_err(|never: Infallible| match never {})
         .boxed_unsync();
@@ -173,4 +249,24 @@ pub(crate) fn mcp_session_header_missing_response() -> Response<BoxBody> {
 
 pub(crate) fn mcp_session_unknown_response() -> Response<BoxBody> {
     text_response(StatusCode::NOT_FOUND, "unknown or expired Mcp-Session-Id")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_then_replay_respects_last_event_id() {
+        let s = McpStreamableSessionStore::new();
+        let sid = s.create_session();
+        let _ = s.append_sse_message_event(&sid, r#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
+        let b2 = s
+            .append_sse_message_event(&sid, r#"{"jsonrpc":"2.0","id":2,"result":{}}"#)
+            .expect("second chunk");
+        let r0 = s.replay_events_after(&sid, 0);
+        assert_eq!(r0.len(), 2);
+        let r_after_first = s.replay_events_after(&sid, 1);
+        assert_eq!(r_after_first.len(), 1);
+        assert_eq!(r_after_first[0], b2);
+    }
 }

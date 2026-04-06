@@ -2585,7 +2585,7 @@ async fn dispatch(
     if let Some(rest) = control_plane_rest_path(&path, &state.config) {
         let corr_ops = ops_log_correlation_id(req.headers(), &state.config);
         let bucket = ops_bucket_for_path(&path, req.headers(), state.as_ref()).await;
-        if let Err(resp) = enforce_control_plane_auth_async(
+        let cp_access = match enforce_control_plane_auth_async(
             req.headers(),
             &state.config,
             state.console_oidc.as_ref(),
@@ -2593,9 +2593,23 @@ async fn dispatch(
         )
         .await
         {
+            Ok(a) => a,
+            Err(resp) => {
+                state.ops_metrics.inc_ops_auth_denied(&path);
+                log_ops_access(&path, "deny", &corr_ops, bucket.as_deref());
+                return Ok(resp);
+            }
+        };
+        if cp_access == ControlPlaneAccess::ReadOnly && control_plane_route_is_mutating(rest, &method)
+        {
             state.ops_metrics.inc_ops_auth_denied(&path);
-            log_ops_access(&path, "deny", &corr_ops, bucket.as_deref());
-            return Ok(resp);
+            log_ops_access(&path, "deny_read_only_mutate", &corr_ops, bucket.as_deref());
+            return Ok(json_response(
+                StatusCode::FORBIDDEN,
+                serde_json::json!({
+                    "error": "read-only control plane credentials cannot perform this operation"
+                }),
+            ));
         }
         state.ops_metrics.inc_ops_auth_allowed(&path);
         log_ops_access(&path, "allow", &corr_ops, bucket.as_deref());
@@ -3789,6 +3803,53 @@ fn enforce_ops_auth_if_configured_inner(
     ))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ControlPlaneAccess {
+    ReadWrite,
+    ReadOnly,
+}
+
+/// True for routes that change dynamic ingress, API keys, or other mutable control-plane state.
+fn control_plane_route_is_mutating(rest: &str, method: &hyper::Method) -> bool {
+    match rest {
+        "/v1/status" => method != &hyper::Method::GET,
+        "/v1/api_gateway/ingress/routes/export" => method != &hyper::Method::GET,
+        "/v1/api_gateway/ingress/routes" => method != &hyper::Method::GET,
+        "/v1/api_gateway/ingress/routes/import" => true,
+        "/v1/api_keys" => true,
+        _ => method != &hyper::Method::GET,
+    }
+}
+
+fn try_control_plane_read_only_secrets(headers: &HeaderMap, cfg: &PandaConfig) -> bool {
+    let names: Vec<&str> = cfg
+        .control_plane
+        .read_only_secret_envs
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if names.is_empty() {
+        return false;
+    }
+    let header_name = cfg.observability.admin_auth_header.as_str();
+    let got = headers
+        .get(header_name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    for env_name in &names {
+        if let Ok(expected) = std::env::var(env_name) {
+            if !expected.is_empty()
+                && got.len() == expected.len()
+                && constant_time_eq(got.as_bytes(), expected.as_bytes())
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn try_control_plane_secrets(headers: &HeaderMap, cfg: &PandaConfig) -> bool {
     let extra_names: Vec<&str> = cfg
         .control_plane
@@ -3853,16 +3914,19 @@ async fn enforce_control_plane_auth_async(
     cfg: &PandaConfig,
     console_oidc: Option<&Arc<console_oidc::ConsoleOidcRuntime>>,
     cp_redis: Option<&redis::aio::ConnectionManager>,
-) -> Result<(), Response<BoxBody>> {
+) -> Result<ControlPlaneAccess, Response<BoxBody>> {
     if try_control_plane_secrets(headers, cfg) {
-        return Ok(());
+        return Ok(ControlPlaneAccess::ReadWrite);
+    }
+    if try_control_plane_read_only_secrets(headers, cfg) {
+        return Ok(ControlPlaneAccess::ReadOnly);
     }
     let a = &cfg.control_plane.auth;
     if a.allow_console_oidc_session {
         if let Some(oc) = console_oidc {
             let mode = a.required_console_roles_mode.as_str();
             if oc.control_plane_session_authorized(headers, &a.required_console_roles, mode) {
-                return Ok(());
+                return Ok(ControlPlaneAccess::ReadWrite);
             }
         }
     }
@@ -3883,7 +3947,7 @@ async fn enforce_control_plane_auth_async(
                 )
                 .await
                 {
-                    return Ok(());
+                    return Ok(ControlPlaneAccess::ReadWrite);
                 }
             }
         }
@@ -5216,10 +5280,22 @@ fn mcp_ingress_tool_call_result_json(res: &mcp::McpToolCallResult) -> serde_json
 }
 
 fn mcp_ingress_jsonrpc_result(
+    state: &ProxyState,
     accept_streamable_http: bool,
     id: serde_json::Value,
     result: serde_json::Value,
+    mcp_session_id: Option<String>,
 ) -> Response<BoxBody> {
+    let buf = if accept_streamable_http {
+        mcp_session_id.as_deref().map(|s| {
+            (
+                state.mcp_streamable_sessions.as_ref(),
+                s,
+            )
+        })
+    } else {
+        None
+    };
     mcp_ingress_emit_jsonrpc_envelope(
         accept_streamable_http,
         StatusCode::OK,
@@ -5228,16 +5304,29 @@ fn mcp_ingress_jsonrpc_result(
             "id": id,
             "result": result,
         }),
+        buf,
     )
 }
 
 fn mcp_ingress_jsonrpc_error(
+    state: &ProxyState,
     accept_streamable_http: bool,
     status: StatusCode,
     id: serde_json::Value,
     code: i32,
     message: &str,
+    mcp_session_id: Option<String>,
 ) -> Response<BoxBody> {
+    let buf = if accept_streamable_http {
+        mcp_session_id.as_deref().map(|s| {
+            (
+                state.mcp_streamable_sessions.as_ref(),
+                s,
+            )
+        })
+    } else {
+        None
+    };
     mcp_ingress_emit_jsonrpc_envelope(
         accept_streamable_http,
         status,
@@ -5246,6 +5335,7 @@ fn mcp_ingress_jsonrpc_error(
             "id": id,
             "error": { "code": code, "message": message }
         }),
+        buf,
     )
 }
 
@@ -5261,6 +5351,7 @@ pub(crate) async fn mcp_http_ingress_execute_tools_call(
     arguments: serde_json::Value,
     id: serde_json::Value,
     accept_streamable_http: bool,
+    mcp_session_id: Option<String>,
 ) -> Response<BoxBody> {
     let server_lbl = server.clone();
     let tool_lbl = tool.clone();
@@ -5268,11 +5359,13 @@ pub(crate) async fn mcp_http_ingress_execute_tools_call(
     if let Some(allowed) = state.config.effective_mcp_server_names(ingress_path) {
         if !allowed.iter().any(|a| a == &server_lbl) {
             return mcp_ingress_jsonrpc_error(
+                state,
                 accept_streamable_http,
                 StatusCode::OK,
                 id,
                 -32602,
                 "MCP server not allowed for this ingress route",
+                mcp_session_id.clone(),
             );
         }
     }
@@ -5284,11 +5377,13 @@ pub(crate) async fn mcp_http_ingress_execute_tools_call(
             .ops_metrics
             .inc_mcp_tool_route_event("call_blocked", &rule);
         return mcp_ingress_jsonrpc_error(
+            state,
             accept_streamable_http,
             StatusCode::OK,
             id,
             -32602,
             "tool blocked by mcp.tool_routes policy",
+            mcp_session_id.clone(),
         );
     }
 
@@ -5370,9 +5465,11 @@ pub(crate) async fn mcp_http_ingress_execute_tools_call(
                 );
             }
             return mcp_ingress_jsonrpc_result(
+                state,
                 accept_streamable_http,
                 id,
                 mcp_ingress_tool_call_result_json(&hit),
+                mcp_session_id.clone(),
             );
         } else {
             state
@@ -5423,11 +5520,13 @@ pub(crate) async fn mcp_http_ingress_execute_tools_call(
                         other => format!("{other:?}"),
                     };
                     return mcp_ingress_jsonrpc_error(
+                        state,
                         accept_streamable_http,
                         StatusCode::OK,
                         id,
                         -32603,
                         &format!("hitl: {msg}"),
+                        mcp_session_id.clone(),
                     );
                 }
             }
@@ -5485,9 +5584,11 @@ pub(crate) async fn mcp_http_ingress_execute_tools_call(
                 }
             }
             mcp_ingress_jsonrpc_result(
+                state,
                 accept_streamable_http,
                 id,
                 mcp_ingress_tool_call_result_json(&result),
+                mcp_session_id.clone(),
             )
         }
         Err(e) => {
@@ -5498,11 +5599,13 @@ pub(crate) async fn mcp_http_ingress_execute_tools_call(
             };
             state.record_mcp_tool_call(server_lbl.as_str(), tool_lbl.as_str(), outcome);
             mcp_ingress_jsonrpc_error(
+                state,
                 accept_streamable_http,
                 StatusCode::OK,
                 id,
                 -32603,
                 &format!("tools/call failed: {e:#}"),
+                mcp_session_id.clone(),
             )
         }
     }
@@ -8664,17 +8767,25 @@ pub(crate) fn json_response(status: StatusCode, value: serde_json::Value) -> Res
 
 /// MCP **streamable HTTP** (minimal): when `Accept` includes `text/event-stream`, wrap the JSON-RPC
 /// envelope in a single SSE `message` event ([MCP streamable HTTP](https://modelcontextprotocol.io)).
+/// When `sse_buffer` is set, assigns an `id:` field and retains the chunk for GET listener replay.
 pub(crate) fn mcp_ingress_emit_jsonrpc_envelope(
     accept_event_stream: bool,
     status: StatusCode,
     envelope: serde_json::Value,
+    sse_buffer: Option<(&crate::inbound::mcp_streamable_http::McpStreamableSessionStore, &str)>,
 ) -> Response<BoxBody> {
     let payload = envelope.to_string();
     if !accept_event_stream {
         return text_with_content_type(status, payload, "application/json; charset=utf-8");
     }
-    let sse = format!("event: message\ndata: {payload}\n\n");
-    let body = Full::new(bytes::Bytes::copy_from_slice(sse.as_bytes()))
+    let sse_bytes: bytes::Bytes = if let Some((store, sid)) = sse_buffer {
+        store.append_sse_message_event(sid, payload.as_str()).unwrap_or_else(|| {
+            bytes::Bytes::from(format!("event: message\ndata: {payload}\n\n"))
+        })
+    } else {
+        bytes::Bytes::from(format!("event: message\ndata: {payload}\n\n"))
+    };
+    let body = Full::new(sse_bytes)
         .map_err(|never: std::convert::Infallible| match never {})
         .boxed_unsync();
     Response::builder()
@@ -8882,6 +8993,7 @@ mod tests {
     mod gateway_workflow;
     mod backend_routing_and_proxy;
     mod dispatch_branches;
+    mod control_plane_and_streamable_scenarios;
 
     fn mcp_streamable_accept_value() -> &'static str {
         "application/json, text/event-stream"

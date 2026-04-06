@@ -2,6 +2,8 @@
 
 This doc describes **how to test** Panda when **`api_gateway` ingress/egress** and **`mcp`** are used together, and points at the **framework the repo already ships** (Rust integration tests + optional shell smoke).
 
+**Catalog:** For a **per-test map** (purpose + data flow through `dispatch`), see [`testing_scenarios_and_data_flows.md`](./testing_scenarios_and_data_flows.md).
+
 ---
 
 ## 1. What you are testing
@@ -143,6 +145,12 @@ The strongest coverage is **`cargo test -p panda-proxy`**. Tests spin up a **loc
 
 ```bash
 cargo test -p panda-proxy tests::gateway_workflow -- --nocapture
+```
+
+**Control plane + tenant + streamable replay (scenario matrix):** `crates/panda-proxy/src/tests/control_plane_and_streamable_scenarios.rs` documents **CP-RO-*** (read-only vs write secrets), **TN-*** (global vs `tenant_id`-scoped dynamic ingress with `tenant_resolution_header`), and **SSE-1** (`Last-Event-ID` replays only newer buffered POST events on the GET listener). Run:
+
+```bash
+cargo test -p panda-proxy control_plane_and_streamable -- --nocapture
 ```
 
 **Examples (additional full stack in `lib.rs`):**

@@ -56,6 +56,12 @@ listen: "127.0.0.1:8080"
 # Default backend when no `routes` prefix matches (e.g. custom paths or future routes).
 default_backend: "http://127.0.0.1:5023"
 
+# Required by config validation (`PandaConfig::validate`); used for correlation IDs and ops /metrics auth.
+# CI includes this file via `scenario_d_repo_root_panda_yaml_parses` and the panda-proxy repo-root smoke test.
+observability:
+  correlation_header: x-request-id
+  admin_auth_header: x-panda-admin-secret
+
 # Per-path backend_base and limits (longest path_prefix wins; list order does not matter).
 # Fields: backend_base, type (openai|anthropic), methods, rate_limit, tpm_limit, semantic_cache,
 # mcp_servers, mcp_advertise_tools, routing (overrides when global `routing` is enabled — see commented block below).
