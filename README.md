@@ -191,9 +191,9 @@ PANDA_DEV_CONSOLE_ENABLED=true cargo run -p panda-server -- panda.yaml
 | Deployment | What to Use |
 |------------|-------------|
 | **Local Development** | `cargo run` + `panda.yaml`; optional `PANDA_DEV_CONSOLE_ENABLED=true` for [`/console`](docs/developer_console.md) |
-| **Docker Container** | `docker build` + mount `panda.yaml`; see **Docker** below |
-| **Kubernetes** | Manifests under `k8s/`; ConfigMap + Deployment pattern |
-| **Behind Edge Gateway** | Edge handles TLS and coarse routing; forward AI and MCP paths to Panda—see [`docs/kong_handshake.md`](docs/kong_handshake.md) |
+| **Docker Container** | `docker build` + mount `panda.yaml`; fully supports all three gateway functions |
+| **Kubernetes** | Manifests under `k8s/`; updated ConfigMap with unified gateway configuration |
+| **Behind Edge Gateway** | Edge handles TLS and coarse routing; forward AI, MCP, and API paths to Panda—see [`docs/kong_handshake.md`](docs/kong_handshake.md) |
 | **MCP + Databases** | `deploy/mcp-starters/docker-compose.yml` — see `deploy/mcp-starters/README.md` |
 | **Load Testing** | `scripts/staging_readiness_gate.sh`, `scripts/load_profile_chat.sh` |
 
@@ -358,7 +358,9 @@ docker run --rm -p 8080:8080 \
 
 Container images default `PANDA_LISTEN_OVERRIDE=0.0.0.0:8080` so host port publishing works out of the box.
 
-By default, the Docker build enables `mimalloc` (`PANDA_BUILD_FEATURES=mimalloc`).
+**Unified Gateway Support:** The Docker image now fully supports all three gateway functions (API, MCP, and AI) with the updated configuration format.
+
+**Build Features:** By default, the Docker build enables `mimalloc` (`PANDA_BUILD_FEATURES=mimalloc`).
 
 **MCP + Postgres lab:** `docker compose -f deploy/mcp-starters/docker-compose.yml up --build` (see `deploy/mcp-starters/README.md`).
 
@@ -370,7 +372,22 @@ By default, the Docker build enables `mimalloc` (`PANDA_BUILD_FEATURES=mimalloc`
 
 Starter manifests: `k8s/configmap.yaml`, `deployment.yaml`, `service.yaml`, `pdb.yaml`, `hpa.yaml`, `secret.example.yaml`.
 
-Before applying, set a real upstream in `k8s/configmap.yaml` (`replace-me-upstream` is a placeholder).
+### Unified Gateway Configuration
+
+The Kubernetes `configmap.yaml` has been updated to support the unified gateway architecture:
+
+- Uses `default_backend` instead of the legacy `upstream` field
+- Includes **API Gateway** configuration with ingress/egress routes
+- Includes **MCP Gateway** configuration with sample tool servers
+
+### Deployment Steps
+
+1. **Update the configmap** with your actual upstream and MCP tool servers:
+   - Set `default_backend` to your LLM provider
+   - Configure `api_gateway` routes as needed
+   - Add MCP tool servers under `mcp.servers`
+
+2. **Apply the manifests**:
 
 ```bash
 kubectl apply -f k8s/configmap.yaml
