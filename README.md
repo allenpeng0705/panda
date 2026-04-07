@@ -4,7 +4,7 @@
 
 **Website:** https://www.homeclaw.cn/panda-ai/
 
-**Panda is a Rust AI gateway**: **OpenAI-compatible HTTP** in front, your **models and routes** behind—one **YAML** config, one binary. It is built for **streaming**, **token-aware budgets**, **MCP agents**, and **low-cardinality observability** so you get clear **key values** (who, what, cost, cache, tools) without turning the proxy into a data warehouse.
+**Panda is a Rust unified gateway**: combines **API gateway** capabilities with **MCP (Model Context Protocol) tool orchestration** and **AI gateway** features—all in one binary with one **YAML** config. It is built for **streaming**, **token-aware budgets**, **agent-ready tool loops**, and **low-cardinality observability** so you get clear **key values** (who, what, cost, cache, tools) without turning the gateway into a data warehouse.
 
 ### Key values (what you get)
 
@@ -23,60 +23,77 @@
 
 ## What is Panda?
 
-A **specialized reverse proxy for LLM traffic**: auth, routing, budgets, cache, tools, and policy share one **request context**. You run **`cargo run -p panda-server -- panda.yaml`** (or Docker/K8s). **Client** traffic stays **OpenAI-compatible** on the paths Panda exposes today; **upstream** targets aim for **broad provider coverage**—OpenAI-compatible bases (Ollama, vLLM, many clouds), **Anthropic-native** APIs via the built-in adapter, and **more native adapters over time** (same budgets, cache, and policy)—see [`docs/ai_routing_strategy.md`](docs/ai_routing_strategy.md) §1.1.
+A **unified gateway** that combines three powerful functions in one binary:
+
+1. **API Gateway** — Ingress routing, egress governance, TLS, auth, rate limits
+2. **MCP (Model Context Protocol) Gateway** — Tool orchestration, tool result caching, multi-round agent loops
+3. **AI Gateway** — OpenAI-compatible chat endpoints, token budgets, semantic cache, model adapters
+
+You run **`cargo run -p panda-server -- panda.yaml`** (or Docker/K8s). **Client** traffic stays **OpenAI-compatible** on AI paths, while **MCP tool calls** use JSON-RPC over HTTP. **Upstream** targets include OpenAI-compatible bases (Ollama, vLLM, many clouds), **Anthropic-native** APIs via the built-in adapter, and **REST/remote MCP tool servers**.
 
 ---
 
-## Inbound vs outbound (product shape)
+## Use Cases
 
-| Pillar | Role | Typical stack |
+Panda can be used in various configurations depending on your needs:
+
+| Use Case | Description | Configuration |
+|----------|-------------|---------------|
+| **Pure API Gateway** | Traditional REST API proxying with path routing, auth, and rate limits | `mcp.enabled: false`, configure `routes` and `api_gateway` |
+| **AI Gateway Only** | Governed OpenAI-compatible proxy with token budgeting and semantic cache | `mcp.enabled: false`, set `default_backend` or `routes` |
+| **MCP Gateway Only** | Tool orchestration for integration tests, scripts, or headless automation | `mcp.enabled: true`, configure `mcp.servers` |
+| **AI Gateway + MCP** | Assistant flows where the LLM chooses tools and Panda executes them | `mcp.enabled: true`, set `mcp_advertise_tools: true` on routes |
+| **Full Stack** | Enterprise deployment with all components: API gateway, MCP, and AI gateway | All components enabled and configured |
+
+Detailed use case examples with configuration: [`docs/panda_use_cases.md`](docs/panda_use_cases.md)
+
+---
+
+## Inbound vs Outbound (Architecture)
+
+| Pillar | Role | Typical Stack |
 |--------|------|----------------|
-| **Inbound — all-in-one** | **Panda API gateway** (first-class): **ingress** in front of **Panda MCP**, and/or **egress** behind MCP toward **corporate** API gateway + REST. Optional **external** Kong/NGINX outside Panda | [`docs/panda_data_flow.md`](docs/panda_data_flow.md) |
-| **Outbound — AI gateway** | **Control organizational AI use:** OpenAI-shaped traffic to LLMs, **budgets**, usage signals, adapters, streaming, semantic cache, routing, failover | Same process and `panda.yaml`; providers behind `upstream` / `routes` |
+| **Inbound** | **API Gateway** (ingress/egress) + **MCP Gateway** for tool orchestration | Clients → Panda API Gateway → Panda MCP → Corporate API Gateway → REST |
+| **Outbound** | **AI Gateway** for LLM traffic | Clients → Panda → Model Providers (OpenAI, Anthropic, local) |
 
-Cross-cutting identity, policy, and observability apply to both. **First step:** narrow inbound to **[Phase 1 MCP + API gateway](docs/mcp_gateway_phase1.md)** (defer advanced MCP options until basics work). **MCP is not the only future wire format** — [`docs/protocol_evolution.md`](docs/protocol_evolution.md). Full map: [`docs/architecture_two_pillars.md`](docs/architecture_two_pillars.md).
+Cross-cutting identity, policy, and observability apply to both. **First step:** start with **[Phase 1 MCP + API gateway](docs/mcp_gateway_phase1.md)** (defer advanced MCP options until basics work). Full architecture: [`docs/architecture_two_pillars.md`](docs/architecture_two_pillars.md).
 
 ---
 
-## QuickStart (standalone)
+## QuickStart
 
-The fastest path is **Cargo** against a local or remote OpenAI-compatible API.
+Choose the QuickStart that matches your use case:
 
-### Prerequisites
+### Option 1: AI Gateway (Standalone)
 
-- [Rust toolchain](https://rustup.rs/) (stable), **or** Docker (see below).
-- A model server URL: e.g. [Ollama](https://ollama.com/) on `http://127.0.0.1:11434`, or a cloud provider’s OpenAI-compatible base URL.
+The fastest path to get started with LLM traffic.
 
-### 1. Config
+#### Prerequisites
+- [Rust toolchain](https://rustup.rs/) (stable), **or** Docker
+- A model server URL: e.g. [Ollama](https://ollama.com/) on `http://127.0.0.1:11434`, or a cloud provider’s OpenAI-compatible base URL
 
+#### 1. Config
 ```bash
 cp panda.example.yaml panda.yaml
 ```
 
 Edit `panda.yaml`:
-
-- Set **`upstream`** to your provider (examples):
+- Set **`default_backend`** to your provider (examples):
   - Local Ollama: `http://127.0.0.1:11434`
-  - OpenAI: `https://api.openai.com` (set `Authorization` / API key via your provider’s usual env or route config)
-- Default **`listen`** is `127.0.0.1:8080` (see top of `panda.example.yaml`).
+  - OpenAI: `https://api.openai.com/v1` (set `Authorization` / API key via env or route config)
+- Default **`listen`** is `127.0.0.1:8080`
 
-### 2. Run
-
+#### 2. Run
 ```bash
 cargo run -p panda-server -- panda.yaml
 ```
 
-Optional: `RUST_LOG=info` for structured logs.
-
-### 3. Verify
-
+#### 3. Verify
 ```bash
+# Health check
 curl -s http://127.0.0.1:8080/health
-```
 
-Minimal chat request (adjust `model` to match your upstream):
-
-```bash
+# Test chat completion
 curl -s http://127.0.0.1:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
@@ -85,42 +102,118 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
-You now have Panda **standalone**: one process, one config file, no separate database required for core features.
+### Option 2: MCP Gateway (Tool Orchestration)
 
-**Tip:** enable the [Developer Console](docs/developer_console.md) on first run with `--ui` (binds `127.0.0.1:8081` unless `PANDA_LISTEN_OVERRIDE` is set):
+For tool orchestration without LLM traffic.
 
+#### 1. Config
+Edit `panda.yaml`:
+```yaml
+mcp:
+  enabled: true
+  servers:
+    - name: corpapi
+      enabled: true
+      http_tool:
+        path: /api/data
+        method: GET
+        tool_name: fetch
+api_gateway:
+  ingress:
+    enabled: true
+    routes:
+      - path_prefix: /mcp
+        backend: mcp
+        methods: [POST]
+  egress:
+    enabled: true
+    corporate:
+      default_base: http://internal-api:8080
+    allowlist:
+      allow_hosts: [internal-api:8080]
+      allow_path_prefixes: [/api]
+```
+
+#### 2. Run
 ```bash
-cargo run -p panda-server -- --ui panda.yaml
+cargo run -p panda-server -- panda.yaml
+```
+
+#### 3. Verify
+```bash
+# Test MCP initialization
+curl -s http://127.0.0.1:8080/mcp \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+      "protocolVersion": "2025-03-26",
+      "capabilities": {},
+      "clientInfo": {
+        "name": "test",
+        "version": "0"
+      }
+    }
+  }'
+```
+
+### Option 3: Full Stack (API + MCP + AI)
+
+For complete agent workflows with tool integration.
+
+#### 1. Config
+Edit `panda.yaml` to enable all components:
+- Set `default_backend` for AI traffic
+- Enable `mcp` with tool servers
+- Configure `api_gateway` for ingress/egress
+
+#### 2. Run
+```bash
+cargo run -p panda-server -- panda.yaml
+```
+
+#### 3. Verify
+- Test AI gateway: `/v1/chat/completions`
+- Test MCP: `/mcp` JSON-RPC
+- Test API gateway: path-based routing
+
+**Tip:** Enable the [Developer Console](docs/developer_console.md) for live debugging:
+```bash
+PANDA_DEV_CONSOLE_ENABLED=true cargo run -p panda-server -- panda.yaml
 ```
 
 ---
 
-## Other ways to run and use cases
+## Deployment Options
 
-| Scenario | What to use |
-|----------|-------------|
-| **Local dev / lab** | `cargo run` + `panda.yaml`; optional `PANDA_DEV_CONSOLE_ENABLED=true` for [`/console`](docs/developer_console.md) |
-| **Container** | `docker build` + mount `panda.yaml`; see **Docker** below |
+| Deployment | What to Use |
+|------------|-------------|
+| **Local Development** | `cargo run` + `panda.yaml`; optional `PANDA_DEV_CONSOLE_ENABLED=true` for [`/console`](docs/developer_console.md) |
+| **Docker Container** | `docker build` + mount `panda.yaml`; see **Docker** below |
 | **Kubernetes** | Manifests under `k8s/`; ConfigMap + Deployment pattern |
-| **Behind an API / edge gateway** | Edge handles TLS and coarse routing; forward AI and MCP paths to Panda—see [`docs/kong_handshake.md`](docs/kong_handshake.md) (trusted hop contract, any L7), [`docs/deployment.md`](docs/deployment.md) |
-| **MCP + databases (Compose)** | `deploy/mcp-starters/docker-compose.yml` — see `deploy/mcp-starters/README.md` |
-| **Load / staging checks** | `scripts/staging_readiness_gate.sh`, `scripts/load_profile_chat.sh` (see **Validation scripts** below) |
+| **Behind Edge Gateway** | Edge handles TLS and coarse routing; forward AI and MCP paths to Panda—see [`docs/kong_handshake.md`](docs/kong_handshake.md) |
+| **MCP + Databases** | `deploy/mcp-starters/docker-compose.yml` — see `deploy/mcp-starters/README.md` |
+| **Load Testing** | `scripts/staging_readiness_gate.sh`, `scripts/load_profile_chat.sh` |
 
-**Environment overrides (common):**
-
-- `PANDA_LISTEN_OVERRIDE=0.0.0.0:8080` — override YAML `listen` (e.g. bind all interfaces).
-- `OTEL_EXPORTER_OTLP_ENDPOINT=...` — enable OTLP trace export (see full list in [`crates/panda-server/src/main.rs`](crates/panda-server/src/main.rs) `ENV_HELP`).
-- `PANDA_GRPC_HEALTH_LISTEN=0.0.0.0:50051` — gRPC **`grpc.health.v1`** (requires binary built with **`--features grpc`**).
+### Environment Overrides (Common)
+- `PANDA_LISTEN_OVERRIDE=0.0.0.0:8080` — override YAML `listen` (e.g. bind all interfaces)
+- `OTEL_EXPORTER_OTLP_ENDPOINT=...` — enable OTLP trace export (see full list in [`crates/panda-server/src/main.rs`](crates/panda-server/src/main.rs) `ENV_HELP`)
+- `PANDA_GRPC_HEALTH_LISTEN=0.0.0.0:50051` — gRPC **`grpc.health.v1`** (requires binary built with **`--features grpc`**)
+- `PANDA_DEV_CONSOLE_ENABLED=true` — enable developer console
+- `PANDA_UPSTREAM_FIRST_BYTE_TIMEOUT_MS` — timeout for first upstream response byte
+- `PANDA_UPSTREAM_SSE_IDLE_TIMEOUT_MS` — timeout for SSE chunk idle time
 
 ---
 
-## Design principles
+## Design Principles
 
-- **Two pillars** — **[Inbound](docs/architecture_two_pillars.md)** = **Panda API gateway + MCP gateway** (all-in-one: ingress and/or egress); **[Outbound](docs/architecture_two_pillars.md)** = **AI gateway** (chat/SSE, TPM, cache, adapters to LLMs).
-- **One hop for AI policy** — Identity, budgets, cache, MCP, and safety see the same request; config stays in **YAML** (`panda.example.yaml` is the annotated template).
-- **Stream-native** — SSE stays incremental where possible; optional **buffered mid-stream failover** (enterprise) is explicit in **`/ready`** because it affects **TTFT**.
-- **Key values, not a warehouse** — Prometheus stays **healthy**: high-volume series avoid per-tenant labels; **correlation id**, **`/tpm/status`**, and optional **audit JSONL** carry the detail your log or compliance pipeline aggregates.
-- **Edge + Panda** — **Inbound:** **Panda’s API gateway** (ingress/egress) + **MCP**; optional **external** Kong on top. **Outbound:** Panda as **AI gateway** to LLM providers. **Trusted hop** when an **external** gateway wraps Panda ([`docs/kong_handshake.md`](docs/kong_handshake.md)).
+- **Unified Gateway** — Three powerful functions in one binary: **API Gateway** (ingress/egress), **MCP Gateway** (tool orchestration), and **AI Gateway** (LLM traffic).
+- **One Hop Policy** — Identity, budgets, cache, MCP, and safety see the same request; config stays in **YAML** (`panda.example.yaml` is the annotated template).
+- **Stream-Native** — SSE stays incremental where possible; optional **buffered mid-stream failover** (enterprise) is explicit in **`/ready`** because it affects **TTFT**.
+- **Observability Focus** — Prometheus stays **healthy** with low-cardinality metrics; **correlation id**, **`/tpm/status`**, and optional **audit JSONL** carry detailed information.
+- **Flexible Deployment** — Use as standalone AI gateway, pure API gateway, MCP gateway, or full-stack solution. **Edge + Panda** pattern supported with trusted hop contracts.
 
 **Core vs Enterprise:** core = single `panda.yaml`, optional Redis for TPM/cache, no SSO required. Enterprise = console SSO, hierarchical budgets, model failover chains—[`docs/enterprise_track.md`](docs/enterprise_track.md).
 
@@ -130,11 +223,11 @@ cargo run -p panda-server -- --ui panda.yaml
 
 ```mermaid
 flowchart TD
-  C["Clients and Agent SDKs (core)"]
+  C["Clients and Agent SDKs"]
 
-  subgraph EDGE["Ingress — core: pick a deployment pattern"]
-    E1["Standalone: clients → Panda (core)"]
-    E2["With API gateway / edge: AI + MCP routes → Panda (core)"]
+  subgraph EDGE["Ingress Options"]
+    E1["Standalone: clients → Panda"]
+    E2["With API Gateway: AI + MCP routes → Panda"]
   end
 
   C --> E1
@@ -143,42 +236,58 @@ flowchart TD
   E1 --> P
   E2 --> P
 
-  subgraph PANDA["Panda Gateway data plane"]
-    I["Ingress: auth & routing (core)"]
-    S["Safety & policy (core)\nJWT/JWKS, prompt safety, PII, Wasm hooks"]
-    X["AI control (core + optional enterprise)\nTPM, semantic cache, context\nenterprise: hierarchical budgets"]
-    A["Adapter & streaming (core + optional enterprise)\nOpenAI ingress, SSE guards\nenterprise: model failover / parity"]
-    M["MCP orchestration (core)"]
-    I --> S --> X --> A --> M
+  subgraph PANDA["Panda Unified Gateway"]
+    subgraph API_GW["API Gateway (core)"]
+      ING["Ingress: auth & routing"]
+      EGR["Egress: corporate services"]
+      ING --> EGR
+    end
+    
+    subgraph MCP_GW["MCP Gateway (core)"]
+      MCP_RT["MCP Runtime"]
+      TOOL_CACHE["Tool Result Cache"]
+      MCP_RT <--> TOOL_CACHE
+    end
+    
+    subgraph AI_GW["AI Gateway (core)"]
+      AI_CTRL["AI Control\nTPM, semantic cache"]
+      ADAPTER["Adapter & Streaming\nOpenAI, Anthropic"]
+      AI_CTRL --> ADAPTER
+    end
+    
+    ING --> MCP_RT
+    ING --> AI_CTRL
+    MCP_RT --> EGR
   end
 
-  P["Panda HTTP listener (core)"] --> I
+  P["Panda HTTP Listener"] --> API_GW
 
-  subgraph STATEFUL["State & observability"]
-    R["Redis (optional)\ncore optional: TPM, semantic cache\nenterprise: hierarchical budgets"]
-    PM["Prometheus (core)\nscrape /metrics"]
-    OT["OTLP (core)\ntraces to your collector"]
-    OPS["Ops HTTP (core)\n/health, /ready, /metrics\n/tpm/status, /mcp/status\n/ops/fleet/status, /compliance/status"]
+  subgraph STATE["State & Observability"]
+    R["Redis (optional)\nTPM, cache"]
+    PM["Prometheus\n/metrics"]
+    OT["OTLP\nTraces"]
+    OPS["Ops Endpoints\n/health, /ready, /tpm/status, /mcp/status"]
   end
 
-  X <--> R
+  AI_CTRL <--> R
+  TOOL_CACHE <--> R
   P --> PM
   P --> OT
   P --> OPS
 
-  subgraph PROVIDERS["Model providers (core: single upstream)\nenterprise: ordered failover chain"]
+  subgraph PROVIDERS["Model Providers"]
     OAI["OpenAI / Azure OpenAI"]
-    DS["DeepSeek / Qwen / MiniMax (OpenAI-compatible)"]
-    ANT["Anthropic (adapter or failover hop)"]
-    LOC["Local: Ollama / vLLM / TGI / compatible"]
+    DS["DeepSeek / Qwen / MiniMax"]
+    ANT["Anthropic"]
+    LOC["Local: Ollama / vLLM / TGI"]
   end
 
-  A --> OAI
-  A --> DS
-  A --> ANT
-  A --> LOC
+  ADAPTER --> OAI
+  ADAPTER --> DS
+  ADAPTER --> ANT
+  ADAPTER --> LOC
 
-  M --> TOOLS["MCP tool servers (core)\nPostgres, Slack/Discord, RAG, custom"]
+  MCP_RT --> TOOLS["MCP Tool Servers\nPostgres, Slack, RAG, custom"]
 ```
 
 **Legend:** **(core)** means usable with default small-team `panda.yaml` without Enterprise-only blocks. **Enterprise** items are opt-in (`console_oidc`, `budget_hierarchy`, `model_failover`, etc.); see [`docs/enterprise_track.md`](docs/enterprise_track.md).
@@ -189,40 +298,49 @@ flowchart TD
 sequenceDiagram
   autonumber
   participant U as Client / Agent SDK
-  participant K as API gateway / Edge (optional)
-  participant P as Panda Gateway
+  participant K as Edge Gateway (optional)
+  participant P as Panda Unified Gateway
   participant R as Redis (optional)
   participant M as MCP Tool Server(s) (optional)
-  participant L as Model Provider (OpenAI/Azure/DeepSeek/Qwen/MiniMax/Anthropic/Local)
-  participant O as Prometheus / OTLP / Ops endpoints
+  participant L as Model Provider
+  participant O as Observability
 
   alt Standalone deployment
-    U->>P: OpenAI-style request (e.g. /v1/chat/completions)
-  else With API gateway or existing edge
+    U->>P: Request (AI or MCP)
+  else With edge gateway
     U->>K: Request to edge route
-    K->>P: Forward AI path + trusted identity headers
+    K->>P: Forward with trusted headers
   end
 
-  P->>P: Ingress auth/routing + policy checks (JWT/JWKS, safety, PII, Wasm)
-  P->>R: Read/update TPM and cache state (optional)
-  R-->>P: Budget/cache result
-
-  opt MCP tool orchestration needed
-    P->>L: Initial model call (tool planning)
-    L-->>P: Tool calls in response
-    P->>M: Execute approved tool(s)
-    M-->>P: Tool result payload(s)
-    P->>L: Follow-up model call with tool outputs
+  P->>P: API Gateway: Ingress auth & routing
+  
+  alt AI Gateway path (/v1/chat/completions)
+    P->>P: AI Gateway: TPM & semantic cache checks
+    P->>R: Read/update cache (optional)
+    R-->>P: Cache result
+    
+    opt MCP tool orchestration
+      P->>L: Initial model call (tool planning)
+      L-->>P: Tool calls in response
+      P->>P: MCP Gateway: Execute tools
+      P->>M: Tool execution
+      M-->>P: Tool results
+      P->>L: Follow-up model call
+    end
+    
+    L-->>P: Model response (JSON or SSE)
+    P-->>U: OpenAI-shaped response
+  else MCP Gateway path (/mcp)
+    P->>P: MCP Gateway: Process JSON-RPC
+    P->>M: Tool execution
+    M-->>P: Tool results
+    P-->>U: MCP response
+  else API Gateway path (REST)
+    P->>P: API Gateway: Egress to corporate services
+    P-->>U: API response
   end
 
-  alt Enterprise failover enabled and hop fails (5xx/429/timeout)
-    P->>L: Retry next parity backend (ordered chain)
-  end
-
-  L-->>P: Final response (JSON or SSE stream)
-  P-->>U: OpenAI-shaped response (stream preserved when enabled)
-
-  P->>O: Emit metrics/logs/traces and status updates
+  P->>O: Emit metrics, logs, traces
 ```
 
 ---
@@ -340,10 +458,11 @@ cargo build -p panda-server --release --features mimalloc
 
 ---
 
-## Documentation map
+## Documentation Map
 
 | Doc | Topic |
 |-----|--------|
+| [`docs/panda_use_cases.md`](docs/panda_use_cases.md) | Use cases and configuration examples for all deployment scenarios |
 | [`docs/architecture_two_pillars.md`](docs/architecture_two_pillars.md) | Inbound (MCP + API gateway) vs outbound (AI gateway) — module & config map |
 | [`docs/mcp_gateway_phase1.md`](docs/mcp_gateway_phase1.md) | Phase 1: what the API gateway vs Panda MCP own; minimal YAML; what to defer |
 | [`docs/mcp_gateway_reference_designs.md`](docs/mcp_gateway_reference_designs.md) | Design notes: [Docker](https://github.com/docker/mcp-gateway) & [Microsoft](https://github.com/microsoft/mcp-gateway) MCP gateways vs Panda |
