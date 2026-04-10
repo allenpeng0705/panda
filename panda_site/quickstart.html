@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>QuickStart - Panda AI Gateway</title>
+    <title>QuickStart - Panda Gateway</title>
     <link rel="stylesheet" href="styles.css">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
@@ -16,7 +16,7 @@
         <div class="container">
             <a class="navbar-brand" href="index.html">
                 <img src="assets/images/panda-logo.svg" alt="Panda Logo" width="30" height="30" class="d-inline-block align-top me-2">
-                Panda AI Gateway
+                Panda Gateway
             </a>
             <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
                 <span class="navbar-toggler-icon"></span>
@@ -121,6 +121,93 @@ $ docker run --rm -p 8080:8080 \
             </div>
 
             <div class="mt-12">
+                <h2>Agent Integration</h2>
+                <div class="row">
+                    <div class="col-md-6 mb-6">
+                        <div class="card h-100">
+                            <div class="card-body">
+                                <h3 class="card-title">OpenClaw Integration</h3>
+                                <p class="card-text">Integrate Panda with OpenClaw-class agents for enhanced performance, caching, and observability.</p>
+                                <h4>Key Benefits:</h4>
+                                <ul>
+                                    <li>Semantic caching for LLM responses</li>
+                                    <li>Tool caching for deterministic operations</li>
+                                    <li>Rate limiting and TPM control</li>
+                                    <li>Unified routing for local and cloud models</li>
+                                </ul>
+                                <h4>Configuration Steps:</h4>
+                                <pre><code># 1. Create panda.openclaw.yaml
+$ cp panda.example.yaml panda.openclaw.yaml
+
+# 2. Update with OpenClaw routes
+routes:
+  - path_prefix: /v1/chat
+    backend_base: "http://127.0.0.1:5023"
+    type: openai
+    semantic_cache: true
+  - path_prefix: /cloud
+    backend_base: "http://127.0.0.1:14005"
+    type: openai
+    semantic_cache: true
+  - path_prefix: /v1/embeddings
+    backend_base: "http://127.0.0.1:5066"
+    type: openai
+
+# 3. Start Panda
+$ cargo run --bin panda panda.openclaw.yaml
+
+# 4. Update OpenClaw config/llm.yml
+panda:
+  enabled: true
+  host: 127.0.0.1
+  port: 8081
+  paths:
+    main_llm: /v1/chat/completions
+    embedding: /v1/embeddings
+    cloud_llm: /cloud/v1/chat/completions</code></pre>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-6 mb-6">
+                        <div class="card h-100">
+                            <div class="card-body">
+                                <h3 class="card-title">HomeClaw Integration</h3>
+                                <p class="card-text">Specific integration for HomeClaw agents with optimized routing and caching.</p>
+                                <h4>Configuration:</h4>
+                                <pre><code># Use the provided panda.homeclaw.yaml
+$ cargo run --bin panda panda.homeclaw.yaml
+
+# Update HomeClaw config/llm.yml
+panda:
+  enabled: true
+  host: 127.0.0.1
+  port: 8081
+  paths:
+    main_llm: /v1/chat/completions
+    embedding: /v1/embeddings
+    cloud_llm: /cloud/v1/chat/completions</code></pre>
+                                <h4>Testing:</h4>
+                                <pre><code># Test local model
+curl -X POST http://127.0.0.1:8081/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"test","messages":[{"role":"user","content":"hi"}]}'
+
+# Test cloud model
+curl -X POST http://127.0.0.1:8081/cloud/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"test","messages":[{"role":"user","content":"hi"}]}'
+
+# Test embeddings
+curl -X POST http://127.0.0.1:8081/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"input":"test"}'</code></pre>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="mt-12">
                 <h2>Next Steps</h2>
                 <div class="row">
                     <div class="col-md-4 mb-6">
@@ -197,8 +284,8 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318/v1/traces cargo run -p panda-s
         <div class="container">
             <div class="row">
                 <div class="col-md-3">
-                    <h4>Panda AI Gateway</h4>
-                    <p>A high-performance, stateless, intent-aware gateway for LLMs and AI services.</p>
+                    <h4>Panda Gateway</h4>
+                    <p>A high-performance, stateless, intent-aware gateway that combines MCP, API, and AI capabilities.</p>
                 </div>
                 <div class="col-md-3">
                     <h4>Quick Links</h4>
@@ -224,7 +311,7 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318/v1/traces cargo run -p panda-s
                 </div>
             </div>
             <div class="border-top border-gray mt-6 pt-6 text-center">
-                <p>&copy; 2026 Panda AI Gateway. All rights reserved.</p>
+                <p>&copy; 2026 Panda Gateway. All rights reserved.</p>
             </div>
         </div>
     </footer>

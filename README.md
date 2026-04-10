@@ -2,7 +2,7 @@
 
 ![Panda Logo](panda_site/assets/images/panda-logo.svg)
 
-**Website:** https://www.homeclaw.cn/panda-ai/
+**Website:** https://www.homeclaw.cn/panda/
 
 **Panda is a Rust unified gateway**: combines **API gateway** capabilities with **MCP (Model Context Protocol) tool orchestration** and **AI gateway** features—all in one binary with one **YAML** config. It is built for **streaming**, **token-aware budgets**, **agent-ready tool loops**, and **low-cardinality observability** so you get clear **key values** (who, what, cost, cache, tools) without turning the gateway into a data warehouse.
 

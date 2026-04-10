@@ -17,7 +17,7 @@
         <div class="container">
             <a class="navbar-brand" href="index.html">
                 <img src="assets/images/panda-logo.svg" alt="Panda Logo" width="30" height="30" class="d-inline-block align-top me-2">
-                Panda AI Gateway
+                Panda Gateway
             </a>
             <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
                 <span class="navbar-toggler-icon"></span>
@@ -49,9 +49,9 @@
         <div class="container">
             <div class="row align-items-center">
                 <div class="col-md-6">
-                    <h1 class="display-4">Panda AI Gateway</h1>
-                    <p class="lead">A high-performance, stateless, intent-aware gateway for LLMs and AI services</p>
-                    <p class="mt-4">Panda is a Rust-based unified gateway that combines API gateway capabilities with Model Context Protocol (MCP) tools orchestration. It sits between your clients and model providers, adding policy, identity, budgets, MCP tools, caching, safety, and observability in one place.</p>
+                    <h1 class="display-4">Panda Gateway</h1>
+                    <p class="lead">A high-performance, stateless, intent-aware gateway that combines MCP, API, and AI capabilities</p>
+                    <p class="mt-4">Panda is a Rust-based unified gateway that combines MCP (Model Context Protocol) tool orchestration, API gateway capabilities, and AI traffic management. It sits between your clients and services, adding policy, identity, budgets, tool orchestration, caching, safety, and observability in one place.</p>
                     <div class="mt-5">
                         <a href="quickstart.html" class="btn btn-primary btn-lg">Get Started</a>
                         <a href="architecture.html" class="btn btn-outline-light btn-lg ms-3">Learn More</a>
@@ -61,13 +61,13 @@
                     <div class="mermaid-diagram rounded-lg shadow-lg">
                         <div class="mermaid">
 flowchart TD
-    C[Clients] --> P[Panda AI Gateway]
+    C[Clients] --> P[Panda Gateway]
     P --> M[Model Providers]
     P --> T[MCP Tool Servers]
     P --> O[Observability]
     P --> S[Security]
     
-    subgraph Panda[Panda AI Gateway]
+    subgraph Panda[Panda Gateway]
         I[Ingress - Mouth] --> Sh[Shield - Bamboo]
         Sh --> Br[Brain - Intelligence]
         Br --> H[Hands - Egress]
@@ -348,6 +348,49 @@ flowchart TD
         </div>
     </section>
 
+    <!-- Agent Integration -->
+    <section class="agent-integration py-12 bg-light">
+        <div class="container">
+            <h2 class="text-center mb-8">Agent Integration</h2>
+            <p class="text-center mb-8">Seamless integration with OpenClaw-class agents and other AI assistants</p>
+            
+            <div class="row">
+                <div class="col-md-6 mb-6">
+                    <div class="card h-100">
+                        <div class="card-body">
+                            <h3 class="card-title">OpenClaw Integration</h3>
+                            <p class="card-text">Optimized integration for OpenClaw-class agents with enhanced performance and capabilities.</p>
+                            <ul class="list-unstyled mt-4">
+                                <li class="mb-2">• Unified routing for local and cloud models</li>
+                                <li class="mb-2">• Semantic caching for LLM responses</li>
+                                <li class="mb-2">• Tool caching for deterministic operations</li>
+                                <li class="mb-2">• Rate limiting and TPM control</li>
+                                <li class="mb-2">• MCP tool orchestration</li>
+                            </ul>
+                            <a href="quickstart.html#openclaw" class="btn btn-primary mt-4">Learn More</a>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6 mb-6">
+                    <div class="card h-100">
+                        <div class="card-body">
+                            <h3 class="card-title">HomeClaw Integration</h3>
+                            <p class="card-text">Specific integration for HomeClaw agents with optimized configuration.</p>
+                            <ul class="list-unstyled mt-4">
+                                <li class="mb-2">• Pre-configured routing for HomeClaw models</li>
+                                <li class="mb-2">• Tool caching for HomeClaw-specific tools</li>
+                                <li class="mb-2">• Optimized rate limits for HomeClaw workloads</li>
+                                <li class="mb-2">• Embedding service integration</li>
+                                <li class="mb-2">• Cloud model proxy support</li>
+                            </ul>
+                            <a href="quickstart.html#homeclaw" class="btn btn-primary mt-4">Learn More</a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
     <!-- Call to Action -->
     <section class="cta-section py-12 bg-dark text-white">
         <div class="container">
@@ -367,8 +410,8 @@ flowchart TD
         <div class="container">
             <div class="row">
                 <div class="col-md-3">
-                    <h4>Panda AI Gateway</h4>
-                    <p>A high-performance, stateless, intent-aware gateway for LLMs and AI services.</p>
+                    <h4>Panda Gateway</h4>
+                    <p>A high-performance, stateless, intent-aware gateway that combines MCP, API, and AI capabilities.</p>
                 </div>
                 <div class="col-md-3">
                     <h4>Quick Links</h4>
@@ -394,7 +437,7 @@ flowchart TD
                 </div>
             </div>
             <div class="border-top border-gray mt-6 pt-6 text-center">
-                <p>&copy; 2026 Panda AI Gateway. All rights reserved.</p>
+                <p>&copy; 2026 Panda Gateway. All rights reserved.</p>
             </div>
         </div>
     </footer>
