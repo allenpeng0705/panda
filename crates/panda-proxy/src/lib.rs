@@ -7199,7 +7199,21 @@ async fn forward_to_upstream(
         &ctx,
         &state.config.agent_sessions,
     );
-    parts.uri = upstream::join_upstream_uri(&resolved_upstream_base, &ingress_uri_full)
+    
+    // Strip path prefix from the request path if there's an effective route
+    let mut uri_to_join = ingress_uri_full.clone();
+    if let Some(route) = state.config.effective_route_for_path(&ingress_path) {
+        let prefix = route.path_prefix.as_str();
+        if ingress_path.starts_with(prefix) && prefix != "/" && ingress_path.len() > prefix.len() {
+            let stripped_path = &ingress_path[prefix.len()..];
+            let stripped_path = if stripped_path.is_empty() { "/" } else { stripped_path };
+            if let Ok(new_uri) = upstream::rewrite_uri_path_preserving_query(&ingress_uri_full, stripped_path) {
+                uri_to_join = new_uri;
+            }
+        }
+    }
+    
+    parts.uri = upstream::join_upstream_uri(&resolved_upstream_base, &uri_to_join)
         .map_err(ProxyError::Upstream)?;
 
     let max_body = state.config.plugins.max_request_body_bytes;

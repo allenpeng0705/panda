@@ -40,18 +40,18 @@ groups:
 
       # API Gateway request rates
       - record: panda:api_gateway:ingress_rate5m
-        expr: sum by (path_prefix, method) (rate(panda_api_gateway_ingress_requests_total[5m]))
+        expr: sum by (path_prefix, method) (rate(panda_gateway_ingress_rps_total[5m]))
         labels:
           gateway: api
 
       - record: panda:api_gateway:egress_rate5m
-        expr: sum by (host) (rate(panda_api_gateway_egress_requests_total[5m]))
+        expr: sum by (host) (rate(panda_gateway_rps_allowed_total[5m]))
         labels:
           gateway: api
 
       # API Gateway auth failures
       - record: panda:api_gateway:auth_failures:rate5m
-        expr: sum by (reason) (rate(panda_api_gateway_auth_failures_total[5m]))
+        expr: sum by (endpoint) (rate(panda_ops_auth_denied_total[5m]))
         labels:
           gateway: api
 

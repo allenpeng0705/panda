@@ -115,7 +115,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum(rate(panda_api_gateway_ingress_requests_total[5m]))",
+          "expr": "sum(rate(panda_ops_auth_allowed_total[5m]))",
           "legendFormat": "API Gateway Ingress",
           "refId": "A"
         },
@@ -124,7 +124,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum(rate(panda_api_gateway_egress_requests_total[5m]))",
+          "expr": "sum(rate(panda_gateway_rps_allowed_total[5m]))",
           "legendFormat": "API Gateway Egress",
           "refId": "B"
         },
@@ -133,7 +133,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum(rate(http_requests_total{job=\"panda\"}[5m]))",
+          "expr": "sum(rate(panda_ops_auth_allowed_total[5m]))",
           "legendFormat": "Total Requests",
           "refId": "C"
         }
@@ -996,8 +996,8 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum by (path_prefix) (rate(panda_api_gateway_ingress_requests_total[5m]))",
-          "legendFormat": "{{path_prefix}}",
+          "expr": "sum by (layer) (rate(panda_gateway_rps_allowed_total[5m]))",
+          "legendFormat": "{{layer}}",
           "refId": "A"
         }
       ],
@@ -1083,7 +1083,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum by (reason) (rate(panda_api_gateway_auth_failures_total[5m]))",
+          "expr": "sum by (endpoint) (rate(panda_ops_auth_denied_total[5m]))",
           "legendFormat": "{{reason}}",
           "refId": "A"
         }
@@ -1170,7 +1170,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum by (host) (rate(panda_api_gateway_egress_requests_total[5m]))",
+          "expr": "sum by (host) (rate(panda_gateway_rps_allowed_total[5m]))",
           "legendFormat": "{{host}}",
           "refId": "A"
         }
@@ -1257,7 +1257,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum(rate(panda_api_gateway_rate_limit_exceeded_total[5m]))",
+          "expr": "sum(rate(panda_gateway_rps_denied_total[5m]))",
           "legendFormat": "Rate Limit Exceeded",
           "refId": "A"
         }

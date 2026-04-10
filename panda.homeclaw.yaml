@@ -1,7 +1,7 @@
 # Panda Gateway configuration for HomeClaw
 # Based on the working panda.test.yaml file
 
-listen: 127.0.0.1:8080
+listen: 127.0.0.1:8081
 default_backend: "http://127.0.0.1:5023"
 
 routes:
@@ -11,11 +11,10 @@ routes:
     mcp_advertise_tools: true
     rate_limit:
       rps: 300
-    tpm_limit: 800000
     semantic_cache: true
   # Cloud model route
-  - path_prefix: /cloud/v1/chat
-    backend_base: "http://127.0.0.1:14005/v1/chat"
+  - path_prefix: /cloud
+    backend_base: "http://127.0.0.1:14005"
     type: openai
     rate_limit:
       rps: 150
@@ -24,6 +23,7 @@ routes:
   - path_prefix: /v1/embeddings
     backend_base: "http://127.0.0.1:5066"
     type: openai
+    tpm_limit: 100000  # Add this - tokens per minute for cloud model
     rate_limit:
       rps: 200
 
@@ -49,6 +49,11 @@ api_gateway:
           rps: 10
       - path_prefix: /v1
         backend: ai
+        rate_limit:
+          rps: 50
+      - path_prefix: /cloud
+        backend: ai
+        backend_base: "http://127.0.0.1:14005"
         rate_limit:
           rps: 50
       - path_prefix: /mcp
@@ -154,3 +159,4 @@ tpm:
 
 semantic_cache:
   enabled: true
+
