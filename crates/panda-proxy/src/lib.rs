@@ -10548,6 +10548,7 @@ agent_sessions:
             model_failover: Default::default(),
             routing: Default::default(),
             agent_sessions: Default::default(),
+            litellm: None,
             control_plane: Default::default(),
         });
         let state = test_proxy_state(Arc::clone(&cfg)).await;
@@ -10632,6 +10633,7 @@ agent_sessions:
             model_failover: Default::default(),
             routing: Default::default(),
             agent_sessions: Default::default(),
+            litellm: None,
             control_plane: Default::default(),
         });
         let state = test_proxy_state(Arc::clone(&cfg)).await;
@@ -10725,6 +10727,7 @@ agent_sessions:
             model_failover: Default::default(),
             routing: Default::default(),
             agent_sessions: Default::default(),
+            litellm: None,
             control_plane: Default::default(),
         });
         let state = test_proxy_state(Arc::clone(&cfg)).await;
@@ -10826,6 +10829,7 @@ agent_sessions:
             model_failover: Default::default(),
             routing: Default::default(),
             agent_sessions: Default::default(),
+            litellm: None,
             control_plane: Default::default(),
         };
         let mut headers = HeaderMap::new();
@@ -10874,6 +10878,7 @@ agent_sessions:
             model_failover: Default::default(),
             routing: Default::default(),
             agent_sessions: Default::default(),
+            litellm: None,
             control_plane: Default::default(),
         });
         let hub = Arc::new(ConsoleEventHub::new(DEFAULT_CONSOLE_CHANNEL_CAPACITY));
@@ -11019,6 +11024,7 @@ agent_sessions:
             model_failover: Default::default(),
             routing: Default::default(),
             agent_sessions: Default::default(),
+            litellm: None,
             control_plane: Default::default(),
         });
         let state = Arc::new(ProxyState {
@@ -11164,6 +11170,7 @@ control_plane:
             model_failover: Default::default(),
             routing: Default::default(),
             agent_sessions: Default::default(),
+            litellm: None,
             control_plane: panda_config::ControlPlaneConfig {
                 enabled: true,
                 ..Default::default()
@@ -11318,6 +11325,7 @@ control_plane:
             model_failover: Default::default(),
             routing: Default::default(),
             agent_sessions: Default::default(),
+            litellm: None,
             control_plane: panda_config::ControlPlaneConfig {
                 enabled: true,
                 additional_admin_secret_envs: vec![EXTRA.to_string()],
@@ -11511,6 +11519,7 @@ control_plane:
             model_failover: Default::default(),
             routing: Default::default(),
             agent_sessions: Default::default(),
+            litellm: None,
             control_plane: Default::default(),
         });
         let tpm = Arc::new(TpmCounters::connect(None).await.unwrap());
@@ -11613,6 +11622,7 @@ control_plane:
             model_failover: Default::default(),
             routing: Default::default(),
             agent_sessions,
+            litellm: None,
             control_plane: Default::default(),
         });
         let tpm = Arc::new(TpmCounters::connect(None).await.unwrap());
@@ -11691,6 +11701,7 @@ control_plane:
             model_failover: Default::default(),
             routing: Default::default(),
             agent_sessions: Default::default(),
+            litellm: None,
             control_plane: Default::default(),
         });
         let state = ProxyState {
@@ -11917,6 +11928,7 @@ control_plane:
             model_failover: Default::default(),
             routing: Default::default(),
             agent_sessions: Default::default(),
+            litellm: None,
             control_plane: Default::default(),
         });
         let state = ProxyState {
@@ -12062,6 +12074,7 @@ control_plane:
                 enabled: true,
                 ..Default::default()
             },
+            litellm: None,
             control_plane: Default::default(),
         });
         let state = ProxyState {
@@ -12176,6 +12189,7 @@ control_plane:
             model_failover: Default::default(),
             routing: Default::default(),
             agent_sessions: Default::default(),
+            litellm: None,
             control_plane: Default::default(),
         });
         let state = ProxyState {
@@ -12249,6 +12263,7 @@ control_plane:
             model_failover: Default::default(),
             routing: Default::default(),
             agent_sessions: Default::default(),
+            litellm: None,
             control_plane: Default::default(),
         });
         let state = ProxyState {
@@ -12327,6 +12342,7 @@ control_plane:
             model_failover: Default::default(),
             routing: Default::default(),
             agent_sessions: Default::default(),
+            litellm: None,
             control_plane: Default::default(),
         });
         let state = ProxyState {
@@ -12397,6 +12413,7 @@ control_plane:
             model_failover: Default::default(),
             routing: Default::default(),
             agent_sessions: Default::default(),
+            litellm: None,
             control_plane: Default::default(),
         });
         let state = ProxyState {
@@ -12557,6 +12574,7 @@ control_plane:
             model_failover: Default::default(),
             routing: Default::default(),
             agent_sessions: Default::default(),
+            litellm: None,
             control_plane: Default::default(),
         });
 
@@ -13158,6 +13176,7 @@ mcp:
             model_failover: Default::default(),
             routing: Default::default(),
             agent_sessions: Default::default(),
+            litellm: None,
             control_plane: Default::default(),
         });
         let state = test_proxy_state(Arc::clone(&cfg)).await;
@@ -13243,6 +13262,7 @@ mcp:
             model_failover: Default::default(),
             routing: Default::default(),
             agent_sessions: Default::default(),
+            litellm: None,
             control_plane: Default::default(),
         });
         let state = test_proxy_state(Arc::clone(&cfg)).await;
@@ -13326,6 +13346,7 @@ mcp:
             model_failover: Default::default(),
             routing: Default::default(),
             agent_sessions: Default::default(),
+            litellm: None,
             control_plane: Default::default(),
         });
         let state = test_proxy_state(Arc::clone(&cfg)).await;
@@ -13411,6 +13432,7 @@ mcp:
             model_failover: Default::default(),
             routing: Default::default(),
             agent_sessions: Default::default(),
+            litellm: None,
             control_plane: Default::default(),
         });
         let state = test_proxy_state(Arc::clone(&cfg)).await;
@@ -13672,6 +13694,7 @@ data: [DONE]
             model_failover: Default::default(),
             routing: Default::default(),
             agent_sessions: Default::default(),
+            litellm: None,
             control_plane: Default::default(),
         });
         let state = test_proxy_state(Arc::clone(&cfg)).await;

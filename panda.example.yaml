@@ -437,6 +437,15 @@ default_backend: "http://127.0.0.1:5023"
 # - Anthropic non-streaming chat is mapped to OpenAI chat completion format.
 # - If OpenAI sets stream=true with provider=anthropic, Panda forwards stream to Anthropic and
 #   translates Anthropic SSE to OpenAI chat.completion.chunk SSE (including data: [DONE]).
+#
+# Optional: route AI traffic through LiteLLM proxy (passthrough — no body transform).
+# When provider is "litellm", Panda forwards to the LiteLLM server and optionally injects an API key.
+# adapter:
+#   provider: "litellm"
+# litellm:
+#   upstream: "http://localhost:4000"   # LiteLLM server base URL (optional; defaults to default_backend)
+#   api_key_env: "LITELLM_API_KEY"       # env var name for LiteLLM API key (optional)
+# default_backend: "http://localhost:4000"  # fallback upstream when litellm.upstream not set
 
 # --- MCP gateway (Phase 1) — see docs/mcp_gateway_phase1.md ---
 # Start here: enable + one stdio server (or http_tool + api_gateway.egress) + advertise_tools. Add tool_routes, intent_tool_policies,

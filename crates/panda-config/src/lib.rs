@@ -532,6 +532,20 @@ impl Default for AdapterConfig {
     }
 }
 
+/// Optional LiteLLM proxy integration (passthrough — no request/response body transform).
+/// When [`AdapterConfig::provider`] is `"litellm"`, Panda forwards AI traffic to LiteLLM
+/// and optionally injects an API key from the environment.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct LitellmConfig {
+    /// LiteLLM server base URL. If set, overrides [`PandaConfig::default_backend`] for AI paths.
+    #[serde(default)]
+    pub upstream: String,
+    /// Env var name containing the LiteLLM API key (injected as `Authorization: Bearer` header).
+    #[serde(default)]
+    pub api_key_env: String,
+}
+
 /// Labels for `adapter.provider` and per-route `type` (`adapter_type`) that use **OpenAI-shaped**
 /// HTTP to `backend_base` (passthrough; no request-body mapping). Same idea as multi-provider
 /// gateways (e.g. [Portkey AI Gateway](https://github.com/Portkey-AI/gateway)): one client surface,
@@ -566,6 +580,8 @@ pub const OPENAI_SHAPED_ADAPTER_PROVIDER_LABELS: &[&str] = &[
     "gemini",
     "vertex",
     "bedrock",
+    // LiteLLM proxy passthrough
+    "litellm",
 ];
 
 fn ensure_adapter_provider_allowed(name: &str) -> anyhow::Result<()> {
@@ -2749,6 +2765,8 @@ pub struct PandaConfig {
     pub routing: RoutingConfig,
     #[serde(default)]
     pub agent_sessions: AgentSessionsConfig,
+    #[serde(default)]
+    pub litellm: Option<LitellmConfig>,
 }
 
 impl PandaConfig {
